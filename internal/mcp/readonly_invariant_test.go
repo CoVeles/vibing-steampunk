@@ -425,9 +425,10 @@ var readOnlyClasses = map[string]surfaceClass{
 	"SAP read UI5_FILE":                   clsRead,
 	"SAP read COVERAGE include_dangerous": clsExecute,
 	"SAP query TABL_CONTENTS":             clsRead, "SAP query SQL": clsRead, "SAP query SQL table": clsRead,
-	"SAP query (no params)": clsRead,
-	"SAP search":            clsRead,
-	"SAP grep package":      clsRead, "SAP grep packages": clsRead, "SAP grep object": clsRead,
+	"SAP query (no params)":   clsRead,
+	"SAP query SQL in target": clsRead, "SAP query table in target": clsRead,
+	"SAP search":       clsRead,
+	"SAP grep package": clsRead, "SAP grep packages": clsRead, "SAP grep object": clsRead,
 	"SAP grep objects": clsRead, "SAP grep (no target)": clsRead,
 
 	// --- SAP(): edit ---
@@ -475,9 +476,12 @@ var readOnlyClasses = map[string]surfaceClass{
 	"SAP test type=unit include_dangerous": clsExecute,
 	"SAP test type=atc":                    clsRead,
 	"SAP test type=atc_customizing":        clsRead,
+	"SAP test ATC":                         clsRead,
+	"SAP test ATC_CUSTOMIZING":             clsRead,
 
 	// --- SAP(): analyze, switch-routed ---
 	"SAP analyze type=definition":                  clsRead,
+	"SAP analyze type=cds_impact":                  clsRead,
 	"SAP analyze type=references":                  clsRead,
 	"SAP analyze type=completion":                  clsRead,
 	"SAP analyze type=pretty_print":                clsRead,
@@ -577,6 +581,9 @@ var readOnlyClasses = map[string]surfaceClass{
 	"SAP system COMPONENTS":                   clsRead,
 	"SAP system CONNECTION":                   clsRead,
 	"SAP system FEATURES":                     clsRead,
+	"SAP system type=system_info":             clsRead,
+	"SAP system type=installed_components":    clsRead,
+	"SAP system type=connection_info":         clsRead,
 	"SAP system type=git_types":               clsRead,
 	"SAP system type=git_export":              clsRead,
 	"SAP system type=git_import_zip":          clsMutate, // abapGit deserialize into a package, as a background job
@@ -992,6 +999,8 @@ func actionCases() []actionCase {
 		{Name: "SAP query SQL", Action: "query", Target: "SQL", Exact: true, Params: kv("sql", "SELECT * FROM T000")},
 		{Name: "SAP query SQL table", Action: "query", Target: "SQL T000", Exact: true},
 		{Name: "SAP query (no params)", Action: "query", Exact: true},
+		{Name: "SAP query SQL in target", Action: "query", Target: "SELECT * FROM T000", Exact: true},
+		{Name: "SAP query table in target", Action: "query", Target: "T000", Exact: true},
 
 		// search and grep
 		{Name: "SAP search", Action: "search", Target: "ZDEMO*", Exact: true},
@@ -1064,6 +1073,8 @@ func actionCases() []actionCase {
 		{Name: "SAP test type=unit include_dangerous", Action: "test", Exact: true, Params: kv("type", "unit", "object_url", obj, "include_dangerous", true)},
 		{Name: "SAP test type=atc", Action: "test", Like: "RunATCCheck", Params: kv("type", "atc")},
 		{Name: "SAP test type=atc_customizing", Action: "test", Like: "GetATCCustomizing", Params: kv("type", "atc_customizing")},
+		{Name: "SAP test ATC", Action: "test", Target: "ATC", Exact: true, Params: kv("object_uri", obj)},
+		{Name: "SAP test ATC_CUSTOMIZING", Action: "test", Target: "ATC_CUSTOMIZING", Exact: true},
 
 		// analyze types routed by switch
 		an("definition", "FindDefinition"), an("references", "FindReferences"), an("completion", "CodeCompletion"),
@@ -1092,6 +1103,9 @@ func actionCases() []actionCase {
 		{Name: "SAP system COMPONENTS", Action: "system", Target: "COMPONENTS", Exact: true},
 		{Name: "SAP system CONNECTION", Action: "system", Target: "CONNECTION", Exact: true},
 		{Name: "SAP system FEATURES", Action: "system", Target: "FEATURES", Exact: true},
+		{Name: "SAP system type=system_info", Action: "system", Exact: true, Params: kv("type", "system_info")},
+		{Name: "SAP system type=installed_components", Action: "system", Exact: true, Params: kv("type", "installed_components")},
+		{Name: "SAP system type=connection_info", Action: "system", Exact: true, Params: kv("type", "connection_info")},
 		sys("git_types", "GitTypes"), sys("git_export", "GitExport"),
 		{Name: "SAP system type=git_import_zip", Action: "system", Exact: true, Params: kv("type", "git_import_zip", "file_path", "demo.zip", "package", "$TMP")},
 		{Name: "SAP system type=git_import_zip base64", Action: "system", Exact: true, Params: kv("type", "git_import_zip",
