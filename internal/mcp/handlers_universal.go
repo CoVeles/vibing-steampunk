@@ -159,11 +159,18 @@ func parseTarget(target string) (objectType, objectName string) {
 // raw text is kept: parseTarget upper-cases, which would corrupt string
 // literals in the statement. Other actions pass through unchanged.
 func queryTargetSQL(action, target string, params map[string]any) (string, map[string]any) {
-	if action != "query" || getStringParam(params, "sql_query") != "" || !looksLikeSQL(target) {
+	if action != "query" || !looksLikeSQL(target) {
 		return target, params
 	}
-	params = copyParams(params)
-	params["sql_query"] = strings.TrimSpace(target)
+	// A statement passed explicitly in params, under any of the names the
+	// query route accepts, wins over one that happens to be in target.
+	if firstParam(params, "sql_query", "sql", "query", "statement") == "" {
+		params = copyParams(params)
+		params["sql_query"] = strings.TrimSpace(target)
+	}
+	// Either way the target has served its purpose and must not reach
+	// parseTarget, which would split "SELECT * FROM T000" into a type and a
+	// name and match nothing.
 	return "SQL", params
 }
 

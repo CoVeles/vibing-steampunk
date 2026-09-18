@@ -262,3 +262,46 @@ func TestUniversalToolQueryParamMapping(t *testing.T) {
 		t.Error("an existing value must win over its alias")
 	}
 }
+
+// TestQueryTargetSQLExplicitStatementWins pins that a statement passed in
+// params, under any accepted name, is not shadowed by SQL in target, and that
+// the caller's map is not written into.
+func TestQueryTargetSQLExplicitStatementWins(t *testing.T) {
+	for _, key := range []string{"sql_query", "sql", "query", "statement"} {
+		params := map[string]any{key: "SELECT mandt FROM t000"}
+		target, out := queryTargetSQL("query", "SELECT * FROM T100", params)
+		if target != "SQL" {
+			t.Errorf("%s: target = %q, want SQL", key, target)
+		}
+		if got := firstParam(out, "sql_query", "sql", "query", "statement"); got != "SELECT mandt FROM t000" {
+			t.Errorf("%s: statement = %q, want the one passed in params", key, got)
+		}
+	}
+	params := map[string]any{}
+	target, out := queryTargetSQL("query", "SELECT * FROM T000", params)
+	if target != "SQL" || out["sql_query"] != "SELECT * FROM T000" {
+		t.Errorf("SQL-only target: got target=%q sql_query=%v", target, out["sql_query"])
+	}
+	if len(params) != 0 {
+		t.Errorf("queryTargetSQL wrote into the caller's map: %v", params)
+	}
+	if target, _ := queryTargetSQL("read", "SELECT * FROM T000", map[string]any{}); target != "SELECT * FROM T000" {
+		t.Errorf("a non-query action must keep its target, got %q", target)
+	}
+}
+
+// TestGrepBareTargetRefused pins that a one-word grep target is refused by
+// name instead of being guessed to be a class.
+func TestGrepBareTargetRefused(t *testing.T) {
+	s := NewServer(&Config{BaseURL: "http://127.0.0.1:1", Username: "probe", Password: "probe", Client: "001", Language: "EN"})
+	result, err := s.handleUniversalTool(context.Background(), newRequest(map[string]any{
+		"action": "grep", "target": "$TMP", "params": map[string]any{"pattern": "SELECT"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(result)
+	if !result.IsError || !strings.Contains(text, "does not say what kind of object") {
+		t.Errorf("bare grep target: want a refusal naming the ambiguity, got: %s", text)
+	}
+}
