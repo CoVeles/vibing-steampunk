@@ -548,6 +548,16 @@ Transports:
 Git/abapGit:
   SAP(action="system", params={"type": "git_types"})
   SAP(action="system", params={"type": "git_export", "packages": "$TMP"})
+  SAP(action="system", params={"type": "git_import_zip", "file_path": "/in/demo.zip", "package": "$ZDEMO", "repo_name": "demo", "overwrite": false})
+    - an abapGit offline zip into a package (or "zip_base64"), by the abapGit on the system, as background job ZVSP_GIT_IMPORT;
+      waits wait_seconds (300; 0 = answer with the job) and answers status (imported / imported_with_errors / refused / failed),
+      the E/W/A log, the TADIR rows created or changed, repoKey. Nothing existing is overwritten without overwrite: true;
+      conflicts, unmet requirements and objects of other packages refuse. Every package the zip maps to must pass
+      --allowed-packages; a transportable package needs --allow-transportable-edits and a transport
+  SAP(action="system", params={"type": "git_import_status", "job": "12345678"})  - the import job's state and result, read-only
+  SAP(action="system", params={"type": "git_delete_objects", "package": "$ZDEMO", "objects": ["PROG ZDEMO_REPORT"]})
+    - deletes exactly those TADIR items of the package (each through DeleteObject's gate), then its abapGit
+      repository row, then the package if nothing is left in it; nothing outside the package
 
 Install tools:
   SAP(action="system", params={"type": "install_zadt_vsp"})
