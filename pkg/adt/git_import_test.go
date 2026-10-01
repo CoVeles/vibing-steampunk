@@ -286,7 +286,9 @@ type fakeGitWS struct {
 	// with a refusal; abortErr fails abort without an answer.
 	beginErr     error
 	beginRefusal *WSError
-	abortErr     error
+	// beginNoID answers begin without an assembly id.
+	beginNoID bool
+	abortErr  error
 	// statusErr fails import_status without an answer once the status
 	// answers are used up.
 	statusErr error
@@ -335,7 +337,11 @@ func (f *fakeGitWS) SendDomainRequest(_ context.Context, domain, action string, 
 			if f.beginPackage != "" {
 				pkg = f.beginPackage
 			}
-			return ok(map[string]any{"assembly_id": "A1", "package": pkg, "system": "XYZ", "client": orDefaultString(f.client, "001")})
+			id := "A1"
+			if f.beginNoID {
+				id = ""
+			}
+			return ok(map[string]any{"assembly_id": id, "package": pkg, "system": "XYZ", "client": orDefaultString(f.client, "001")})
 		case "chunk":
 			c, _ := base64.StdEncoding.DecodeString(p["chunk_b64"].(string))
 			if int(p["offset"].(float64)) != len(f.got) {
@@ -1167,6 +1173,7 @@ func TestStartGitImportResetsAnUnconfirmedUpload(t *testing.T) {
 	}{
 		{"begin timed out", &fakeGitWS{beginErr: errors.New("request timeout")}, nil, 1, "import_zip:begin"},
 		{"begin cancelled", &fakeGitWS{beginErr: context.Canceled}, nil, 1, "import_zip:begin"},
+		{"begin without an assembly id", &fakeGitWS{beginNoID: true}, nil, 1, "import_zip:begin"},
 		{"begin refused", &fakeGitWS{beginRefusal: &WSError{Code: "UPLOAD_IN_PROGRESS", Message: "busy"}}, nil, 0, "import_zip:begin"},
 		{"abort answered", &fakeGitWS{client: "200"}, []Option{WithClient("001")}, 0, "import_zip:begin,import_zip:abort"},
 		{"abort unanswered", &fakeGitWS{client: "200", abortErr: errors.New("request timeout")}, []Option{WithClient("001")}, 1, "import_zip:begin,import_zip:abort"},
