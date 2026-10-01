@@ -1912,6 +1912,25 @@ ExecuteABAP:
     lv_result = lv_msg.
 ```
 
+Several values: call `RETURN_VALUE( x )` once per value (in addition to, or
+instead of, `lv_result`).
+
+The MCP tool (`execute_abap`) answers JSON. `result_text` is the returned value
+in full, unwrapped from SAP's `Critical Assertion Error: '…'`: a string for one
+value, an array for several. The other fields are `success`, `programName`,
+`output` (every value, in order), `executionTime`, `message`, `cleanedUp`,
+`failure` (when the code did not finish) and `rawAlerts` (only when no value
+came back). SAP turns a line break inside a value into `#`.
+
+```json
+{ "success": true, "programName": "ZTEMP_EXEC_12345678",
+  "output": ["20261001", "TESTUSER"], "result_text": ["20261001", "TESTUSER"],
+  "message": "Executed successfully, 2 output(s) returned", "cleanedUp": true, ... }
+```
+
+`vsp execute` prints every value whole, one per line; `vsp execute --json`
+prints the same object as the MCP tool.
+
 **Risk levels:** `harmless` (read-only), `dangerous` (write), `critical` (full access)
 
 See [ExecuteABAP Report](reports/2025-12-05-004-execute-abap-implementation.md) for details.

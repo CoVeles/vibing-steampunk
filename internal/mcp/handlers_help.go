@@ -426,7 +426,12 @@ Transport analysis:
   SAP(action="analyze", params={"type": "health", "object_type": "CLAS", "object_name": "ZCL_ORDER_SERVICE"})
 
 Execute ABAP:
-  SAP(action="analyze", params={"type": "execute_abap", "code": "WRITE 'Hello'."})
+  SAP(action="analyze", params={"type": "execute_abap", "code": "lv_result = |Hello { sy-uname }|."})
+  SAP(action="analyze", params={"type": "execute_abap", "code": "RETURN_VALUE( sy-datum ). RETURN_VALUE( sy-uzeit )."})
+      answers JSON: success, message, output (every value, in order), result_text (the value
+      in full, unwrapped from SAP's "Critical Assertion Error: '...'": a string for one value,
+      an array when RETURN_VALUE( ) was called more than once), failure when the code did not
+      finish, rawAlerts only when no value came back. SAP turns a line break in a value into #.
 
 Runtime errors (ST22) — a listing, and a post-mortem around one dump:
   SAP(action="analyze", params={"type": "list_dumps", "since": "2026-08-01", "program": "ZDEMO_POST"})
