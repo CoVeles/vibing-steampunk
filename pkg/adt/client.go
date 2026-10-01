@@ -179,7 +179,7 @@ func (c *Client) CheckObjectPackageByName(ctx context.Context, objectType, name 
 	}
 	objectType = strings.ToUpper(strings.TrimSpace(objectType))
 	name = strings.ToUpper(strings.TrimSpace(name))
-	results, err := c.SearchObject(ctx, name, 50)
+	results, err := c.SearchObjectByType(ctx, name, objectType, 50)
 	if err != nil {
 		return fmt.Errorf("resolving package for %s %s: %w", objectType, name, err)
 	}
