@@ -2,6 +2,7 @@ package adt
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,33 +18,54 @@ type includeWireCall struct {
 	body   string
 }
 
-// newIncludeWriteServer answers like ADT for a class whose include writes
-// are recorded. missingTestInclude makes the first PUT to includes/testclasses
-// answer 404 until the include is created.
+// includeServer answers like ADT for one class whose include writes are
+// recorded. A PUT stores the body and a GET of the same path returns it.
+type includeServer struct {
+	missingTestInclude bool   // the testclasses include does not exist until created
+	missingStatus      int    // what a PUT to the missing include answers
+	missingBody        string // and with which body
+	createFails        bool   // POST .../includes (create the test include) answers 500
+	activationBody     string // the activation response; empty means success
+	packageName        string // the package the repository search reports
+	initial            map[string]string
+	opts               []Option
+}
+
+// newIncludeWriteServer is the plain server: missingTestInclude makes the
+// first PUT to includes/testclasses answer 404 until the include is created.
 func newIncludeWriteServer(t *testing.T, missingTestInclude bool) (*Client, func() []includeWireCall) {
-	return newIncludeWriteServerAnswering(t, missingTestInclude, http.StatusNotFound, "")
+	return includeServer{missingTestInclude: missingTestInclude, missingStatus: http.StatusNotFound}.start(t)
+}
+
+func newIncludeWriteServerAnswering(t *testing.T, missingTestInclude bool, missingStatus int, missingBody string) (*Client, func() []includeWireCall) {
+	return includeServer{missingTestInclude: missingTestInclude, missingStatus: missingStatus, missingBody: missingBody}.start(t)
 }
 
 // missingIncludeED170 is what a 7.58 answers a PUT to the testclasses include
 // of a class that has none: a 500, not a 404.
-const missingIncludeED170 = `<?xml version="1.0" encoding="utf-8"?><exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><namespace id="com.sap.adt"/><type id="ExceptionResourceSaveFailure"/><message lang="EN">ZCL_PROBE======================CCAU does not have any inactive version</message><properties><entry key="T100KEY-ID">ED</entry><entry key="T100KEY-NO">170</entry></properties></exc:exception>`
+const missingIncludeED170 = `<?xml version="1.0" encoding="utf-8"?><exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><namespace id="com.sap.adt"/><type id="ExceptionResourceSaveFailure"/><message lang="EN">ZCL_PROBE=====================CCAU does not have any inactive version</message><properties><entry key="T100KEY-ID">ED</entry><entry key="T100KEY-NO">170</entry><entry key="T100KEY-V1">ZCL_PROBE=====================CCAU</entry></properties></exc:exception>`
 
-func newIncludeWriteServerAnswering(t *testing.T, missingTestInclude bool, missingStatus int, missingBody string) (*Client, func() []includeWireCall) {
+func (cfg includeServer) start(t *testing.T) (*Client, func() []includeWireCall) {
 	t.Helper()
 	var mu sync.Mutex
 	var calls []includeWireCall
-	testIncludeExists := !missingTestInclude
+	testIncludeExists := !cfg.missingTestInclude
+	stored := map[string]string{}
+	for k, v := range cfg.initial {
+		stored[k] = v
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
+		defer mu.Unlock()
 		calls = append(calls, includeWireCall{
 			method: r.Method,
 			path:   r.URL.EscapedPath(),
 			action: r.URL.Query().Get("_action"),
 			body:   string(body),
 		})
-		mu.Unlock()
 		w.Header().Set("X-CSRF-Token", "TOKEN")
+		isTestInclude := strings.HasSuffix(r.URL.Path, "/includes/testclasses")
 		switch {
 		case r.URL.Query().Get("_action") == "LOCK":
 			w.Header().Set("Content-Type", "application/xml")
@@ -51,24 +73,40 @@ func newIncludeWriteServerAnswering(t *testing.T, missingTestInclude bool, missi
 <asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA>
 <LOCK_HANDLE>HANDLE-1</LOCK_HANDLE><IS_LOCAL>X</IS_LOCAL>
 </DATA></asx:values></asx:abap>`)
+		case r.URL.Query().Get("_action") == "UNLOCK":
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "informationsystem/search"):
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_probe" adtcore:type="CLAS/OC" adtcore:name="ZCL_PROBE" adtcore:packageName="`+cfg.packageName+`"/>
+</adtcore:objectReferences>`)
 		case strings.Contains(r.URL.Path, "/checkruns"):
 			w.Header().Set("Content-Type", "application/xml")
 			_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><chkrun:checkRunReports xmlns:chkrun="http://www.sap.com/adt/checkrun"/>`)
+		case strings.HasSuffix(r.URL.Path, "/activation"):
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(w, cfg.activationBody)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/includes"):
-			mu.Lock()
-			testIncludeExists = true
-			mu.Unlock()
-			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/includes/testclasses"):
-			mu.Lock()
-			exists := testIncludeExists
-			mu.Unlock()
-			if !exists {
-				w.WriteHeader(missingStatus)
-				_, _ = io.WriteString(w, missingBody)
+			if cfg.createFails {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, "create refused")
 				return
 			}
+			testIncludeExists = true
 			w.WriteHeader(http.StatusOK)
+		case isTestInclude && !testIncludeExists:
+			if r.Method == http.MethodGet {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(cfg.missingStatus)
+			_, _ = io.WriteString(w, cfg.missingBody)
+		case r.Method == http.MethodPut:
+			stored[r.URL.EscapedPath()] = string(body)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet:
+			_, _ = io.WriteString(w, stored[r.URL.EscapedPath()])
 		default:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -79,7 +117,7 @@ func newIncludeWriteServerAnswering(t *testing.T, missingTestInclude bool, missi
 		defer mu.Unlock()
 		return append([]includeWireCall(nil), calls...)
 	}
-	return NewClient(srv.URL, "TESTUSER", "pw"), snapshot
+	return NewClient(srv.URL, "TESTUSER", "pw", cfg.opts...), snapshot
 }
 
 func putPaths(calls []includeWireCall) []string {
@@ -276,6 +314,239 @@ func TestSplitClassIncludeURL(t *testing.T) {
 		}
 		if !tt.err && (class != tt.class || source != tt.source) {
 			t.Errorf("%s: got (%s, %s), want (%s, %s)", tt.in, class, source, tt.class, tt.source)
+		}
+	}
+}
+
+func countCalls(calls []includeWireCall, pred func(includeWireCall) bool) int {
+	n := 0
+	for _, c := range calls {
+		if pred(c) {
+			n++
+		}
+	}
+	return n
+}
+
+func isCreateInclude(c includeWireCall) bool {
+	return c.method == http.MethodPost && strings.HasSuffix(c.path, "/includes")
+}
+
+func isIncludeUnlock(c includeWireCall) bool { return c.action == "UNLOCK" }
+
+const probeTestSource = "CLASS ltcl DEFINITION FOR TESTING. ENDCLASS."
+
+// The expected_source_hash precondition reads the include before the PUT. That
+// read answering 404 must not create the include: the write is refused as
+// drift anyway, and the create would leave an empty include behind.
+func TestWriteSourceClassIncludePreconditionReadDoesNotCreate(t *testing.T) {
+	c, snapshot := includeServer{missingTestInclude: true, missingStatus: http.StatusInternalServerError, missingBody: missingIncludeED170}.start(t)
+	result, err := c.WriteSource(context.Background(), "CLAS", "ZCL_PROBE", probeTestSource, &WriteSourceOptions{
+		Include: "testclasses", ExpectedSourceHash: SourceHash("CLASS ltcl_old DEFINITION FOR TESTING. ENDCLASS."),
+	})
+	if err != nil {
+		t.Fatalf("WriteSource: %v", err)
+	}
+	if result.Success {
+		t.Fatalf("a failed precondition read must fail the write: %s", result.Message)
+	}
+	calls := snapshot()
+	if n := countCalls(calls, isCreateInclude); n != 0 {
+		t.Fatalf("the precondition read created the include (%d POST .../includes); calls=%+v", n, calls)
+	}
+	if puts := putPaths(calls); len(puts) != 0 {
+		t.Fatalf("PUTs = %v, want none", puts)
+	}
+	if countCalls(calls, isIncludeUnlock) != 1 {
+		t.Fatalf("the class lock must be released; calls=%+v", calls)
+	}
+}
+
+// When the include had to be created, every outcome says so, the failures
+// included: the caller is left with an include it did not have before.
+func TestWriteSourceClassIncludeReportsCreatedOnFailure(t *testing.T) {
+	c, _ := includeServer{
+		missingTestInclude: true, missingStatus: http.StatusNotFound,
+		activationBody: activationErrorXML,
+	}.start(t)
+	result, err := c.WriteSource(context.Background(), "CLAS", "ZCL_PROBE", probeTestSource, &WriteSourceOptions{Include: "testclasses"})
+	if err != nil {
+		t.Fatalf("WriteSource: %v", err)
+	}
+	if result.Success || !strings.Contains(result.Message, "was created") {
+		t.Fatalf("result = success=%v message=%q, want a failure that says the include was created", result.Success, result.Message)
+	}
+}
+
+const activationErrorXML = `<?xml version="1.0" encoding="utf-8"?><chkl:messages xmlns:chkl="http://www.sap.com/abapxml/checklist"><msg objDescr="Class ZCL_PROBE" type="E" line="1"><shortText><txt>LTCL is unknown</txt></shortText></msg></chkl:messages>`
+
+func TestWriteSourceClassIncludeReportsActivationFailure(t *testing.T) {
+	c, _ := includeServer{activationBody: activationErrorXML}.start(t)
+	result, err := c.WriteSource(context.Background(), "CLAS", "ZCL_PROBE", probeTestSource, &WriteSourceOptions{Include: "testclasses"})
+	if err != nil {
+		t.Fatalf("WriteSource: %v", err)
+	}
+	if result.Success {
+		t.Fatalf("a failed activation was reported as success: %s", result.Message)
+	}
+	if !strings.Contains(result.Message, "activation failed") || result.Activation == nil || len(result.Activation.Messages) == 0 {
+		t.Fatalf("result = message=%q activation=%+v, want the activation failure and its messages", result.Message, result.Activation)
+	}
+}
+
+func TestWriteSourceClassIncludeReleasesLockWhenCreateFails(t *testing.T) {
+	c, snapshot := includeServer{missingTestInclude: true, missingStatus: http.StatusNotFound, createFails: true}.start(t)
+	result, err := c.WriteSource(context.Background(), "CLAS", "ZCL_PROBE", probeTestSource, &WriteSourceOptions{Include: "testclasses"})
+	if err != nil {
+		t.Fatalf("WriteSource: %v", err)
+	}
+	if result.Success || !strings.Contains(result.Message, "creating the testclasses include also failed") {
+		t.Fatalf("result = success=%v message=%q, want the create failure reported", result.Success, result.Message)
+	}
+	calls := snapshot()
+	if countCalls(calls, isCreateInclude) != 1 {
+		t.Fatalf("want one create attempt; calls=%+v", calls)
+	}
+	unlock := -1
+	for i, call := range calls {
+		if isIncludeUnlock(call) {
+			unlock = i
+		}
+	}
+	if unlock < 0 || calls[unlock].path != "/sap/bc/adt/oo/classes/ZCL_PROBE" {
+		t.Fatalf("the class lock must be released after the create fails; calls=%+v", calls)
+	}
+}
+
+// expected_source_hash is checked on, and verified against, the include's own
+// source, never the main source.
+func TestWriteSourceClassIncludeExpectedSourceHash(t *testing.T) {
+	const includePath = "/sap/bc/adt/oo/classes/ZCL_PROBE/includes/testclasses"
+	const current = "CLASS ltcl_old DEFINITION FOR TESTING. ENDCLASS."
+	const mainSource = "CLASS zcl_probe DEFINITION PUBLIC. ENDCLASS. CLASS zcl_probe IMPLEMENTATION. ENDCLASS."
+	initial := map[string]string{
+		includePath: current,
+		"/sap/bc/adt/oo/classes/ZCL_PROBE/source/main": mainSource,
+	}
+
+	t.Run("matching hash writes and verifies the include", func(t *testing.T) {
+		c, snapshot := includeServer{initial: initial}.start(t)
+		result, err := c.WriteSource(context.Background(), "CLAS", "ZCL_PROBE", probeTestSource, &WriteSourceOptions{
+			Include: "testclasses", ExpectedSourceHash: SourceHash(current),
+		})
+		if err != nil {
+			t.Fatalf("WriteSource: %v", err)
+		}
+		if !result.Success {
+			t.Fatalf("WriteSource failed: %s", result.Message)
+		}
+		if result.VerifiedSourceHash != SourceHash(probeTestSource) {
+			t.Fatalf("verifiedSourceHash = %s, want the hash of the written include", result.VerifiedSourceHash)
+		}
+		calls := snapshot()
+		gets := countCalls(calls, func(c includeWireCall) bool { return c.method == http.MethodGet && c.path == includePath })
+		if gets != 2 {
+			t.Fatalf("want the include read twice (precondition, verification), got %d; calls=%+v", gets, calls)
+		}
+		if n := countCalls(calls, func(c includeWireCall) bool {
+			return c.method == http.MethodGet && strings.HasSuffix(c.path, "/source/main")
+		}); n != 0 {
+			t.Fatalf("the main source was read %d time(s) for an include write; calls=%+v", n, calls)
+		}
+	})
+
+	t.Run("drifted include is not written", func(t *testing.T) {
+		c, snapshot := includeServer{initial: initial}.start(t)
+		result, err := c.WriteSource(context.Background(), "CLAS", "ZCL_PROBE", probeTestSource, &WriteSourceOptions{
+			// The main source's hash: right for main, wrong for the include.
+			Include: "testclasses", ExpectedSourceHash: SourceHash(mainSource),
+		})
+		if err != nil {
+			t.Fatalf("WriteSource: %v", err)
+		}
+		if result.Success {
+			t.Fatalf("a drifted include was written: %s", result.Message)
+		}
+		if puts := putPaths(snapshot()); len(puts) != 0 {
+			t.Fatalf("PUTs = %v, want none after drift", puts)
+		}
+	})
+}
+
+// The gate (read-only, operation type, package) runs before any LOCK.
+func TestWriteSourceClassIncludeGateRunsBeforeLock(t *testing.T) {
+	t.Run("allowed package: search precedes the lock", func(t *testing.T) {
+		c, snapshot := includeServer{packageName: "$TMP", opts: []Option{WithAllowedPackages("$TMP")}}.start(t)
+		result, err := c.WriteSource(context.Background(), "CLAS", "ZCL_PROBE", probeTestSource, &WriteSourceOptions{Include: "testclasses"})
+		if err != nil || !result.Success {
+			t.Fatalf("WriteSource: err=%v result=%+v", err, result)
+		}
+		calls := snapshot()
+		search, lock := -1, -1
+		for i, call := range calls {
+			if search < 0 && strings.Contains(call.path, "informationsystem/search") {
+				search = i
+			}
+			if lock < 0 && call.action == "LOCK" {
+				lock = i
+			}
+		}
+		if search < 0 || lock < 0 || search > lock {
+			t.Fatalf("package search must come before the LOCK: search=%d lock=%d calls=%+v", search, lock, calls)
+		}
+		for _, call := range calls[lock:] {
+			if strings.Contains(call.path, "informationsystem/search") {
+				t.Fatalf("a package lookup inside the lock window kills the handle (#91); calls=%+v", calls)
+			}
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		cfg  includeServer
+	}{
+		{"package not allowed", includeServer{packageName: "ZOTHER", opts: []Option{WithAllowedPackages("$TMP")}}},
+		{"read only", includeServer{opts: []Option{WithReadOnly()}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c, snapshot := tt.cfg.start(t)
+			result, err := c.WriteSource(context.Background(), "CLAS", "ZCL_PROBE", probeTestSource, &WriteSourceOptions{Include: "testclasses"})
+			if err == nil && result != nil && result.Success {
+				t.Fatalf("the gate let the write through: %+v", result)
+			}
+			for _, call := range snapshot() {
+				if call.action == "LOCK" || call.method == http.MethodPut {
+					t.Fatalf("a refused write reached %s %s", call.method, call.path)
+				}
+			}
+		})
+	}
+}
+
+func TestTestIncludeMissing(t *testing.T) {
+	ccau := "ZCL_PROBE" + strings.Repeat("=", 21) + "CCAU"
+	other := "ZCL_OTHER" + strings.Repeat("=", 21) + "CCAU"
+	keys := func(v1 string) string {
+		return `<properties><entry key="T100KEY-ID">ED</entry><entry key="T100KEY-NO">170</entry><entry key="T100KEY-V1">` + v1 + `</entry></properties>`
+	}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"404", &APIError{StatusCode: 404, Message: "not found"}, true},
+		{"500 ED 170 for this class", &APIError{StatusCode: 500, Message: "<message>" + ccau + " does not have any inactive version</message>" + keys(ccau)}, true},
+		{"500 ED 170, German logon", &APIError{StatusCode: 500, Message: "<message>" + ccau + " hat keine inaktive Version</message>" + keys(ccau)}, true},
+		{"500 English text for this class, no keys", &APIError{StatusCode: 500, Message: ccau + " does not have any inactive version"}, true},
+		{"500 bare English text", &APIError{StatusCode: 500, Message: "does not have any inactive version"}, false},
+		{"500 ED 170 for another class", &APIError{StatusCode: 500, Message: "<message>" + other + " does not have any inactive version</message>" + keys(other)}, false},
+		{"500 this class's include, another message", &APIError{StatusCode: 500, Message: "<message>" + ccau + " is locked</message>"}, false},
+		{"400 ED 170 for this class", &APIError{StatusCode: 400, Message: ccau + " does not have any inactive version" + keys(ccau)}, false},
+		{"not an API error", errors.New(ccau + " does not have any inactive version"), false},
+	}
+	for _, tt := range tests {
+		if got := testIncludeMissing(tt.err, "ZCL_PROBE"); got != tt.want {
+			t.Errorf("%s: testIncludeMissing = %v, want %v", tt.name, got, tt.want)
 		}
 	}
 }

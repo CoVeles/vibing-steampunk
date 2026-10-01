@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -127,9 +128,19 @@ func (c *Client) writeClassIncludeUpdate(ctx context.Context, name string, inclu
 	result.Transport, result.TransportNote = transport, trNote
 
 	createdInclude := false
+	created := func(message string) string {
+		if createdInclude {
+			return message + " (the testclasses include did not exist and was created)"
+		}
+		return message
+	}
 	err = c.UpdateClassInclude(ctx, name, include, source, lock.LockHandle, transport)
-	if err != nil && include == ClassIncludeTestClasses && testIncludeMissing(err) {
-		// A class has no testclasses include until one is created.
+	// Create the include only when the PUT itself said it is missing. A
+	// failure of the expected_source_hash precondition read is not a PUT
+	// failure: creating the include there would leave an empty one behind
+	// for a write that is then refused as drift.
+	var putErr *classIncludePutError
+	if err != nil && include == ClassIncludeTestClasses && errors.As(err, &putErr) && testIncludeMissing(putErr.err, name) {
 		if createErr := c.CreateTestInclude(ctx, name, lock.LockHandle, transport); createErr != nil {
 			err = fmt.Errorf("%w; creating the testclasses include also failed: %v", err, createErr)
 		} else {
@@ -138,50 +149,67 @@ func (c *Client) writeClassIncludeUpdate(ctx context.Context, name string, inclu
 		}
 	}
 	if err != nil {
-		return failUnderLock(fmt.Sprintf("Failed to update the %s include of %s: %v", include, name, err))
+		return failUnderLock(created(fmt.Sprintf("Failed to update the %s include of %s: %v", include, name, err)))
 	}
 
 	if err := c.UnlockObject(ctx, objectURL, lock.LockHandle); err != nil {
-		result.Message = fmt.Sprintf("The %s include was written, but unlocking %s failed: %v", include, name, err)
+		result.Message = created(fmt.Sprintf("The %s include was written, but unlocking %s failed: %v", include, name, err))
 		return result, nil
 	}
 
 	activation, err := c.Activate(ctx, objectURL, name)
 	result.Activation = activation
 	if err != nil {
-		result.Message = fmt.Sprintf("The %s include was written but not activated: %v", include, err)
+		result.Message = created(fmt.Sprintf("The %s include was written but not activated: %v", include, err))
 		return result, nil
 	}
 	if activation == nil || !activation.Success {
-		result.Message = fmt.Sprintf("The %s include was written, but activation failed - check activation messages", include)
+		result.Message = created(fmt.Sprintf("The %s include was written, but activation failed - check activation messages", include))
 		return result, nil
 	}
 
 	result.Success = true
-	result.Message = fmt.Sprintf("The %s include of %s was updated and activated", include, name)
-	if createdInclude {
-		result.Message = fmt.Sprintf("The %s include of %s was created, written and activated", include, name)
-	}
+	result.Message = created(fmt.Sprintf("The %s include of %s was updated and activated", include, name))
 	return result, nil
 }
 
-// testIncludeMissing reports whether a write to the testclasses include failed
-// because the class has no such include yet. A 7.58 does not answer that with
-// a 404: the PUT comes back 500 ExceptionResourceSaveFailure, message ED 170
-// "<class>====CCAU does not have any inactive version". The T100 key is
-// matched as well as the English text, so a logon language other than English
-// is recognised too.
-func testIncludeMissing(err error) bool {
+// classIncludePutError is a failure of the PUT that writes a class include,
+// as distinct from a failure of the reads before it (the expected_source_hash
+// precondition). Only a PUT failure can mean "this include does not exist yet".
+type classIncludePutError struct{ err error }
+
+func (e *classIncludePutError) Error() string { return "updating class include: " + e.err.Error() }
+func (e *classIncludePutError) Unwrap() error { return e.err }
+
+// classIncludeProgramName is the name of the ABAP include behind a class
+// include: the class name padded with '=' to 30 characters, then the suffix
+// (CCAU for testclasses).
+func classIncludeProgramName(className, suffix string) string {
+	if n := len(className); n < 30 {
+		className += strings.Repeat("=", 30-n)
+	}
+	return className + suffix
+}
+
+// testIncludeMissing reports whether the PUT to the testclasses include of
+// className failed because the class has no such include yet. That is a 404,
+// or what a 7.58 answers instead: 500 ExceptionResourceSaveFailure with
+// message ED 170, "<class>====CCAU does not have any inactive version". The
+// 500 counts only when it names this class's CCAU include and carries ED 170,
+// by T100 key or by the English text; the text alone is not enough, and the
+// key makes a logon language other than English work.
+func testIncludeMissing(err error, className string) bool {
 	if IsNotFoundError(err) {
 		return true
 	}
 	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError {
 		return false
 	}
 	msg := apiErr.Message
-	if strings.Contains(msg, `"T100KEY-ID">ED<`) && strings.Contains(msg, `"T100KEY-NO">170<`) {
-		return true
+	if !strings.Contains(strings.ToUpper(msg), classIncludeProgramName(strings.ToUpper(className), "CCAU")) {
+		return false
 	}
-	return strings.Contains(msg, "does not have any inactive version")
+	ed170 := strings.Contains(msg, `"T100KEY-ID">ED<`) && strings.Contains(msg, `"T100KEY-NO">170<`)
+	return ed170 || strings.Contains(msg, "does not have any inactive version")
 }
