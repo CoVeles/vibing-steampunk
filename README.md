@@ -502,6 +502,11 @@ works the same, polling. An upload committed but
 never handed to a job (the session ends, or a new upload begins) has its files
 deleted again.
 
+A request whose SID is the connected system's own (exported from this very
+system) is uploaded like any other: putting a system's own released request
+back into its queue -- after its files were lost, say -- is a legitimate use,
+and the import, if any, is still a human decision in STMS.
+
 The rules, checked in vsp and again in ZADT_VSP's `ZCL_VSP_TRANSPORT_SERVICE`:
 both files, matching number and SID, the cofile's shape (a header and an
 export step from its SID), 50 MB together; the target is always the server's

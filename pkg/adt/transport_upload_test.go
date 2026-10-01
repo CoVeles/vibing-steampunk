@@ -632,3 +632,14 @@ func TestDownloadTransportFilesRefusedUnderReadOnly(t *testing.T) {
 		t.Errorf("sent %v", ws.actions())
 	}
 }
+
+// A request exported from the connected system itself is uploaded like any
+// other (decided: review round 2, item 12) -- not refused for its SID.
+func TestUploadTransportOwnSID(t *testing.T) {
+	ws := newFakeTransportWS()
+	ws.system = "XYZ" // the request XYZK900001 comes from this very system
+	res, err := uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
+	if err != nil || res.Status != TransportPending {
+		t.Fatalf("%v %+v", err, res)
+	}
+}
