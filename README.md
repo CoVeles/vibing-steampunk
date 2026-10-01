@@ -808,20 +808,22 @@ The headline changes are in the **"New in the last three releases"** callout at 
   even with `--enable-transports`;
 - gCTS create, delete, clone, pull, commit and switch-branch;
 - code execution: `SAP(action="rfc")` `call`, `CallRFC` (`debug CALL_RFC`),
-  `RunReport` / `RunReportAsync`, and unit test runs that include dangerous or
-  critical tests (`include_dangerous`). Ordinary unit test runs still work;
+  `RunReport` / `RunReportAsync`, and unit test and code coverage runs
+  (`RunUnitTests`, `GetCodeCoverage`) that include dangerous or critical tests
+  (`include_dangerous`). Ordinary runs still work;
 - object and system changes: `SetTextElements`, `MoveObject` (`edit MOVE`,
   `debug MOVE`), publishing and unpublishing service bindings,
-  `SetPrettyPrinterSettings`, and MODIFY locks (`LockObject`, `edit LOCK`).
-  READ locks still work;
-- debugger variable writes (`DebuggerSetVariableValue`, and so Lua
-  `setVariable`, `forceReplay`, `injectCheckpoint`, `replayFromStep`).
+  `SetPrettyPrinterSettings`, and every lock except a READ lock
+  (`LockObject`, `edit LOCK`);
+- debugger variable writes through the ADT client (`DebuggerSetVariableValue`).
 
 **The CLI honours `read_only` in `.vsp.json` and `SAP_READ_ONLY`** for
 `vsp rfc call`, `rfc run`, `rfc adt` with a method other than GET/HEAD/OPTIONS,
 `vsp trace run --call`, `vsp trace unit --call`, the Run button of
-`vsp debug ui`, `run` and `call` in the `vsp debug` REPL, and `eset` and
-writing `adt` requests in the `vsp rfc debug` / `vsp adt debug` REPLs.
+`vsp debug ui`, `run` and `call` in the `vsp debug` REPL, `eset` and
+writing `adt` requests in the `vsp rfc debug` / `vsp adt debug` REPLs, and the
+`vsp lua` bindings that overwrite variables (`setVariable`, `injectCheckpoint`,
+`forceReplay`, `replayFromStep`).
 
 **`--block-free-sql`** (and `block_free_sql` / `SAP_BLOCK_FREE_SQL` on the
 CLI) refuses `rfc read_table` / `vsp rfc read-table` with a caller's WHERE.
