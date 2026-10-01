@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -306,72 +307,106 @@ func lockAsync(g contextGate, ctx context.Context) <-chan error {
 
 // A writer that gives up while queued must pass the turn on: the writer
 // behind it still gets the gate once it is free.
+//
+// The gate is a semaphore.Weighted, whose waiters block on channels, so the
+// whole test runs in a synctest bubble: synctest.Wait returns only once every
+// writer is parked in the queue, with no sleep to guess how long that takes.
 func TestContextGate_ACancelledWriterDoesNotStrandTheNext(t *testing.T) {
-	g := newContextGate()
-	if !g.tryShared() {
-		t.Fatal("a fresh gate refused a reader")
-	}
-
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	first := lockAsync(g, ctx1)
-	waitQueued(t, g)
-	second := lockAsync(g, context.Background())
-	time.Sleep(10 * time.Millisecond) // let the second writer queue behind the first
-
-	cancel1()
-	select {
-	case err := <-first:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("cancelled writer: got %v, want %v", err, context.Canceled)
+	synctest.Test(t, func(t *testing.T) {
+		g := newContextGate()
+		if !g.tryShared() {
+			t.Fatal("a fresh gate refused a reader")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the cancelled writer is still waiting")
-	}
 
-	g.releaseShared()
-	select {
-	case err := <-second:
-		if err != nil {
-			t.Fatalf("second writer: %v", err)
+		ctx1, cancel1 := context.WithCancel(context.Background())
+		first := lockAsync(g, ctx1)
+		synctest.Wait() // the first writer is queued behind the reader
+		if g.tryShared() {
+			t.Fatal("a reader got in past a queued writer: the first writer never queued")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the second writer never got the gate after the first gave up")
-	}
-	g.unlock()
+		second := lockAsync(g, context.Background())
+		synctest.Wait() // the second writer is queued behind the first
+
+		select {
+		case err := <-first:
+			t.Fatalf("the first writer left the queue before it was cancelled: %v", err)
+		case err := <-second:
+			t.Fatalf("the second writer left the queue before the gate was free: %v", err)
+		default:
+		}
+
+		cancel1()
+		synctest.Wait()
+		select {
+		case err := <-first:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancelled writer: got %v, want %v", err, context.Canceled)
+			}
+		default:
+			t.Fatal("the cancelled writer is still waiting")
+		}
+		select {
+		case err := <-second:
+			t.Fatalf("the second writer got the gate while the reader still held it: %v", err)
+		default:
+		}
+
+		g.releaseShared()
+		synctest.Wait()
+		select {
+		case err := <-second:
+			if err != nil {
+				t.Fatalf("second writer: %v", err)
+			}
+		default:
+			t.Fatal("the second writer never got the gate after the first gave up")
+		}
+		g.unlock()
+	})
 }
 
 // Writers get the gate in the order they asked for it.
+//
+// Each writer is started only once synctest.Wait has seen the one before it
+// park in the queue, so the arrival order is the loop order by construction.
 func TestContextGate_WritersAreServedInArrivalOrder(t *testing.T) {
-	g := newContextGate()
-	if err := g.lock(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		g := newContextGate()
+		if err := g.lock(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 
-	var mu sync.Mutex
-	var order []int
-	var wg sync.WaitGroup
-	for i := 1; i <= 3; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if err := g.lock(context.Background()); err != nil {
-				t.Errorf("writer %d: %v", i, err)
-				return
-			}
-			mu.Lock()
-			order = append(order, i)
-			mu.Unlock()
-			g.unlock()
-		}(i)
-		// Each writer has to be in the queue before the next one starts.
-		time.Sleep(20 * time.Millisecond)
-	}
-	g.unlock()
-	wg.Wait()
+		var mu sync.Mutex
+		var order []int
+		var wg sync.WaitGroup
+		for i := 1; i <= 3; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				if err := g.lock(context.Background()); err != nil {
+					t.Errorf("writer %d: %v", i, err)
+					return
+				}
+				mu.Lock()
+				order = append(order, i)
+				mu.Unlock()
+				g.unlock()
+			}(i)
+			// Each writer has to be in the queue before the next one starts.
+			synctest.Wait()
+		}
+		mu.Lock()
+		if len(order) != 0 {
+			t.Fatalf("writers %v got the gate while it was held", order)
+		}
+		mu.Unlock()
+		g.unlock()
+		wg.Wait()
 
-	if fmt.Sprint(order) != "[1 2 3]" {
-		t.Errorf("writers acquired in order %v, want [1 2 3]", order)
-	}
+		if fmt.Sprint(order) != "[1 2 3]" {
+			t.Errorf("writers acquired in order %v, want [1 2 3]", order)
+		}
+	})
 }
 
 // A stateless request that arrives while a request into the context waits
