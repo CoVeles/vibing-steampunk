@@ -88,14 +88,66 @@ func TestGenerateTableDDL_ClientField(t *testing.T) {
 			wantErr: "client_dependent is false",
 		},
 		{
-			name:    "a client field that is not the first key is refused",
+			name:    "a client-typed key field that is not the first key is refused",
 			opts:    tableOpts(id, mandt),
-			wantErr: "not the first key field",
+			wantErr: "only the first key field can be the client field",
+		},
+		{
+			name:    "a second client-typed key after the client field is refused",
+			opts:    tableOpts(mandt, TableField{Name: "MANDT2", Type: "CLNT", IsKey: true}),
+			wantErr: "only the first key field can be the client field",
 		},
 		{
 			name:    "a non-key MANDT field is refused rather than doubled",
 			opts:    tableOpts(TableField{Name: "MANDT", Type: "MANDT"}, id),
-			wantErr: "not the first key field",
+			wantErr: `no "key": true`,
+		},
+		{
+			// A data column that holds a client (the source client of a
+			// copy, say) is not the client field and is allowed.
+			name:       "a non-key client-typed data column is allowed",
+			opts:       tableOpts(mandt, id, TableField{Name: "SRC_CLIENT", Type: "MANDT"}),
+			wantClient: []string{"key mandt : mandt not null;", "src_client : mandt;"},
+		},
+		{
+			name:       "a non-key client-typed data column next to the added CLIENT",
+			opts:       tableOpts(id, TableField{Name: "SRC_CLIENT", Type: "CLNT"}),
+			wantClient: []string{"key client : abap.clnt not null;", "src_client : abap.clnt;"},
+		},
+		{
+			name:       "type is trimmed before it is recognised and mapped",
+			opts:       tableOpts(TableField{Name: "MANDT", Type: " clnt ", IsKey: true}, id),
+			wantClient: []string{"key mandt : abap.clnt not null;"},
+		},
+		{
+			// Named like a client field, typed with something vsp cannot
+			// place: guessing either way can double the client field.
+			name:    "first key named MANDT with an unknown type needs client_dependent",
+			opts:    tableOpts(TableField{Name: "MANDT", Type: "SYMANDT", IsKey: true}, id),
+			wantErr: "is MANDT your client field? pass client_dependent:true",
+		},
+		{
+			name:    "first key named CLIENT with type CHAR3 needs client_dependent",
+			opts:    tableOpts(TableField{Name: "client", Type: "CHAR3", IsKey: true}, id),
+			wantErr: "is CLIENT your client field?",
+		},
+		{
+			name: "client_dependent true makes a named MANDT first key the client field as is",
+			opts: func() CreateTableOptions {
+				o := tableOpts(TableField{Name: "MANDT", Type: "/ABC/MANDT", IsKey: true}, id)
+				o.ClientDependent = boolPtr(true)
+				return o
+			}(),
+			wantClient: nil, // no abap.clnt line added; /abc/mandt is used as is
+		},
+		{
+			name: "client_dependent false keeps a named MANDT first key as a plain field",
+			opts: func() CreateTableOptions {
+				o := tableOpts(TableField{Name: "MANDT", Type: "ZMANDT", IsKey: true}, id)
+				o.ClientDependent = boolPtr(false)
+				return o
+			}(),
+			wantClient: nil,
 		},
 		{
 			name:    "a field named CLIENT would collide with the added one",
@@ -139,7 +191,7 @@ func TestParseTableFields_RefusesUnknownAttributes(t *testing.T) {
 	}
 
 	for _, js := range []string{
-		`[{"name":"A","type":"INT4","notnull":true}]`,
+		`[{"name":"A","type":"INT4","not-null":true}]`,
 		`[{"name":"A","type":"INT4","is_key":true}]`,
 		`[{"name":"A","type":"INT4","nullable":false}]`,
 	} {
@@ -174,5 +226,51 @@ func TestParseTableFields_RequiresNameAndType(t *testing.T) {
 		if _, err := ParseTableFields(js); err == nil {
 			t.Errorf("%s: accepted", js)
 		}
+	}
+}
+
+// encoding/json matched attribute names case-insensitively before #254, so
+// "Key" and "NotNull" worked; the strict parser keeps that.
+func TestParseTableFields_AttributeNamesAreCaseInsensitive(t *testing.T) {
+	fields, err := ParseTableFields(`[{"Name":"ID","TYPE":"CHAR10","Key":true},{"name":"VAL","type":"INT4","NotNull":true,"notnull":false}]`)
+	if err == nil {
+		t.Fatalf("NotNull and notnull on one field were both accepted: %+v", fields)
+	}
+	if !strings.Contains(err.Error(), "twice") {
+		t.Errorf("error %q does not say the attribute is given twice", err)
+	}
+
+	fields, err = ParseTableFields(`[{"Name":"ID","TYPE":"CHAR10","Key":true},{"name":"VAL","type":"INT4","NotNull":true}]`)
+	if err != nil {
+		t.Fatalf("ParseTableFields: %v", err)
+	}
+	if fields[0].Name != "ID" || fields[0].Type != "CHAR10" || !fields[0].IsKey {
+		t.Errorf("field 1 = %+v", fields[0])
+	}
+	if !fields[1].NotNull {
+		t.Errorf("NotNull was dropped: %+v", fields[1])
+	}
+}
+
+func TestResolveCreateTableSpec_ParsesRawArguments(t *testing.T) {
+	no := "false"
+	opts, err := ResolveCreateTableSpec(CreateTableOptions{
+		FieldsJSON:         `[{"name":"ID","type":"CHAR10","key":true}]`,
+		ClientDependentArg: &no,
+	})
+	if err != nil {
+		t.Fatalf("ResolveCreateTableSpec: %v", err)
+	}
+	if len(opts.Fields) != 1 || opts.ClientDependent == nil || *opts.ClientDependent {
+		t.Errorf("resolved = %+v", opts)
+	}
+
+	bad := "maybe"
+	if _, err := ResolveCreateTableSpec(CreateTableOptions{FieldsJSON: `[{"name":"ID","type":"CHAR10"}]`, ClientDependentArg: &bad}); err == nil ||
+		!strings.Contains(err.Error(), "client_dependent must be true or false") {
+		t.Errorf("client_dependent=maybe: %v", err)
+	}
+	if _, err := ResolveCreateTableSpec(CreateTableOptions{FieldsJSON: `[]`}); err == nil {
+		t.Error("an empty field list was accepted")
 	}
 }

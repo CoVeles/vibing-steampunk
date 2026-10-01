@@ -97,10 +97,13 @@ Create object:
   SAP(action="create", target="OBJECT", params={"object_type": "MSAG/N", "name": "ZDEMO", "description": "Demo messages", "package_name": "$TMP", "language": "DE", "messages": {"001": "Auftrag & nicht gefunden"}})
   SAP(action="create", target="TABL", params={"name": "ZTABLE", "description": "New table", "package": "$TMP",
       "fields": "[{\"name\":\"MANDT\",\"type\":\"MANDT\",\"key\":true},{\"name\":\"ID\",\"type\":\"CHAR10\",\"key\":true},{\"name\":\"VAL\",\"type\":\"INT4\",\"notNull\":true}]"})
-      Field attributes: name, type, length, decimals, description, key, notNull (others are refused).
-      Client field: a first key field of type MANDT/CLNT is the client field. Without one, a
-      "key client : abap.clnt" is added in front. "client_dependent": false creates a
-      client-independent table with no client field.
+      Field attributes: name, type, length, decimals, description, key, notNull (any case; others are refused).
+      Client field: a first key field of type MANDT, CLIENT, CLNT or abap.clnt is the client field.
+      Without one, a "key client : abap.clnt" is added in front. A first key field named MANDT or
+      CLIENT with another type (SYMANDT, ZMANDT) is refused unless "client_dependent" is given;
+      true uses it as the client field as is. "client_dependent": false creates a
+      client-independent table with no client field. Non-key client-typed columns (SRC_CLIENT)
+      are plain data columns; a client-typed key field after the first is refused.
   SAP(action="create", target="CLONE", params={"object_type": "CLAS", "source_name": "ZCL_OLD", "target_name": "ZCL_NEW", "package": "$TMP"})
   SAP(action="create", target="STRUCT", params={"description": "Demo", "package": "$TMP",
       "source": "@AbapCatalog.enhancement.category : #EXTENSIBLE_ANY

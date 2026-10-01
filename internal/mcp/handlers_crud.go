@@ -356,17 +356,6 @@ func (s *Server) handleCreateTable(ctx context.Context, request mcp.CallToolRequ
 		return newToolResultError("fields is required (JSON array)"), nil
 	}
 
-	// Parse fields JSON. An unknown attribute (say "not_null" for "notNull")
-	// is refused rather than dropped (issue #254).
-	fields, err := adt.ParseTableFields(fieldsJSON)
-	if err != nil {
-		return newToolResultError(fmt.Sprintf("Invalid fields: %v", err)), nil
-	}
-
-	if len(fields) == 0 {
-		return newToolResultError("At least one field is required"), nil
-	}
-
 	// Optional parameters
 	pkg := "$TMP"
 	if p, ok := request.GetArguments()["package"].(string); ok && p != "" {
@@ -387,43 +376,42 @@ func (s *Server) handleCreateTable(ctx context.Context, request mcp.CallToolRequ
 		Name:          name,
 		Description:   description,
 		Package:       pkg,
-		Fields:        fields,
+		FieldsJSON:    fieldsJSON,
 		Transport:     transport,
 		DeliveryClass: deliveryClass,
 	}
 
 	// client_dependent: true/false (or "true"/"false"); left out, a client key
-	// field is added unless the first key field already is one.
+	// field is added unless the first key field already is one. The fields
+	// and this flag are handed over raw: CreateTable parses them after its
+	// mutation gate (issue #254), so --read-only and --allowed-packages answer
+	// a blocked caller before any complaint about the spec does.
 	if v, present := request.GetArguments()["client_dependent"]; present && v != nil {
-		var b bool
+		var raw string
 		switch t := v.(type) {
 		case bool:
-			b = t
+			raw = strconv.FormatBool(t)
 		case string:
-			parsed, perr := strconv.ParseBool(strings.TrimSpace(t))
-			if perr != nil {
-				return newToolResultError(fmt.Sprintf("client_dependent must be true or false, got %q", t)), nil
-			}
-			b = parsed
+			raw = t
 		default:
-			return newToolResultError(fmt.Sprintf("client_dependent must be true or false, got %v", v)), nil
+			raw = fmt.Sprintf("%v (%T)", v, v) // not a bool; refused after the gate
 		}
-		opts.ClientDependent = &b
+		opts.ClientDependentArg = &raw
 	}
 
-	// CreateTable checks the field list against the client setting after its
-	// mutation gate, so --read-only answers first.
 	if err := s.adtClient.CreateTable(ctx, opts); err != nil {
 		return newToolResultError(fmt.Sprintf("Failed to create table: %v", err)), nil
 	}
-	clientField, clientAdded, _ := adt.TableClientField(opts) // accepted by CreateTable above
+	// CreateTable accepted these, so neither call can fail here.
+	resolved, _ := adt.ResolveCreateTableSpec(opts)
+	clientField, clientAdded, _ := adt.TableClientField(resolved)
 
 	result := map[string]interface{}{
 		"status":      "created",
 		"table":       strings.ToUpper(name),
 		"package":     pkg,
 		"description": description,
-		"fields":      len(fields),
+		"fields":      len(resolved.Fields),
 	}
 	if clientField == "" {
 		result["client_dependent"] = false

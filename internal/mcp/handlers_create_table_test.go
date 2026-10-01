@@ -18,7 +18,7 @@ type tableStub struct {
 	sources []string
 }
 
-func newCreateTableTestServer(t *testing.T) (*Server, *tableStub) {
+func newCreateTableTestServer(t *testing.T, configure ...func(*Config)) (*Server, *tableStub) {
 	t.Helper()
 	stub := &tableStub{}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -44,14 +44,18 @@ func newCreateTableTestServer(t *testing.T) (*Server, *tableStub) {
 	}))
 	t.Cleanup(ts.Close)
 
-	server := NewServer(&Config{
+	cfg := &Config{
 		BaseURL:            ts.URL,
 		Username:           "u",
 		Password:           "p",
 		Client:             "001",
 		Language:           "EN",
 		InsecureSkipVerify: true,
-	})
+	}
+	for _, f := range configure {
+		f(cfg)
+	}
+	server := NewServer(cfg)
 	if server == nil {
 		t.Fatal("NewServer returned nil")
 	}
@@ -164,5 +168,88 @@ func TestCreateTable_RefusedBeforeSAP(t *testing.T) {
 				t.Errorf("a refused create still made %d request(s) to SAP", calls)
 			}
 		})
+	}
+}
+
+// A caller the mutation gate turns away hears the gate's reason. The spec is
+// parsed only behind the gate, so a typo in it must not pre-empt a read-only
+// or package refusal, and nothing may reach SAP either way.
+func TestCreateTable_GateAnswersBeforeTheSpec(t *testing.T) {
+	gates := map[string]struct {
+		configure func(*Config)
+		pkg       string
+		want      string
+	}{
+		"read-only": {
+			configure: func(c *Config) { c.ReadOnly = true },
+			pkg:       "$TMP",
+			want:      "blocked by safety configuration",
+		},
+		"package outside --allowed-packages": {
+			configure: func(c *Config) { c.AllowedPackages = []string{"$TMP"} },
+			pkg:       "ZDEMO_PROD",
+			want:      "ZDEMO_PROD",
+		},
+	}
+	specs := map[string]map[string]any{
+		"unknown field attribute": {
+			"fields": `[{"name":"ID","type":"CHAR10","key":true,"not_null":true}]`,
+		},
+		"client_dependent not a bool": {
+			"fields":           `[{"name":"ID","type":"CHAR10","key":true}]`,
+			"client_dependent": "maybe",
+		},
+	}
+	for gname, gate := range gates {
+		for sname, spec := range specs {
+			t.Run(gname+"/"+sname, func(t *testing.T) {
+				server, stub := newCreateTableTestServer(t, gate.configure)
+				params := map[string]any{"name": "ZDEMO_GATE", "description": "demo", "package": gate.pkg}
+				for k, v := range spec {
+					params[k] = v
+				}
+				text, isErr := createTable(t, server, params)
+				if !isErr {
+					t.Fatalf("accepted: %s", text)
+				}
+				if !strings.Contains(text, gate.want) {
+					t.Errorf("the refusal does not come from the gate (want %q): %s", gate.want, text)
+				}
+				for _, spoiler := range []string{"not_null", "client_dependent must be"} {
+					if strings.Contains(text, spoiler) {
+						t.Errorf("the spec was judged before the gate: %s", text)
+					}
+				}
+				if calls, _ := stub.snapshot(); calls != 0 {
+					t.Errorf("a refused create made %d request(s) to SAP", calls)
+				}
+			})
+		}
+	}
+}
+
+func TestCreateTable_NamedMANDTNeedsClientDependent(t *testing.T) {
+	fields := `[{"name":"MANDT","type":"SYMANDT","key":true},{"name":"ID","type":"CHAR10","key":true}]`
+
+	server, stub := newCreateTableTestServer(t)
+	text, isErr := createTable(t, server, map[string]any{"name": "ZDEMO_SYM", "description": "demo", "fields": fields})
+	if !isErr || !strings.Contains(text, "is MANDT your client field?") {
+		t.Fatalf("a key field named MANDT of unknown type was not questioned: %s", text)
+	}
+	if calls, _ := stub.snapshot(); calls != 0 {
+		t.Errorf("a refused create made %d request(s) to SAP", calls)
+	}
+
+	server, stub = newCreateTableTestServer(t)
+	text, isErr = createTable(t, server, map[string]any{"name": "ZDEMO_SYM", "description": "demo", "fields": fields, "client_dependent": true})
+	if isErr {
+		t.Fatalf("client_dependent:true was refused: %s", text)
+	}
+	_, sources := stub.snapshot()
+	if len(sources) != 1 || strings.Contains(sources[0], "key client") || !strings.Contains(sources[0], "key mandt : symandt not null;") {
+		t.Fatalf("MANDT was not used as the client field as is:\n%v", sources)
+	}
+	if !strings.Contains(text, `"client_field": "MANDT"`) {
+		t.Errorf("result does not name MANDT as the client field: %s", text)
 	}
 }
