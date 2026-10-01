@@ -511,7 +511,9 @@ func (c *Client) GetClassMethods(ctx context.Context, className string) ([]Metho
 
 // GetClassObjectStructure returns the full parsed class structure (methods, attributes, types, events).
 func (c *Client) GetClassObjectStructure(ctx context.Context, className string) (*ClassObjectStructure, error) {
-	className = strings.ToUpper(className)
+	// The name may arrive already escaped from a URL; normalize to the raw
+	// name so it is escaped exactly once below.
+	className = strings.ToUpper(unescapeObjectName(className))
 
 	path := fmt.Sprintf("/sap/bc/adt/oo/classes/%s/objectstructure", url.PathEscape(className))
 	resp, err := c.transport.Request(ctx, path, &RequestOptions{

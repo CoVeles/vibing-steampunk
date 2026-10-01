@@ -1156,7 +1156,7 @@ func unescapeObjectName(name string) string {
 // GetClassIncludeURL returns the URL for a class include.
 // Supports namespaced classes like /UI5/CL_REPOSITORY_LOAD.
 func GetClassIncludeURL(className string, includeType ClassIncludeType) string {
-	className = strings.ToUpper(className)
+	className = strings.ToUpper(unescapeObjectName(className))
 	encodedName := url.PathEscape(className)
 	if includeType == ClassIncludeMain {
 		return fmt.Sprintf("/sap/bc/adt/oo/classes/%s/source/main", encodedName)
@@ -1186,7 +1186,9 @@ func GetClassIncludeSourceURL(className string, includeType ClassIncludeType) st
 // Requires a lock on the parent class.
 // Supports namespaced classes.
 func (c *Client) CreateTestInclude(ctx context.Context, className string, lockHandle string, transport string) error {
-	className = strings.ToUpper(className)
+	// The name may arrive already escaped from a URL; normalize to the raw
+	// name so it is escaped exactly once below.
+	className = strings.ToUpper(unescapeObjectName(className))
 
 	// Unified mutation policy gate (op type + parent class package + transport)
 	if err := c.checkMutation(ctx, MutationContext{

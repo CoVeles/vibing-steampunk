@@ -91,3 +91,52 @@ func TestGetClassMethods_EscapesNameOnce(t *testing.T) {
 		})
 	}
 }
+
+func TestGetClassIncludeURL_EscapesOnce(t *testing.T) {
+	for _, tc := range namespacedClassNameCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, want := GetClassIncludeURL(tc.in, ClassIncludeTestClasses), "/sap/bc/adt/oo/classes/"+tc.want+"/includes/testclasses"; got != want {
+				t.Errorf("include: %s, want %s", got, want)
+			}
+			if got, want := GetClassIncludeURL(tc.in, ClassIncludeMain), "/sap/bc/adt/oo/classes/"+tc.want+"/source/main"; got != want {
+				t.Errorf("main: %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestGetClassObjectStructure_EscapesNameOnce(t *testing.T) {
+	for _, tc := range namespacedClassNameCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, paths := escapedPathServer(t, `<?xml version="1.0" encoding="UTF-8"?><abapsource:objectStructureElement xmlns:abapsource="http://www.sap.com/adt/abapsource" xmlns:adtcore="http://www.sap.com/adt/core"/>`)
+			if _, err := client.GetClassObjectStructure(context.Background(), tc.in); err != nil {
+				t.Fatalf("GetClassObjectStructure: %v", err)
+			}
+			want := "GET /sap/bc/adt/oo/classes/" + tc.want + "/objectstructure"
+			if got := paths(); len(got) == 0 || got[len(got)-1] != want {
+				t.Errorf("requests %v, want last %q", got, want)
+			}
+		})
+	}
+}
+
+func TestCreateTestInclude_EscapesNameOnce(t *testing.T) {
+	for _, tc := range namespacedClassNameCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, paths := escapedPathServer(t, "")
+			if err := client.CreateTestInclude(context.Background(), tc.in, "LOCK", ""); err != nil {
+				t.Fatalf("CreateTestInclude: %v", err)
+			}
+			want := "POST /sap/bc/adt/oo/classes/" + tc.want + "/includes"
+			var found bool
+			for _, p := range paths() {
+				if p == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("no %q among requests %v", want, paths())
+			}
+		})
+	}
+}
