@@ -1142,6 +1142,17 @@ func ClassIncludeForSection(section string) (ClassIncludeType, bool) {
 	return ClassIncludeMain, false
 }
 
+// unescapeObjectName returns the raw object name for a name that may arrive
+// already escaped from a URL (%2FDMO%2FCL_FLIGHT -> /DMO/CL_FLIGHT), so the
+// caller can escape it exactly once. A name that is not a valid escape
+// sequence is returned unchanged.
+func unescapeObjectName(name string) string {
+	if raw, err := url.PathUnescape(name); err == nil {
+		return raw
+	}
+	return name
+}
+
 // GetClassIncludeURL returns the URL for a class include.
 // Supports namespaced classes like /UI5/CL_REPOSITORY_LOAD.
 func GetClassIncludeURL(className string, includeType ClassIncludeType) string {
@@ -1156,8 +1167,11 @@ func GetClassIncludeURL(className string, includeType ClassIncludeType) string {
 // GetClassIncludeSourceURL returns the source URL for a class include.
 // Note: For includes other than main, the URL does NOT have /source/main suffix
 // Supports namespaced classes like /UI5/CL_REPOSITORY_LOAD.
+//
+// The name may be raw (/DMO/CL_FLIGHT) or already escaped from a URL
+// (%2FDMO%2FCL_FLIGHT); either way it is escaped exactly once.
 func GetClassIncludeSourceURL(className string, includeType ClassIncludeType) string {
-	className = strings.ToUpper(className)
+	className = strings.ToUpper(unescapeObjectName(className))
 	encodedName := url.PathEscape(className)
 	if includeType == ClassIncludeMain {
 		return fmt.Sprintf("/sap/bc/adt/oo/classes/%s/source/main", encodedName)

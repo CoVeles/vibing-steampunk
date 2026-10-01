@@ -487,7 +487,9 @@ func (c *Client) GetClassSource(ctx context.Context, className string) (string, 
 // GetClassMethods retrieves the list of methods in a class with their source line boundaries.
 // This is useful for method-level source operations (GetSource with method, EditSource with method).
 func (c *Client) GetClassMethods(ctx context.Context, className string) ([]MethodInfo, error) {
-	className = strings.ToUpper(className)
+	// The name may arrive already escaped from a URL; normalize to the raw
+	// name so it is escaped exactly once below.
+	className = strings.ToUpper(unescapeObjectName(className))
 
 	// Fetch objectstructure endpoint
 	path := fmt.Sprintf("/sap/bc/adt/oo/classes/%s/objectstructure", url.PathEscape(className))
