@@ -26,6 +26,8 @@ type uploadFakeWS struct {
 	actions []string
 	dials   int
 	client  string
+	// loseAdd makes add_to_buffer's answer get lost.
+	loseAdd bool
 }
 
 func (f *uploadFakeWS) SendDomainRequest(_ context.Context, domain, action string, params map[string]any, _ time.Duration) (*adt.WSResponse, error) {
@@ -43,6 +45,9 @@ func (f *uploadFakeWS) SendDomainRequest(_ context.Context, domain, action strin
 		data = map[string]any{"status": "done", "system": "QAS", "client": f.client, "file_exists": true, "total": 1,
 			"entries": []any{map[string]any{"trkorr": "XYZK900001", "raw": "XYZK900001 K758 TESTUSER"}}}
 	case "add_to_buffer":
+		if f.loseAdd {
+			return nil, context.DeadlineExceeded
+		}
 		data = map[string]any{"status": "pending", "ticket": "47110001", "job": "ZVSP_TRANSPORT_BUFFER", "job_count": "47110001", "request": "XYZK900001"}
 	case "add_status":
 		data = map[string]any{"request": "XYZK900001", "system": "QAS", "outcome": "queued", "job_count": params["job"],
@@ -274,5 +279,19 @@ func TestTransportStatusView(t *testing.T) {
 		"action": "system", "params": map[string]any{"type": "transport_status", "transport": "XYZK900001"}}))
 	if !res.IsError || ws.dialed() != 0 {
 		t.Errorf("without --enable-transports: %s, dials %d", uploadResultText(res), ws.dialed())
+	}
+}
+
+// A lost add_to_buffer answer is reported as unknown, with where to look --
+// never as "not added".
+func TestUploadTransportLostAddIsUnknown(t *testing.T) {
+	co, da := uploadFiles(t)
+	s, ws := uploadServer(t, nil)
+	ws.loseAdd = true
+	res := callUpload(t, s, map[string]any{"cofile_path": co, "datafile_path": da})
+	text := uploadResultText(res)
+	if !res.IsError || !strings.Contains(text, `"status": "unknown"`) || !strings.Contains(text, "STMS") || !strings.Contains(text, "SM37") ||
+		strings.Contains(text, "was not added") {
+		t.Errorf("got %s", text)
 	}
 }

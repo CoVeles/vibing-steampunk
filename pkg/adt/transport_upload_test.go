@@ -491,8 +491,45 @@ func TestUploadTransportAddFailure(t *testing.T) {
 	ws = newFakeTransportWS()
 	ws.addErr = &WSError{Code: "SERVICE_EXCEPTION", Message: "connection reset"}
 	res, err = uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
-	if err == nil || res.Status != TransportUnknown || !res.FilesWritten || !strings.Contains(res.Note, "unknown") {
+	if err == nil || res.Status != TransportUnknown || !res.FilesWritten || !strings.Contains(res.Note, "unknown") ||
+		!strings.Contains(res.Note, "STMS") || !strings.Contains(res.Note, "SM37") || strings.Contains(res.Note, "  ") {
 		t.Errorf("lost answer: %v %+v", err, res)
+	}
+}
+
+// lostCommitWS answers everything but commit, whose answer is lost.
+type lostCommitWS struct{ *fakeTransportWS }
+
+func (l lostCommitWS) SendDomainRequest(ctx context.Context, domain, action string, params map[string]any, d time.Duration) (*WSResponse, error) {
+	if action == "upload_files" && params["step"] == "commit" {
+		return nil, context.DeadlineExceeded
+	}
+	return l.fakeTransportWS.SendDomainRequest(ctx, domain, action, params, d)
+}
+
+// Only certainty is said: a lost commit answer leaves the files unknown --
+// but no add was sent, so "not added" is certain.
+func TestUploadTransportLostCommitAnswer(t *testing.T) {
+	ws := lostCommitWS{newFakeTransportWS()}
+	res, err := uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
+	if err == nil || res == nil || res.FilesWritten || res.Status != TransportNotAdded ||
+		!strings.Contains(res.Note, "whether its files were written to DIR_TRANS is unknown") {
+		t.Fatalf("%v %+v", err, res)
+	}
+	for _, a := range ws.actions() {
+		if a == "add_to_buffer" {
+			t.Error("add_to_buffer sent after a lost commit answer")
+		}
+	}
+}
+
+// A status without a buffer read is no verdict, whatever the job did.
+func TestTransportAddStatusWithoutBufferIsUnknown(t *testing.T) {
+	ws := newFakeTransportWS()
+	ws.statuses = []map[string]any{{"outcome": "job_failed", "job_status": "A", "buffer_error": "cannot be listed", "system": "QAS"}}
+	st, err := uploadClient(enabled()).TransportAddStatus(context.Background(), ws, "XYZK900001", "47110001")
+	if err != nil || st.Outcome != TransportUnknown || !strings.Contains(st.Note, "SM37") || !strings.Contains(st.Note, "47110001") {
+		t.Errorf("%+v %v", st, err)
 	}
 }
 

@@ -563,6 +563,10 @@ func (c *Client) TransportAddStatus(ctx context.Context, ws TransportService, re
 	if st.JobCount == "" {
 		st.JobCount = jobCount
 	}
+	// Without a buffer read there is no verdict either way.
+	if st.BufferError != "" {
+		st.Outcome = TransportUnknown
+	}
 	if st.Job == "" && st.JobCount != "" {
 		st.Job = transportJobName
 	}
@@ -685,7 +689,11 @@ func transportOutcomeNote(request, system, outcome, job, jobCount string) string
 	if job == "" {
 		job = transportJobName
 	}
-	where := fmt.Sprintf("check the import queue in STMS and job %s %s in SM37", job, jobCount)
+	jobRef := job + " " + jobCount
+	if jobCount == "" {
+		jobRef = "the latest " + job + " (its number never arrived)"
+	}
+	where := fmt.Sprintf("check the import queue in STMS and job %s in SM37", jobRef)
 	switch outcome {
 	case TransportQueued:
 		return fmt.Sprintf("%s is in the import queue of %s and has NOT been imported. Import it, if at all, in STMS.", request, system)
@@ -848,7 +856,20 @@ func (c *Client) UploadTransport(ctx context.Context, ws TransportService, files
 	if err := transportCall(ctx, ws, "upload_files", map[string]any{
 		"step": "commit", "assembly_id": begin.AssemblyID,
 	}, 5*time.Minute, &commit); err != nil {
-		return nil, err
+		var se *TransportServiceError
+		if errors.As(err, &se) {
+			// ZADT_VSP answered: the commit refused, and deleted whatever it
+			// had written; add_to_buffer was never sent.
+			res.Status = TransportNotAdded
+			res.Note = fmt.Sprintf("%s was not added to the import queue; the commit was refused (%s)", files.Request, se.Code)
+			return res, err
+		}
+		// The answer was lost: the files may or may not be in DIR_TRANS.
+		// No add was asked for.
+		res.Status = TransportNotAdded
+		res.Note = fmt.Sprintf("%s was not added to the import queue (no add was sent), but whether its files were written to DIR_TRANS is unknown -- "+
+			"vsp transport status %s shows whether they are there", files.Request, files.Request)
+		return res, err
 	}
 	res.FilesWritten = true
 	res.CofilePath, res.DataPath = commit.CofilePath, commit.DataPath
