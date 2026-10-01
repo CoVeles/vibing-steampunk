@@ -86,13 +86,6 @@ func newFakeSAP(t *testing.T) *fakeSAP {
 }
 
 const (
-	fakeSearchHit = `<?xml version="1.0" encoding="utf-8"?>` +
-		`<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
-		`<adtcore:objectReference adtcore:uri="/sap/bc/adt/programs/programs/zdemo_report" adtcore:type="PROG/P"` +
-		` adtcore:name="ZDEMO_REPORT" adtcore:packageName="$TMP" adtcore:description="Demo"/>` +
-		`<adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_demo" adtcore:type="CLAS/OC"` +
-		` adtcore:name="ZCL_DEMO" adtcore:packageName="$TMP" adtcore:description="Demo"/>` +
-		`</adtcore:objectReferences>`
 	fakeLockResult = `<?xml version="1.0" encoding="utf-8"?>` +
 		`<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA>` +
 		`<LOCK_HANDLE>FAKELOCKHANDLE</LOCK_HANDLE><CORRNR></CORRNR><IS_LOCAL>X</IS_LOCAL>` +
@@ -132,7 +125,7 @@ func (f *fakeSAP) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(fakeLockResult))
 	case strings.Contains(r.URL.Path, "/informationsystem/search"):
 		w.Header().Set("Content-Type", "application/xml")
-		_, _ = w.Write([]byte(fakeSearchHit))
+		_, _ = w.Write([]byte(fakeSearchHits(q.Get("query"))))
 	case strings.Contains(r.URL.Path, "/source/"):
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte(fakeSource))
@@ -143,6 +136,39 @@ func (f *fakeSAP) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		_, _ = w.Write([]byte(fakeEmptyXML))
 	}
+}
+
+// fakeSearchKinds are the repository collections a search hit is offered in:
+// whatever name is searched for exists as each of them, in $TMP, so that a
+// package lookup by object URL resolves for any object a probe names.
+var fakeSearchKinds = []struct{ collection, typ string }{
+	{"programs/programs", "PROG/P"},
+	{"programs/includes", "PROG/I"},
+	{"oo/classes", "CLAS/OC"},
+	{"oo/interfaces", "INTF/OI"},
+	{"functions/groups", "FUGR/F"},
+	{"ddic/dataelements", "DTEL/DE"},
+	{"ddic/domains", "DOMA/DD"},
+	{"ddic/tables", "TABL/DT"},
+	{"ddic/ddl/sources", "DDLS/DF"},
+	{"messageclass", "MSAG/N"},
+}
+
+// fakeSearchHits answers a repository search for query with one hit per
+// fakeSearchKinds entry, all in $TMP.
+func fakeSearchHits(query string) string {
+	name := strings.ToUpper(strings.Trim(strings.TrimSpace(query), "*"))
+	if name == "" {
+		name = "ZDEMO_REPORT"
+	}
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">`)
+	for _, k := range fakeSearchKinds {
+		fmt.Fprintf(&b, `<adtcore:objectReference adtcore:uri="/sap/bc/adt/%s/%s" adtcore:type="%s" adtcore:name="%s" adtcore:packageName="$TMP" adtcore:description="Demo"/>`,
+			k.collection, strings.ToLower(name), k.typ, name)
+	}
+	b.WriteString(`</adtcore:objectReferences>`)
+	return b.String()
 }
 
 func (f *fakeSAP) take() []sentRequest {
@@ -1744,7 +1770,11 @@ var packageGated = map[string]string{
 const gapActivationPackage = "activation is checked as an operation (A) but not against --allowed-packages: resolving each " +
 	"object's package would add a lookup to every write workflow's activation, and fail closed for objects the quick search cannot place"
 
-var packageRefusal = regexp.MustCompile(`(?i)package`)
+// packageRefusal is the package gate's own wording: CheckPackage's refusal
+// of $TMP, or the UI5 surface's fail-closed refusal (no app→package
+// resolution yet). A lookup error that merely mentions a package is not it.
+var packageRefusal = regexp.MustCompile(`operations on package '\$TMP' are blocked by safety configuration|` +
+	`on UI5 surface is blocked: UI5 app→package resolution not yet implemented`)
 
 func testPackageGate(t *testing.T) {
 	env := newInvariantEnv(t, func(base string) *Config {
