@@ -1033,17 +1033,17 @@ func (c *Client) DownloadTransportFiles(ctx context.Context, ws TransportService
 		var out []byte
 		for {
 			var a transportDownloadAnswer
-			if err := transportCall(ctx, ws, "download_files", map[string]any{
+			if callErr := transportCall(ctx, ws, "download_files", map[string]any{
 				"request": request, "file": kind, "offset": len(out), "length": transportDownloadChunk,
 			}, 2*time.Minute, &a); err != nil {
-				return nil, err
+				return nil, callErr
 			}
 			if a.Size > limit {
 				return nil, fmt.Errorf("the %s file of %s is %d bytes, over the %d-byte limit", kind, request, a.Size, limit)
 			}
-			chunk, err := base64.StdEncoding.DecodeString(a.ChunkB64)
-			if err != nil {
-				return nil, fmt.Errorf("the %s file of %s: unreadable chunk: %w", kind, request, err)
+			chunk, decErr := base64.StdEncoding.DecodeString(a.ChunkB64)
+			if decErr != nil {
+				return nil, fmt.Errorf("the %s file of %s: unreadable chunk: %w", kind, request, decErr)
 			}
 			if a.Offset != len(out) {
 				return nil, fmt.Errorf("the %s file of %s: asked for offset %d, got %d", kind, request, len(out), a.Offset)

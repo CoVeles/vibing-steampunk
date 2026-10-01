@@ -58,14 +58,14 @@ and S_CTS_ADMI with EPS1 (files) and TADD (buffer) on the system.
 		if err != nil {
 			return err
 		}
-		if err := client.CheckTransportUpload(""); err != nil {
+		if err = client.CheckTransportUpload(""); err != nil {
 			return err
 		}
 		request, _, _, err := adt.TransportRequestFromFileNames(filepath.Base(cofile), filepath.Base(datafile))
 		if err != nil {
 			return err
 		}
-		if err := client.CheckTransportUpload(request); err != nil {
+		if err = client.CheckTransportUpload(request); err != nil {
 			return err
 		}
 		files, err := adt.ReadTransportFiles(cofile, datafile)
@@ -181,7 +181,7 @@ buffer is read. Read-only: no tp, nothing written. Requires --enable-transports.
 		if err != nil {
 			return err
 		}
-		if err := client.CheckTransportBufferRead(args[0], "TransportAddStatus"); err != nil {
+		if err = client.CheckTransportBufferRead(args[0], "TransportAddStatus"); err != nil {
 			return err
 		}
 		ws, closeWS, err := transportServiceWS(client)
@@ -221,7 +221,7 @@ nothing written. Allowed under --read-only. Requires --enable-transports.
 		if err != nil {
 			return err
 		}
-		if err := client.CheckTransportBufferRead(request, "TransportBuffer"); err != nil {
+		if err = client.CheckTransportBufferRead(request, "TransportBuffer"); err != nil {
 			return err
 		}
 		ws, closeWS, err := transportServiceWS(client)
@@ -277,7 +277,7 @@ carry table contents, so this is treated as a sensitive read: it requires
 		if err != nil {
 			return err
 		}
-		if err := client.CheckTransportDownload(args[0]); err != nil {
+		if err = client.CheckTransportDownload(args[0]); err != nil {
 			return err
 		}
 		cofileName, dataName, err := adt.TransportFileNamesForRequest(args[0])
@@ -285,10 +285,10 @@ carry table contents, so this is treated as a sensitive read: it requires
 			return err
 		}
 		for _, n := range []string{cofileName, dataName} {
-			if _, err := os.Lstat(filepath.Join(dir, n)); err == nil {
+			if _, statErr := os.Lstat(filepath.Join(dir, n)); statErr == nil {
 				return fmt.Errorf("%s exists; not overwritten", filepath.Join(dir, n))
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return err
+			} else if !errors.Is(statErr, os.ErrNotExist) {
+				return statErr
 			}
 		}
 		ws, closeWS, err := transportServiceWS(client)

@@ -157,10 +157,10 @@ func TestReadTransportFiles(t *testing.T) {
 		t.Fatalf("%+v %v", f, err)
 	}
 
-	if _, err := ReadTransportFiles(co, ""); err == nil {
+	if _, err = ReadTransportFiles(co, ""); err == nil {
 		t.Error("missing data file path accepted")
 	}
-	if _, err := ReadTransportFiles(co, filepath.Join(dir, "R900002.XYZ")); err == nil {
+	if _, err = ReadTransportFiles(co, filepath.Join(dir, "R900002.XYZ")); err == nil {
 		t.Error("unpaired files accepted")
 	}
 
@@ -168,13 +168,13 @@ func TestReadTransportFiles(t *testing.T) {
 	ldir := t.TempDir()
 	link := filepath.Join(ldir, "R900001.XYZ")
 	must(t, os.Symlink(da, link))
-	if _, err := ReadTransportFiles(co, link); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+	if _, err = ReadTransportFiles(co, link); err == nil || !strings.Contains(err.Error(), "symbolic link") {
 		t.Errorf("symlink: %v", err)
 	}
 	// A directory is refused.
 	ddir := t.TempDir()
 	must(t, os.Mkdir(filepath.Join(ddir, "R900001.XYZ"), 0o700))
-	if _, err := ReadTransportFiles(co, filepath.Join(ddir, "R900001.XYZ")); err == nil || !strings.Contains(err.Error(), "regular") {
+	if _, err = ReadTransportFiles(co, filepath.Join(ddir, "R900001.XYZ")); err == nil || !strings.Contains(err.Error(), "regular") {
 		t.Errorf("directory: %v", err)
 	}
 	// An oversize file is refused before it is read.
@@ -367,7 +367,7 @@ func (f *fakeTransportWS) SendDomainRequest(_ context.Context, domain, action st
 func (f *fakeTransportWS) actions() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []string
+	out := make([]string, 0, len(f.calls))
 	for _, c := range f.calls {
 		a := c.Action
 		if s, ok := c.Params["step"].(string); ok {

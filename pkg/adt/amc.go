@@ -40,14 +40,14 @@ func (c *Client) UpsertAMCApplication(ctx context.Context, name, description, pk
 	switch {
 	case err == nil:
 	case IsNotFoundError(err):
-		if err := c.checkSafety(OpCreate, "UpsertAMCApplication"); err != nil {
+		if err = c.checkSafety(OpCreate, "UpsertAMCApplication"); err != nil {
 			return err
 		}
 		body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <blue:blueSource xmlns:blue="http://www.sap.com/wbobj/blue" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:description="%s" adtcore:name="%s" adtcore:type="SAMC" adtcore:masterLanguage="EN">
   <adtcore:packageRef adtcore:name="%s"/>
 </blue:blueSource>`, escapeXML(description), escapeXML(name), escapeXML(pkg))
-		if _, err := c.transport.Request(ctx, amcCollection, &RequestOptions{
+		if _, err = c.transport.Request(ctx, amcCollection, &RequestOptions{
 			Method:      http.MethodPost,
 			Body:        []byte(body),
 			ContentType: "application/vnd.sap.adt.blues.v1+xml",

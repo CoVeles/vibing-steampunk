@@ -345,8 +345,9 @@ func checkTransportService(src string) []string {
 	}
 
 	// show_buffer and add_status read and do nothing else.
-	var reads []string
-	for _, m := range []string{"HANDLE_SHOW_BUFFER", "READ_BUFFER_FILE", "BUFFER_LINES", "HANDLE_ADD_STATUS"} {
+	readers := []string{"HANDLE_SHOW_BUFFER", "READ_BUFFER_FILE", "BUFFER_LINES", "HANDLE_ADD_STATUS"}
+	reads := make([]string, 0, 64*len(readers))
+	for _, m := range readers {
 		reads = append(reads, methodStatements(stmts, m)...)
 	}
 	for _, st := range reads {

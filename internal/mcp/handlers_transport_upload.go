@@ -130,7 +130,7 @@ func (s *Server) handleUploadTransport(ctx context.Context, request mcp.CallTool
 	if err != nil {
 		return newToolResultError(err.Error()), nil
 	}
-	if err := s.adtClient.CheckTransportUpload(req); err != nil {
+	if err = s.adtClient.CheckTransportUpload(req); err != nil {
 		return newToolResultError(err.Error()), nil
 	}
 
