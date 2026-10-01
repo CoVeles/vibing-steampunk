@@ -71,3 +71,44 @@ func TestHandleSearchObject_ServerSideTypeFilter(t *testing.T) {
 		t.Errorf("query = %q, want %q", got, "Z*")
 	}
 }
+
+// SAP(action="search", params={"exact": true}) keeps only the objects named
+// exactly as the query, with the type and max filters still applied.
+func TestRouteSearchExact(t *testing.T) {
+	var searchQuery url.Values
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "informationsystem/search") {
+			searchQuery = r.URL.Query()
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>` +
+			`<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
+			`<adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_order" adtcore:type="CLAS/OC" adtcore:name="ZCL_ORDER"/>` +
+			`<adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_order_item" adtcore:type="CLAS/OC" adtcore:name="ZCL_ORDER_ITEM"/>` +
+			`</adtcore:objectReferences>`))
+	}))
+	defer ts.Close()
+	server := NewServer(&Config{BaseURL: ts.URL, Username: "u", Password: "p", Client: "001", Language: "EN"})
+
+	res, err := server.handleUniversalTool(context.Background(), newRequest(map[string]any{
+		"action": "search", "target": "zcl_order",
+		"params": map[string]any{"exact": true, "type": "CLAS", "max": float64(5)},
+	}))
+	if err != nil || res.IsError {
+		t.Fatalf("search failed: %v %+v", err, res)
+	}
+	text := resultText(res)
+	if !strings.Contains(text, `"ZCL_ORDER"`) || strings.Contains(text, "ZCL_ORDER_ITEM") {
+		t.Fatalf("want only ZCL_ORDER, got %s", text)
+	}
+	if searchQuery.Get("objectType") != "CLAS/OC" {
+		t.Fatalf("type filter not sent: %v", searchQuery)
+	}
+
+	res, _ = server.handleUniversalTool(context.Background(), newRequest(map[string]any{
+		"action": "search", "target": "ZCL_*", "params": map[string]any{"exact": true},
+	}))
+	if !res.IsError || !strings.Contains(resultText(res), "not a pattern") {
+		t.Fatalf("exact with a wildcard must be refused, got %s", resultText(res))
+	}
+}

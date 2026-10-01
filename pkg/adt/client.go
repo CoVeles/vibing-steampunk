@@ -403,6 +403,47 @@ func (c *Client) SearchObjectByType(ctx context.Context, query, objectType strin
 	return ParseSearchResults(resp.Body)
 }
 
+// exactSearchFetch is how many hits an exact-name search asks the quick
+// search for before keeping the equal names. The quick search matches a
+// name as a prefix, so the object itself competes with every longer name it
+// begins; the window is wide so that it is not cut off by them.
+const exactSearchFetch = 1000
+
+// SearchObjectExact returns the objects whose name equals name, ignoring
+// case, optionally of one type, at most maxResults of them (0: no limit).
+// A name can belong to several objects of different types (a program and a
+// class, a function group and its main program), so the answer is a list.
+func (c *Client) SearchObjectExact(ctx context.Context, name, objectType string, maxResults int) ([]SearchResult, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("exact search needs a name")
+	}
+	if strings.ContainsAny(name, "*?") {
+		return nil, fmt.Errorf("exact search takes a name, not a pattern: %q (drop exact to search by pattern)", name)
+	}
+	results, err := c.SearchObjectByType(ctx, name, objectType, exactSearchFetch)
+	if err != nil {
+		return nil, err
+	}
+	out := FilterExactName(results, name)
+	if maxResults > 0 && len(out) > maxResults {
+		out = out[:maxResults]
+	}
+	return out, nil
+}
+
+// FilterExactName keeps the results whose name equals name, ignoring case.
+func FilterExactName(results []SearchResult, name string) []SearchResult {
+	name = strings.TrimSpace(name)
+	out := make([]SearchResult, 0, len(results))
+	for _, r := range results {
+		if strings.EqualFold(strings.TrimSpace(r.Name), name) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // ResolveObjectRef converts a "TYPE NAME" shorthand (e.g. "INCL ZREP_F01", "PROG ZREPORT")
 // into the (objectURL, objectName) pair needed for activation or other ADT operations.
 // The name is returned in UPPERCASE; the URL uses lowercase path encoding.

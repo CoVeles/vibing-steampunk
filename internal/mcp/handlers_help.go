@@ -134,7 +134,10 @@ High-level create (with source):
 		return mcp.NewToolResultText(`SAP(action="search") - Search for objects
 
   SAP(action="search", target="ZCL_*")
-  SAP(action="search", target="ZCL_*", params={"maxResults": 50})`)
+  SAP(action="search", target="ZCL_*", params={"maxResults": 50})
+  SAP(action="search", target="ZCL_*", params={"type": "CLAS", "max": 20})   — type filter, applied before max
+  SAP(action="search", target="ZCL_ORDER", params={"exact": true})            — only objects named exactly ZCL_ORDER (case-insensitive)
+  SAP(action="search", target="ZCL_ORDER", params={"exact": true, "type": "CLAS"})`)
 
 	case "query":
 		return mcp.NewToolResultText(`SAP(action="query") - Database queries
