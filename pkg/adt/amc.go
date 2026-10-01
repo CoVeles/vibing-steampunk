@@ -69,12 +69,16 @@ func (c *Client) UpsertAMCApplication(ctx context.Context, name, description, pk
 		ContentType: "application/vnd.sap.adt.blueasxml.v1+xml",
 		Stateful:    true,
 	})
-	uerr := c.UnlockObject(ctx, objectURL, lock.LockHandle)
 	if werr != nil {
+		// Released on a detached, bounded context: the write may have failed
+		// because ctx ended. A lock that cannot be released is reported.
+		if uerr := c.releaseLockAfterFailure(ctx, objectURL, lock.LockHandle); uerr != nil {
+			return fmt.Errorf("writing AMC application %s: %w — %s", name, werr, strandedLockAdvice(objectURL, uerr))
+		}
 		return fmt.Errorf("writing AMC application %s: %w", name, werr)
 	}
-	if uerr != nil {
-		return fmt.Errorf("unlocking AMC application %s: %w", name, uerr)
+	if uerr := c.UnlockObject(ctx, objectURL, lock.LockHandle); uerr != nil {
+		return fmt.Errorf("unlocking AMC application %s: %w — %s", name, uerr, strandedLockAdvice(objectURL, uerr))
 	}
 	res, err := c.Activate(ctx, objectURL, name)
 	if err != nil {
