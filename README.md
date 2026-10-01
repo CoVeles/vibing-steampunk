@@ -469,6 +469,38 @@ If a list fails to copy or the release fails, the result is an error that
 names the transport of copies, what was copied, what was not, and the
 release status. `--read-only` refuses it like any transport write.
 
+**Upload a transport** into the connected system's import queue -- and no
+further. A released request's cofile `K<nr>.<SID>` and data file
+`R<nr>.<SID>` are written into DIR_TRANS of the system vsp is connected to
+(`cofiles/`, `data/`), and the request is added to that system's import
+buffer, as STMS's *Extras > Other Requests > Add* does. vsp never imports:
+the import stays a human step in STMS.
+
+```bash
+SAP_ENABLE_TRANSPORTS=true vsp -s qassys transport upload --cofile ./K900123.DEV --datafile ./R900123.DEV
+SAP_ENABLE_TRANSPORTS=true vsp -s qassys transport buffer TR-EXAMPLE      # read-only view of the queue
+SAP_ENABLE_TRANSPORTS=true vsp -s devsys transport download TR-EXAMPLE -o ./out   # read-only copy out of DIR_TRANS
+```
+
+MCP (expert mode only): `system` with `upload_transport` (`cofile_path` +
+`datafile_path`, or `cofile_name`/`cofile_base64` + `datafile_name`/`datafile_base64`)
+and the read-only `transport_buffer` (optional `transport`).
+
+The rules, checked in vsp and again in ZADT_VSP's `ZCL_VSP_TRANSPORT_SERVICE`:
+both files, matching number and SID, the cofile's shape (a header and an
+export step from its SID), 50 MB together; the target is always the server's
+own system and client (a `system`, `client` or directory parameter is
+refused); a file that exists in DIR_TRANS is never overwritten, not even an
+empty one; a request already in the buffer is not added again; and the only
+tp command that can be sent is the literal `ADDTOBUFFER`, which a test over
+the ABAP source enforces. Refused under `--read-only` and
+`--transport-read-only`; needs `--enable-transports`; `--allowed-transports`
+applies to the request. On the system it needs ZADT_VSP (redeploy:
+`vsp install zadt-vsp`) and `S_CTS_ADMI` with `EPS1` (files) and `TADD`
+(buffer). If the buffer add fails while the request is certainly not in the
+buffer, the two files this upload wrote are deleted again. Taking a request
+out of the queue again is done in STMS.
+
 `vsp update` fetches the latest release for this platform, compares it with
 the running version, verifies the download against the release's
 `checksums.txt`, and puts it in place of the running binary — the old one is
