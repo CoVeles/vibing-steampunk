@@ -96,11 +96,27 @@ func TestRFCDestination_AnOverrideToAnotherGatewayIsRefused(t *testing.T) {
 		}
 	}
 
-	// The same gateway, spelt differently, and a port on it, stay allowed.
+	// A port other than the gateway's own (3300 + sysnr 10) reaches another
+	// instance or service on that host.
+	for name, params := range map[string]map[string]any{
+		"port":            {"port": float64(3300)},
+		"port elsewhere":  {"port": float64(22)},
+		"same host, port": {"host": "prod-gw.example.local", "port": float64(3311)},
+	} {
+		if dest, err := s.rfcDestination(params); err == nil {
+			t.Errorf("%s: override reached %s:%d with the configured password", name, dest.Host, dest.Port)
+		} else if !strings.Contains(err.Error(), "is blocked") {
+			t.Errorf("%s: unexpected error %v", name, err)
+		}
+	}
+
+	// The server's own gateway, named explicitly or spelt differently, stays
+	// allowed.
 	for name, params := range map[string]map[string]any{
 		"same host": {"host": "PROD-GW.example.local"},
 		"sysnr 10":  {"sysnr": "10"},
-		"port":      {"port": float64(3310)},
+		"own port":  {"port": float64(3310)},
+		"all three": {"host": "prod-gw.example.local", "sysnr": "10", "port": float64(3310)},
 	} {
 		if _, err := s.rfcDestination(params); err != nil {
 			t.Errorf("%s: %v", name, err)

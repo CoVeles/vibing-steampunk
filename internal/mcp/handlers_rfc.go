@@ -33,9 +33,10 @@ import (
 //	SAP(action="rfc", target="Z_DOUBLE", params={"op":"call","args":{"N":21}})
 //	SAP(action="rfc", target="T000", params={"op":"read_table","fields":["MANDT"],"top":5})
 //
-// Destination overrides: params host / sysnr / port / user. A host or sysnr
-// other than this server's own gateway is refused: the configured RFC
-// credentials only go to the server's own system.
+// The destination is this server's own gateway. params host / sysnr / port may
+// only name it again: one that differs is refused, because the configured RFC
+// credentials only go to the server's own system. params user picks another
+// RFC logon user on that gateway.
 func (s *Server) routeRFCAction(ctx context.Context, action, objectType, objectName string, params map[string]any) (result *mcp.CallToolResult, handled bool, rfcErr error) {
 	if action != "rfc" {
 		return nil, false, nil
@@ -317,11 +318,14 @@ func (s *Server) rfcDestination(params map[string]any) (saprfc.Params, error) {
 	return saprfc.Resolve(in)
 }
 
-// checkRFCOverride refuses a per-call host or sysnr that differs from the
-// destination resolved from this server's own settings. A port override on the
-// same host stays allowed: it reaches the same machine.
+// checkRFCOverride refuses a per-call host, sysnr or port that makes the
+// destination differ from the one resolved from this server's own settings.
+// Each of them can point the configured credentials somewhere else: another
+// host, another instance on the same host, or another service on a port of
+// the caller's choosing. Naming the server's own destination explicitly is
+// allowed.
 func checkRFCOverride(in saprfc.Input) error {
-	if in.HostFlag == "" && in.SysnrFlag == "" {
+	if in.HostFlag == "" && in.SysnrFlag == "" && in.PortFlag == 0 {
 		return nil
 	}
 	host, sysnr := in.RFCHost, in.RFCSysnr
@@ -334,30 +338,36 @@ func checkRFCOverride(in saprfc.Input) error {
 			sysnr = uSysnr
 		}
 	}
-	sameSysnr := func(a, b string) bool {
-		if a == "" {
-			a = "00"
+	// The destination as saprfc.Resolve builds it: port from the flag, else
+	// rfc_port, else the instance's gateway 3300 + sysnr.
+	dest := func(h, nr string, flagPort int) (string, string, int) {
+		nr = strings.TrimSpace(nr)
+		if nr == "" {
+			nr = "00"
 		}
-		if b == "" {
-			b = "00"
+		if n, err := strconv.Atoi(nr); err == nil {
+			nr = fmt.Sprintf("%02d", n)
 		}
-		na, ea := strconv.Atoi(strings.TrimSpace(a))
-		nb, eb := strconv.Atoi(strings.TrimSpace(b))
-		if ea != nil || eb != nil {
-			return strings.TrimSpace(a) == strings.TrimSpace(b)
+		port := flagPort
+		if port == 0 {
+			port = in.RFCPort
 		}
-		return na == nb
+		if port == 0 {
+			if n, err := strconv.Atoi(nr); err == nil {
+				port = 3300 + n
+			}
+		}
+		return strings.ToLower(strings.TrimSpace(h)), nr, port
 	}
-	hostDiffers := in.HostFlag != "" && !strings.EqualFold(strings.TrimSpace(in.HostFlag), host)
-	sysnrDiffers := in.SysnrFlag != "" && !sameSysnr(in.SysnrFlag, sysnr)
-	if !hostDiffers && !sysnrDiffers {
+	ownHost, ownSysnr, ownPort := dest(host, sysnr, 0)
+	wantHost, wantSysnr, wantPort := dest(firstNonEmptyStr(in.HostFlag, host), firstNonEmptyStr(in.SysnrFlag, sysnr), in.PortFlag)
+	if wantHost == ownHost && wantSysnr == ownSysnr && wantPort == ownPort {
 		return nil
 	}
-	want := firstNonEmptyStr(in.HostFlag, host) + "/" + firstNonEmptyStr(in.SysnrFlag, sysnr, "00")
-	own := host + "/" + firstNonEmptyStr(sysnr, "00")
-	return fmt.Errorf("rfc destination override %s is blocked: it differs from this server's own gateway %s, "+
+	return fmt.Errorf("rfc destination override %s/%s port %d is blocked: it differs from this server's own gateway %s/%s port %d, "+
 		"and the configured RFC credentials are not sent to another destination "+
-		"(configure that system in .vsp.json and use a server connected to it)", want, own)
+		"(configure that system in .vsp.json and use a server connected to it)",
+		wantHost, wantSysnr, wantPort, ownHost, ownSysnr, ownPort)
 }
 
 func firstNonEmptyStr(vals ...string) string {

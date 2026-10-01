@@ -30,7 +30,7 @@ func TestRFCReadTable_CallerWhereRefusedUnderBlockFreeSQL(t *testing.T) {
 			port, dials := fakeGateway(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_, handled, err := s.routeRFCAction(ctx, "rfc", "USR02", "", rfcParams(port, map[string]any{"op": op, "where": "BNAME = 'TESTUSER'"}))
+			_, handled, err := s.routeRFCAction(ctx, "rfc", "USR02", "", rfcParams(t, port, map[string]any{"op": op, "where": "BNAME = 'TESTUSER'"}))
 			if !handled {
 				t.Fatal("rfc action not handled")
 			}
@@ -63,7 +63,7 @@ func TestRFCReadTable_OtherReadsStillReachGateway(t *testing.T) {
 			port, dials := fakeGateway(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_, _, err := s.routeRFCAction(ctx, "rfc", tc.target, "", rfcParams(port, tc.extra))
+			_, _, err := s.routeRFCAction(ctx, "rfc", tc.target, "", rfcParams(t, port, tc.extra))
 			if err != nil && strings.Contains(err.Error(), "blocked") {
 				t.Fatalf("refused: %v", err)
 			}
