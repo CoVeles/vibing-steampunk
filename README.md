@@ -1929,7 +1929,8 @@ came back). SAP turns a line break inside a value into `#`.
 ```json
 { "success": true, "programName": "ZTEMP_EXEC_12345678",
   "output": ["20261001", "TESTUSER"], "result_text": ["20261001", "TESTUSER"],
-  "message": "Executed successfully, 2 output(s) returned", "cleanedUp": true, ... }
+  "executionTime": 0.41,
+  "message": "Executed successfully, 2 output(s) returned", "cleanedUp": true }
 ```
 
 `vsp execute` prints every value whole, one per line; `vsp execute --json`

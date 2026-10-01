@@ -238,7 +238,7 @@ func NewUnitTestReport(result *UnitTestResult, onlyFailures bool) UnitTestReport
 }
 
 func briefAlerts(alerts []UnitTestAlert) []UnitTestAlertBrief {
-	var out []UnitTestAlertBrief
+	out := make([]UnitTestAlertBrief, 0, len(alerts))
 	for _, a := range alerts {
 		b := UnitTestAlertBrief{Kind: a.Kind, Severity: a.Severity, Title: a.Title}
 		if len(a.Details) > 0 {
