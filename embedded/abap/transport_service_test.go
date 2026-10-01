@@ -32,7 +32,6 @@ var transportServiceFunctions = map[string]bool{
 	// The tp step runs as a background job: an APC session may not make the
 	// synchronous RFC that starts tp.
 	"JOB_OPEN":             true,
-	"JOB_SUBMIT":           true,
 	"JOB_CLOSE":            true,
 	"GET_JOB_RUNTIME_INFO": true,
 	// add_status reads the job's log (read-only).
@@ -249,8 +248,26 @@ func checkTransportService(src string) []string {
 				bad = append(bad, "lv_system used other than declared, set from sy-sysid, or passed as iv_system_name: "+st)
 			}
 		}
+		// The one SUBMIT: the job step, this service's own report, as the
+		// caller, scheduled -- never run here.
+		if strings.HasPrefix(up, "SUBMIT ") || strings.Contains(up, " SUBMIT ") {
+			ok := strings.HasPrefix(up, "SUBMIT ('ZVSP_TRANSPORT_BUFFER') ") && strings.Contains(up, " VIA JOB ") && strings.HasSuffix(up, " AND RETURN")
+			for _, kw := range []string{" USER ", " USING SELECTION-SET", " WITH SELECTION-TABLE", " TO SAP-SPOOL", " EXPORTING LIST", " VIA SELECTION-SCREEN"} {
+				if strings.Contains(up, kw) {
+					ok = false
+				}
+			}
+			if !ok {
+				bad = append(bad, "SUBMIT other than the job step SUBMIT ('ZVSP_TRANSPORT_BUFFER') ... VIA JOB ... AND RETURN: "+st)
+			}
+		}
+		// No cluster or table write: nothing is handed over through the
+		// database.
+		if strings.Contains(up, " TO DATABASE ") || strings.Contains(up, " FROM DATABASE ") {
+			bad = append(bad, "database cluster access in the transport service: "+st)
+		}
 		// File statements outside the EPS layer: only reading is allowed.
-		for _, kw := range []string{"DELETE DATASET", "TRANSFER ", "SUBMIT ", "CALL 'SYSTEM'", "CALL TRANSACTION", "GENERATE SUBROUTINE", "INSERT REPORT", "EXEC SQL"} {
+		for _, kw := range []string{"DELETE DATASET", "TRANSFER ", "CALL 'SYSTEM'", "CALL TRANSACTION", "GENERATE SUBROUTINE", "INSERT REPORT", "EXEC SQL"} {
 			if strings.HasPrefix(up, kw) || strings.Contains(up, " "+kw) {
 				bad = append(bad, "statement not allowed in the transport service: "+st)
 			}
@@ -352,7 +369,9 @@ func checkTransportJobProgram(src string) []string {
 	var bad []string
 	for _, st := range abapStatements(src) {
 		switch strings.ToUpper(st) {
-		case "", "REPORT ZVSP_TRANSPORT_BUFFER", "START-OF-SELECTION", "ZCL_VSP_TRANSPORT_SERVICE=>RUN_JOB( )":
+		case "", "REPORT ZVSP_TRANSPORT_BUFFER", "START-OF-SELECTION",
+			"PARAMETERS: P_REQ TYPE TRKORR NO-DISPLAY, P_SHAC TYPE C LENGTH 64 NO-DISPLAY, P_SHAD TYPE C LENGTH 64 NO-DISPLAY",
+			"ZCL_VSP_TRANSPORT_SERVICE=>RUN_JOB( IV_REQUEST = P_REQ IV_COFILE_SHA = P_SHAC IV_DATA_SHA = P_SHAD )":
 		default:
 			bad = append(bad, "statement in ZVSP_TRANSPORT_BUFFER beyond calling run_job: "+st)
 		}
@@ -368,10 +387,10 @@ func TestTransportJobProgramIsAShim(t *testing.T) {
 	for _, e := range checkTransportJobProgram(string(b)) {
 		t.Error(e)
 	}
-	if len(checkTransportJobProgram(string(b)+"\nPARAMETERS p_req TYPE trkorr.\n")) == 0 {
-		t.Error("the guard accepted a parameter in the job program")
+	if len(checkTransportJobProgram(string(b)+"\nPARAMETERS p_sys TYPE sysysid.\n")) == 0 {
+		t.Error("the guard accepted another parameter in the job program")
 	}
-	if len(checkTransportJobProgram(strings.Replace(string(b), "run_job( ).", "run_job( ).\n  SUBMIT zother AND RETURN.", 1))) == 0 {
+	if len(checkTransportJobProgram(strings.Replace(string(b), "iv_data_sha = p_shad ).", "iv_data_sha = p_shad ).\n  SUBMIT zother AND RETURN.", 1))) == 0 {
 		t.Error("the guard accepted a SUBMIT in the job program")
 	}
 }
@@ -402,14 +421,15 @@ func TestTransportServiceGuardBites(t *testing.T) {
 		"command from a variable":                 {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = lv_cmd`},
 		"another system":                          {"iv_system_name     = lv_system\n          iv_request", "iv_system_name     = lv_sid\n          iv_request"},
 		"lv_system not sy-sysid":                  {"    lv_system = sy-sysid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'", "    lv_system = lv_sid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'"},
-		"lv_system changed later":                 {"    lv_trkorr = ls_ticket-request.\n", "    lv_trkorr = ls_ticket-request.\n    CONCATENATE lv_sid space INTO lv_system.\n"},
+		"lv_system changed later":                 {"    lv_trkorr = ls_res-request.\n", "    lv_trkorr = ls_res-request.\n    CONCATENATE lv_sid space INTO lv_system.\n"},
 		"tp options":                              {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_tp_options      = lv_msg\n"},
 		"tp step on another system (DESTINATION)": {"      CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'\n", "      CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER' DESTINATION 'NONE'\n"},
-		"job step as another user":                {"report            = 'ZVSP_TRANSPORT_BUFFER'\n", "report            = 'ZVSP_TRANSPORT_BUFFER'\n        authcknam         = 'DDIC'\n"},
+		"job step as another user":                {"      AND RETURN.\n", "      USER 'DDIC'\n      AND RETURN.\n"},
 		"tp parameter outside the allow-list":     {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_prid_text       = lv_msg\n"},
 		"buffer read in a new task":               {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'\n", "    CALL FUNCTION 'TMS_TP_SHOW_BUFFER' STARTING NEW TASK 'T'\n"},
-		"job runs another report":                 {"report            = 'ZVSP_TRANSPORT_BUFFER'", "report            = 'RSBDCSUB'"},
-		"job runs a command":                      {"report            = 'ZVSP_TRANSPORT_BUFFER'\n", "report            = 'ZVSP_TRANSPORT_BUFFER'\n        commandname       = 'ZCMD'\n"},
+		"job runs another report":                 {"SUBMIT ('ZVSP_TRANSPORT_BUFFER')", "SUBMIT ('RSBDCSUB')"},
+		"job step run here, not as a job":         {"      VIA JOB lv_jobname NUMBER lv_jobcount\n", ""},
+		"a ticket through the database":           {"    ev_jobcount = lv_jobcount.\n", "    ev_jobcount = lv_jobcount.\n    EXPORT p = lv_req TO DATABASE indx(zt) ID lv_req.\n"},
 		"a second tp FM":                          {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'", "    CALL FUNCTION 'TRINT_TP_INTERFACE'"},
 		"dynamic call":                            {"CALL FUNCTION 'EPS_DELETE_FILE'", "CALL FUNCTION lv_fm"},
 		"overwrite":                               {"overwrite_mode         = space", "overwrite_mode         = 'F'"},
@@ -525,5 +545,31 @@ func TestTransportServiceAsyncOutcome(t *testing.T) {
 	status := strings.ToUpper(strings.Join(methodStatements(stmts, "HANDLE_ADD_STATUS"), "\n"))
 	if n := strings.Count(status, "`QUEUED`"); n != 2 || strings.Count(status, "WHEN LV_IN_BUFFER = ABAP_TRUE THEN `QUEUED`") != 2 {
 		t.Errorf("add_status says queued other than from the buffer file (%d)", n)
+	}
+}
+
+// The job gets its work as step parameters bound at scheduling (no INDX
+// ticket), and adds only files that still have the SHA-256 the upload wrote.
+func TestJobChecksFilesBeforeAdd(t *testing.T) {
+	stmts := abapStatements(transportServiceSource(t))
+	start := strings.ToUpper(strings.Join(methodStatements(stmts, "START_JOB"), "\n"))
+	for _, want := range []string{"WITH P_REQ = LV_REQ", "WITH P_SHAC = LV_SHAC", "WITH P_SHAD = LV_SHAD", "VIA JOB LV_JOBNAME NUMBER LV_JOBCOUNT"} {
+		if !strings.Contains(start, want) {
+			t.Errorf("start_job does not bind %q to the job step", want)
+		}
+	}
+	job := methodStatements(stmts, "RUN_JOB")
+	check, add := -1, -1
+	for i, st := range job {
+		up := strings.ToUpper(st)
+		if check < 0 && strings.Contains(up, "SHA256( LV_CONTENT ) <>") {
+			check = i
+		}
+		if add < 0 && strings.HasPrefix(up, "CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'") {
+			add = i
+		}
+	}
+	if check < 0 || add < 0 || check > add {
+		t.Errorf("run_job must compare the files' SHA-256 before ADDTOBUFFER (check at %d, add at %d)", check, add)
 	}
 }

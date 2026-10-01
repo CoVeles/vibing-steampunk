@@ -18,12 +18,13 @@
 "! - there is no dynamic CALL FUNCTION.
 "! tp is started over synchronous RFC, which an ABAP Push Channel may not do
 "! (APC_ILLEGAL_STATEMENT), so the add runs as a background job,
-"! ZVSP_TRANSPORT_BUFFER, which calls run_job. The session hands the job its
-"! work through INDX under the job's own number; the job writes its outcome
-"! to its job log. The upload answers "pending" with the job's number, and
-"! add_status reads the outcome: job status (TBTCO), job log, and -- the
-"! only proof of "queued" -- the buffer file. The job does nothing without a
-"! ticket.
+"! ZVSP_TRANSPORT_BUFFER, which calls run_job. The request and the SHA-256 of
+"! the two files are bound to the job step as parameters when it is
+"! scheduled (SUBMIT ... VIA JOB); the job checks the files still have them
+"! before it adds, and writes its outcome to its job log. The upload answers
+"! "pending" with the job's number, and add_status reads the outcome: job
+"! status (TBTCO), job log, and -- the only proof of "queued" -- the buffer
+"! file.
 "! Authority is SAP's own: S_CTS_ADMI EPS1 for the files (EPS layer), TADD
 "! for the buffer (tp interface). A refusal is reported, not worked around.
 CLASS zcl_vsp_transport_service DEFINITION
@@ -45,10 +46,14 @@ CLASS zcl_vsp_transport_service DEFINITION
     "! The background job (and its program) that runs the tp step.
     CONSTANTS c_job_name TYPE tbtcjob-jobname VALUE 'ZVSP_TRANSPORT_BUFFER'.
 
-    "! The background step: reads this job's ticket, reads the buffer and,
-    "! for an ADD ticket, adds its request; stores the result for the session.
-    "! Outside a ZVSP_TRANSPORT_BUFFER job, or without a ticket, it does nothing.
-    CLASS-METHODS run_job.
+    "! The background step: checks the request and that both files still have
+    "! the SHA-256 the upload wrote, reads the buffer and adds the request;
+    "! writes the outcome to the job log. Its parameters are bound to the job
+    "! when it is scheduled. Outside a ZVSP_TRANSPORT_BUFFER job it does nothing.
+    CLASS-METHODS run_job
+      IMPORTING iv_request    TYPE csequence
+                iv_cofile_sha TYPE csequence
+                iv_data_sha   TYPE csequence.
 
     "! The request two file names belong to: ev_request is &lt;SID&gt;K&lt;nr&gt;.
     "! ev_error is set, and the rest initial, when they are not a pair.
@@ -85,11 +90,9 @@ CLASS zcl_vsp_transport_service DEFINITION
         request     TYPE trkorr,
         cofile_name TYPE string,
         data_name   TYPE string,
+        cofile_sha  TYPE string,
+        data_sha    TYPE string,
       END OF ty_written,
-      BEGIN OF ty_ticket,
-        action  TYPE string,
-        request TYPE string,
-      END OF ty_ticket,
       BEGIN OF ty_job_result,
         request      TYPE string,
         system       TYPE string,
@@ -182,16 +185,21 @@ CLASS zcl_vsp_transport_service DEFINITION
     CLASS-METHODS job_log
       IMPORTING is_result TYPE ty_job_result.
 
-    "! Schedules ZVSP_TRANSPORT_BUFFER with a ticket for one action.
+    "! Schedules ZVSP_TRANSPORT_BUFFER for one request, its step parameters
+    "! being the request and the SHA-256 of its two files.
     CLASS-METHODS start_job
-      IMPORTING iv_action   TYPE string
-                iv_request  TYPE string
-      EXPORTING ev_jobcount TYPE string
-                ev_error    TYPE string.
+      IMPORTING iv_request    TYPE string
+                iv_cofile_sha TYPE string
+                iv_data_sha   TYPE string
+      EXPORTING ev_jobcount   TYPE string
+                ev_error      TYPE string.
 
-    CLASS-METHODS job_key
-      IMPORTING iv_jobcount   TYPE csequence
-      RETURNING VALUE(rv_key) TYPE indx-srtfd.
+    "! Reads a whole cofile or data file through EPS's read checks.
+    CLASS-METHODS read_dir_file
+      IMPORTING iv_kind    TYPE string
+                iv_name    TYPE string
+      EXPORTING ev_content TYPE xstring
+                ev_error   TYPE string.
 
     "! The logical directory of a kind of file: $TR_COFI or $TR_DATA.
     CLASS-METHODS dir_of
@@ -551,7 +559,8 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    ms_written = VALUE #( request = ls_up-request cofile_name = ls_up-cofile_name data_name = ls_up-data_name ).
+    ms_written = VALUE #( request = ls_up-request cofile_name = ls_up-cofile_name data_name = ls_up-data_name
+                          cofile_sha = ls_up-cofile_sha data_sha = ls_up-data_sha ).
 
     rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
       ( zcl_vsp_utils=>json_str( iv_key = 'request' iv_value = CONV #( ls_up-request ) ) )
@@ -596,7 +605,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ENDIF.
     ENDLOOP.
 
-    start_job( EXPORTING iv_action = `ADD` iv_request = lv_request
+    start_job( EXPORTING iv_request = lv_request iv_cofile_sha = ms_written-cofile_sha iv_data_sha = ms_written-data_sha
                IMPORTING ev_jobcount = lv_jobcount ev_error = lv_error ).
     IF lv_error IS NOT INITIAL.
       " Nothing reached tp: the request is not in the buffer, so this
@@ -671,10 +680,15 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     DATA: lv_jobname  TYPE tbtcjob-jobname,
           lv_jobcount TYPE tbtcjob-jobcount,
           lv_released TYPE btch0000-char1,
-          ls_indx     TYPE indx.
+          lv_req      TYPE trkorr,
+          lv_shac     TYPE c LENGTH 64,
+          lv_shad     TYPE c LENGTH 64.
 
     CLEAR: ev_jobcount, ev_error.
     lv_jobname = c_job_name.
+    lv_req = iv_request.
+    lv_shac = iv_cofile_sha.
+    lv_shad = iv_data_sha.
     CALL FUNCTION 'JOB_OPEN'
       EXPORTING
         jobname          = lv_jobname
@@ -690,29 +704,17 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    " The ticket: what the job is to do, under the job's own number.
-    DATA(ls_ticket) = VALUE ty_ticket( action = iv_action request = iv_request ).
-    DATA(lv_key) = job_key( lv_jobcount ).
-    EXPORT ticket = ls_ticket TO DATABASE indx(zt) FROM ls_indx ID lv_key.
-
-    CALL FUNCTION 'JOB_SUBMIT'
-      EXPORTING
-        authcknam         = sy-uname
-        jobcount          = lv_jobcount
-        jobname           = lv_jobname
-        report            = 'ZVSP_TRANSPORT_BUFFER'
-      EXCEPTIONS
-        bad_priparams     = 1
-        bad_xpgflags      = 2
-        invalid_jobdata   = 3
-        jobname_missing   = 4
-        job_notex         = 5
-        job_submit_failed = 6
-        lock_failed       = 7
-        OTHERS            = 8.
+    " What the job is to do is bound to its step here, as selection
+    " parameters: the request, and the SHA-256 of the two files as written.
+    " The step runs as the caller.
+    SUBMIT ('ZVSP_TRANSPORT_BUFFER')
+      WITH p_req  = lv_req
+      WITH p_shac = lv_shac
+      WITH p_shad = lv_shad
+      VIA JOB lv_jobname NUMBER lv_jobcount
+      AND RETURN.
     IF sy-subrc <> 0.
-      ev_error = |JOB_SUBMIT failed (exception { sy-subrc }) { last_message( ) }|.
-      DELETE FROM DATABASE indx(zt) ID lv_key.
+      ev_error = |SUBMIT ZVSP_TRANSPORT_BUFFER VIA JOB failed (sy-subrc { sy-subrc }) { last_message( ) }|.
       RETURN.
     ENDIF.
 
@@ -738,31 +740,84 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         OTHERS               = 10.
     IF sy-subrc <> 0.
       ev_error = |JOB_CLOSE failed (exception { sy-subrc }) { last_message( ) }|.
-      DELETE FROM DATABASE indx(zt) ID lv_key.
       RETURN.
     ENDIF.
     IF lv_released IS INITIAL.
       ev_error = |job { lv_jobname } { lv_jobcount } was scheduled but not released: releasing it needs S_BTCH_JOB with JOBACTION RELE; delete it in SM37|.
-      DELETE FROM DATABASE indx(zt) ID lv_key.
       RETURN.
     ENDIF.
     ev_jobcount = lv_jobcount.
   ENDMETHOD.
 
 
-  METHOD job_key.
-    rv_key = |ZVSPTR{ iv_jobcount }|.
+  METHOD read_dir_file.
+    DATA: lv_name     TYPE eps2filnam,
+          lv_dir      TYPE epsf-epsdirnam,
+          lv_long_dir TYPE eps2path,
+          lv_path     TYPE eps2path,
+          lv_size     TYPE eps2filsiz,
+          lv_pos      TYPE epsfilsiz,
+          lv_dataset  TYPE string.
+
+    CLEAR: ev_content, ev_error.
+    lv_name = iv_name.
+    lv_dir = dir_of( iv_kind ).
+    CALL FUNCTION 'EPS_OPEN_INPUT_FILE'
+      EXPORTING
+        iv_long_file_name      = lv_name
+        dir_name               = lv_dir
+        pos                    = lv_pos
+      IMPORTING
+        ev_long_dir_name       = lv_long_dir
+        ev_long_file_path      = lv_path
+        ev_file_size_long      = lv_size
+      EXCEPTIONS
+        invalid_eps_subdir     = 1
+        sapgparam_failed       = 2
+        build_directory_failed = 3
+        no_authorization       = 4
+        build_path_failed      = 5
+        open_failed            = 6
+        read_directory_failed  = 7
+        read_attributes_failed = 8
+        OTHERS                 = 9.
+    IF sy-subrc <> 0.
+      ev_error = |{ iv_name } in DIR_TRANS ({ lv_dir }) cannot be read (exception { sy-subrc }) { last_message( ) }|.
+      RETURN.
+    ENDIF.
+    CALL FUNCTION 'EPS_CLOSE_FILE'
+      EXPORTING
+        iv_long_file_name = lv_name
+        iv_long_dir_name  = lv_long_dir
+      EXCEPTIONS
+        OTHERS            = 1.
+    IF lv_size > c_max_total.
+      ev_error = |{ iv_name } is { lv_size } bytes, over the { c_max_total }-byte limit|.
+      RETURN.
+    ENDIF.
+    lv_dataset = lv_path.
+    TRY.
+        OPEN DATASET lv_dataset FOR INPUT IN BINARY MODE.
+        IF sy-subrc <> 0.
+          ev_error = |{ iv_name } could not be opened|.
+          RETURN.
+        ENDIF.
+        READ DATASET lv_dataset INTO ev_content.
+        CLOSE DATASET lv_dataset.
+      CATCH cx_root INTO DATA(lx_read).
+        CLOSE DATASET lv_dataset.
+        ev_error = |{ iv_name }: { lx_read->get_text( ) }|.
+    ENDTRY.
   ENDMETHOD.
 
 
   METHOD run_job.
     DATA: lv_jobcount TYPE tbtcm-jobcount,
           lv_jobname  TYPE tbtcm-jobname,
-          ls_ticket   TYPE ty_ticket,
           ls_res      TYPE ty_job_result,
           lt_buffer   TYPE tt_tpbuffer,
           lt_addout   TYPE tt_tpstdout,
-          ls_indx     TYPE indx,
+          lv_content  TYPE xstring,
           lv_error    TYPE string,
           lv_sid      TYPE string,
           lv_number   TYPE string,
@@ -785,33 +840,41 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     IF sy-subrc <> 0 OR lv_jobname <> c_job_name.
       RETURN.
     ENDIF.
-    DATA(lv_key) = job_key( lv_jobcount ).
 
-    " The session commits the ticket when its message step ends, which may be
-    " a moment after the job started.
-    DO 30 TIMES.
-      IMPORT ticket = ls_ticket FROM DATABASE indx(zt) TO ls_indx ID lv_key.
-      IF sy-subrc = 0.
-        EXIT.
-      ENDIF.
-      WAIT UP TO 2 SECONDS.
-    ENDDO.
-    IF ls_ticket IS INITIAL.
-      RETURN.
-    ENDIF.
-    DELETE FROM DATABASE indx(zt) ID lv_key.
-    COMMIT WORK.
-
-    ls_res = VALUE #( request = ls_ticket-request system = CONV #( sy-sysid ) job = CONV #( lv_jobcount ) ).
-    IF ls_ticket-action <> `ADD` OR
-       request_parts( EXPORTING iv_request = ls_ticket-request IMPORTING ev_sid = lv_sid ev_number = lv_number ) = abap_false.
+    ls_res = VALUE #( request = to_upper( iv_request ) system = CONV #( sy-sysid ) job = CONV #( lv_jobcount ) ).
+    DATA(lv_shac) = to_upper( condense( CONV string( iv_cofile_sha ) ) ).
+    DATA(lv_shad) = to_upper( condense( CONV string( iv_data_sha ) ) ).
+    FIND PCRE '^[0-9A-F]{64}\z' IN lv_shac.
+    DATA(lv_sha_ok) = xsdbool( sy-subrc = 0 ).
+    FIND PCRE '^[0-9A-F]{64}\z' IN lv_shad.
+    lv_sha_ok = xsdbool( lv_sha_ok = abap_true AND sy-subrc = 0 ).
+    IF request_parts( EXPORTING iv_request = ls_res-request IMPORTING ev_sid = lv_sid ev_number = lv_number ) = abap_false
+       OR lv_sha_ok = abap_false.
       ls_res-outcome = `not_added`.
-      ls_res-code = `INVALID_TICKET`.
-      ls_res-message = |Ticket '{ ls_ticket-action }' for '{ ls_ticket-request }' is not an add of a request; nothing was done.|.
+      ls_res-code = `INVALID_PARAM`.
+      ls_res-message = |'{ iv_request }' is not a request, or the SHA-256 values are not digests; nothing was done.|.
       job_log( ls_res ).
       RETURN.
     ENDIF.
-    lv_trkorr = ls_ticket-request.
+    lv_trkorr = ls_res-request.
+
+    " The files must be the ones the upload wrote: same SHA-256 as recorded
+    " when the job was scheduled.
+    DATA(lt_files) = VALUE string_table( ( `cofile` ) ( `data` ) ).
+    LOOP AT lt_files INTO DATA(lv_kind).
+      DATA(lv_name) = COND string( WHEN lv_kind = `cofile` THEN |K{ lv_number }.{ lv_sid }| ELSE |R{ lv_number }.{ lv_sid }| ).
+      read_dir_file( EXPORTING iv_kind = lv_kind iv_name = lv_name IMPORTING ev_content = lv_content ev_error = lv_error ).
+      IF lv_error IS INITIAL AND sha256( lv_content ) <> COND string( WHEN lv_kind = `cofile` THEN lv_shac ELSE lv_shad ).
+        lv_error = |{ lv_name } is not the file the upload wrote (SHA-256 differs)|.
+      ENDIF.
+      IF lv_error IS NOT INITIAL.
+        ls_res-outcome = `not_added`.
+        ls_res-code = `FILES_CHANGED`.
+        ls_res-message = |{ lv_error }; ADDTOBUFFER was not called, and no file was touched.|.
+        job_log( ls_res ).
+        RETURN.
+      ENDIF.
+    ENDLOOP.
 
     read_buffer( IMPORTING et_buffer = lt_buffer ev_error = lv_error ).
     IF lv_error IS NOT INITIAL.
