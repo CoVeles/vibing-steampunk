@@ -18,6 +18,13 @@ package mcp
 //   - is everything classified? A new tool, or a new case in a router, fails
 //     with "classify me" until it is placed in readOnlyClasses.
 //
+// What it does not inspect: ZADT_VSP WebSocket and RFC traffic is checked as
+// dials only. A MUTATE or EXECUTE call must not dial at all, but a READ call
+// may, and what it then sends over the WebSocket or the RFC connection is not
+// looked at: the fake WebSocket endpoint refuses the upgrade and the fake
+// gateway hangs up, so nothing is sent there. A READ classification is
+// therefore trusted for those channels.
+//
 // Known gaps are named in readOnlyClasses with their reason, reported and not
 // failed. VSP_READONLY_TRACE=1 logs every call and what it sent.
 
@@ -647,7 +654,7 @@ var readPOSTs = []readPOST{
 	{regexp.MustCompile(`^/sap/bc/adt/datapreview/(freestyle|ddic)`), "data preview: SELECT only, the statement in the body; --block-free-sql governs free SQL"},
 	{regexp.MustCompile(`^/sap/bc/adt/checkruns`), "syntax check of the source in the body; reports diagnostics, stores nothing"},
 	{regexp.MustCompile(`^/sap/bc/adt/abapunit/testruns`), "ABAP Unit run; under --read-only only harmless tests run, dangerous/critical ones are refused in the client (#283)"},
-	{regexp.MustCompile(`^/sap/bc/adt/atc/(runs|worklists)`), "ATC run: produces a transient worklist of findings, changes no object"},
+	{regexp.MustCompile(`^/sap/bc/adt/atc/(runs|worklists)`), "ATC run: checks objects and records its findings as a worklist; changes no object"},
 	{regexp.MustCompile(`^/sap/bc/adt/navigation/target`), "find definition for a position in the source in the body"},
 	{regexp.MustCompile(`^/sap/bc/adt/abapsource/codecompletion/`), "code completion proposals for the source in the body"},
 	{regexp.MustCompile(`^/sap/bc/adt/abapsource/prettyprinter(\?|$)`), "formats the source in the body and returns it; stores nothing (settings are a separate PUT, refused)"},
