@@ -1342,6 +1342,16 @@ func (c *Client) UnpublishServiceBinding(ctx context.Context, serviceName string
 }
 
 func (c *Client) publishUnpublishServiceBinding(ctx context.Context, action, serviceName, serviceVersion string) (*PublishResult, error) {
+	// Publishing or unpublishing activates or removes an OData service in
+	// the gateway: an object change, refused under --read-only before any
+	// request. Here rather than in a handler, so every caller is covered.
+	opName := "PublishServiceBinding"
+	if action == "unpublishjobs" {
+		opName = "UnpublishServiceBinding"
+	}
+	if err := c.checkSafety(OpUpdate, opName); err != nil {
+		return nil, err
+	}
 	if serviceVersion == "" {
 		serviceVersion = "0001"
 	}
