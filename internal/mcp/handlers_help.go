@@ -171,6 +171,21 @@ of a client-specific table cannot be in the WHERE condition.`)
 Unit tests:
   SAP(action="test", target="CLAS ZCL_TEST", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test"})
   SAP(action="test", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test", "include_dangerous": true})
+  SAP(action="test", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test", "only_failures": true})
+
+  Answers JSON:
+    ok        true when a test method ran, nothing failed and every test class
+              ran (a run with no test method, or with a class ABAP Unit did not
+              run, is not ok; "note" says why)
+    counts    {classes, methods, passed, failed, classFailures, warnings, notRun}
+              for the whole run; notRunClasses names the classes not run
+    classes   name, parentName, alerts filed on the class (CLASS_SETUP/TEARDOWN, or
+              a class not run for its risk level), testMethods: name, alerts
+              (kind, severity, title, details, ...)
+  only_failures: true lists only failed methods, and classes with alerts of their
+  own, without URIs or stacks (an alert's "at" is where it was raised). The
+  counts still cover the whole run, so an all-green run is just ok + counts.
+  include_dangerous runs RISK LEVEL DANGEROUS/CRITICAL tests; --read-only refuses it.
   SAP(action="test", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test", "timeout": 600})  — seconds; the run may continue on SAP after it
 
 ATC check:
@@ -439,7 +454,14 @@ Transport analysis:
   SAP(action="analyze", params={"type": "health", "object_type": "CLAS", "object_name": "ZCL_ORDER_SERVICE"})
 
 Execute ABAP:
-  SAP(action="analyze", params={"type": "execute_abap", "code": "WRITE 'Hello'."})
+  SAP(action="analyze", params={"type": "execute_abap", "code": "lv_result = |Hello { sy-uname }|."})
+  SAP(action="analyze", params={"type": "execute_abap", "code": "RETURN_VALUE( sy-datum ). RETURN_VALUE( sy-uzeit )."})
+      answers JSON: success, message, output (every value, in order), result_text (the value
+      in full, unwrapped from SAP's "Critical Assertion Error: '...'": a string for one value,
+      an array when RETURN_VALUE( ) was called more than once), failure when the code did not
+      finish, rawAlerts only when no value came back. SAP turns a line break in a value into #.
+      RETURN_VALUE( x ) hands x back at once (a later RETURN, CHECK or exception keeps it);
+      x may be any data object: structures and tables come back as JSON.
   Long calls (execute_abap, unit tests, deploy_from_file, deploy_zip) take "timeout" in seconds:
     SAP(action="analyze", params={"type": "execute_abap", "code": "...", "timeout": 300})
     Default: the server's --call-timeout (SAP_CALL_TIMEOUT); without one each request to SAP is limited to 60s.
