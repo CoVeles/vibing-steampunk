@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -50,4 +53,31 @@ func FuzzReadExport(f *testing.F) {
 			_, _ = Parse(r.Blob)
 		}
 	})
+}
+
+// TestTableRowCountDoesNotSizeAllocation replays the FuzzParse crasher: a
+// nested table whose row count reads 0xADBEEF00 from a 190-byte blob. The
+// count went straight into make() and asked for 66 GB, which killed the
+// fuzzing process and would take down the server that parsed it.
+func TestTableRowCountDoesNotSizeAllocation(t *testing.T) {
+	data, err := os.ReadFile("testdata/fuzz/FuzzParse/table_row_count_66gb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The corpus file is `go test fuzz v1` followed by one []byte literal.
+	lit := strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[1])
+	lit = strings.TrimSuffix(strings.TrimPrefix(lit, "[]byte("), ")")
+	blob, err := strconv.Unquote(lit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := Parse([]byte(blob)); err == nil {
+		t.Fatal("a truncated cluster parsed")
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 64<<20 {
+		t.Fatalf("allocated %d MiB for a %d-byte blob", got>>20, len(blob))
+	}
 }

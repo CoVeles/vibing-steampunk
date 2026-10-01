@@ -567,6 +567,17 @@ func (p *parser) tableRows(table *Node) ([][]any, error) {
 		return nil, fmt.Errorf("nested table data has line length %d, its descriptor %d", lineLen, table.Length)
 	}
 	leaves := lineLeaves(table)
+	// The count is four bytes of input. Every row of a line with fields
+	// takes at least one byte of the stream (a BC, CA or BE marker), so a
+	// count beyond what is left is a corrupt block, and refusing it here is
+	// what keeps it from sizing the allocation below: 0xADBEEF00 rows from
+	// a 190-byte blob asked for 66 GB.
+	if len(leaves) == 0 && count > 0 {
+		return nil, fmt.Errorf("nested table claims %d rows of a line with no fields", count)
+	}
+	if left := len(p.data) - p.pos; count > left {
+		return nil, fmt.Errorf("nested table claims %d rows, only %d bytes remain", count, left)
+	}
 	rows := make([][]any, 0, count)
 	for r := 0; r < count; r++ {
 		row, err := p.row(leaves)
