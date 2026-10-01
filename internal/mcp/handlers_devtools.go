@@ -29,6 +29,12 @@ func (s *Server) routeDevToolsAction(ctx context.Context, action, objectType, ob
 			if v, ok := getBoolParam(params, "include_long"); ok {
 				args["include_long"] = v
 			}
+			if v, ok := params["timeout"]; ok {
+				args["timeout"] = v
+			}
+			if v, ok := getBoolParam(params, "only_failures"); ok {
+				args["only_failures"] = v
+			}
 			return s.callHandler(ctx, s.handleRunUnitTests, args)
 		}
 	}
@@ -198,6 +204,11 @@ func (s *Server) handleActivatePackage(ctx context.Context, request mcp.CallTool
 }
 
 func (s *Server) handleRunUnitTests(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.longCall(ctx, request, "ABAP Unit run", s.runUnitTests)
+}
+
+// runUnitTests is handleRunUnitTests without the call budget (see longCall).
+func (s *Server) runUnitTests(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	objectURL, ok := request.GetArguments()["object_url"].(string)
 	if !ok || objectURL == "" {
 		return newToolResultError("object_url is required"), nil
@@ -214,11 +225,15 @@ func (s *Server) handleRunUnitTests(ctx context.Context, request mcp.CallToolReq
 		flags.Long = true
 	}
 
+	onlyFailures, _ := request.GetArguments()["only_failures"].(bool)
+
 	result, err := s.adtClient.RunUnitTests(ctx, objectURL, &flags)
 	if err != nil {
 		return newToolResultError(fmt.Sprintf("Unit test run failed: %v", err)), nil
 	}
 
-	output, _ := json.MarshalIndent(result, "", "  ")
+	// ok and counts on top of the classes this tool always answered; with
+	// only_failures, the failed methods alone, in the lean shape.
+	output, _ := adt.IndentJSON(adt.NewUnitTestReport(result, onlyFailures))
 	return mcp.NewToolResultText(string(output)), nil
 }
