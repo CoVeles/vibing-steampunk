@@ -317,11 +317,14 @@ func fugrMember(baseName string) (group, member string, ok bool) {
 	if start >= end {
 		return "", "", false
 	}
-	m := baseName[start:end]
+	// Cut lower, not baseName: lowercasing can change byte lengths (Ⱥ→ⱥ), so
+	// positions found in lower do not hold in baseName. Names are upper-cased
+	// anyway.
+	m := lower[start:end]
 	if strings.Contains(m, ".") {
 		return "", "", false
 	}
-	return nameFromFileStem(baseName[:idx]), nameFromFileStem(m), true
+	return nameFromFileStem(lower[:idx]), nameFromFileStem(m), true
 }
 
 // abapObjectName is a repository object name, optionally with a /NAMESPACE/.

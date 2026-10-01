@@ -366,3 +366,15 @@ func TestAClassStatementSplitAcrossLinesStillNamesTheClass(t *testing.T) {
 		t.Errorf("the error should name the statement it looked for, got %v", err)
 	}
 }
+
+// Lowercasing can grow a name's bytes (Ⱥ is 2 bytes, ⱥ is 3): positions found
+// in the lowered name must not be used to cut the original.
+func TestFugrMemberMultibyteDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panicked: %v", r)
+		}
+	}()
+	_, _, _ = fugrMember("ȺȺȺȺȺȺȺȺ.fugr.x.abap")
+	_, _, _ = fugrMember("ȺȺȺȺȺȺȺȺ.FUGR.X.ABAP")
+}
