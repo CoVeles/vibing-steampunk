@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // --- Lock/Unlock Operations ---
@@ -543,6 +544,10 @@ func (c *Client) objectExistsByURL(ctx context.Context, objectURL string) (bool,
 // create error is never lost — it is always the OriginalErr of the
 // returned PartialCreateError. Manual recovery hints are only added
 // when our best-effort attempt could not finish.
+// partialCreateProbeTimeout bounds the read that checks whether an
+// interrupted throwaway create was committed anyway.
+const partialCreateProbeTimeout = 5 * time.Second
+
 func (c *Client) reconcileFailedCreate(ctx context.Context, opts CreateObjectOptions, createErr error) error {
 	// An already-exists response proves the object predates this create attempt.
 	// It is not partial persistence owned by this request, so reconciliation
@@ -564,8 +569,14 @@ func (c *Client) reconcileFailedCreate(ctx context.Context, opts CreateObjectOpt
 		// committed it. The probe is a read, so it may outlive that
 		// cancellation; with the caller's context it never leaves the
 		// process, and a program left behind would go unreported.
+		//
+		// It is bounded well below the cleanup timeout: it runs after the
+		// caller's own deadline, and a call given a time budget should not
+		// overrun it by much just to say what it left behind.
+		detached, cancelDetached := failureCleanupContext(ctx)
+		defer cancelDetached()
 		var cancel context.CancelFunc
-		probeCtx, cancel = failureCleanupContext(ctx)
+		probeCtx, cancel = context.WithTimeout(detached, partialCreateProbeTimeout)
 		defer cancel()
 	}
 	exists, probeErr := c.objectExistsByURL(probeCtx, objectURL)
