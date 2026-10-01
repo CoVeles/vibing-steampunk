@@ -176,6 +176,16 @@ CLASS zcl_vsp_transport_service DEFINITION
       EXPORTING ev_error         TYPE string
       RETURNING VALUE(rv_exists) TYPE abap_bool.
 
+    "! Whether a file exists in a DIR_TRANS subdirectory. A failure to read
+    "! the directory or the file's attributes is an error, never absence:
+    "! absence is concluded only from a directory listing without it.
+    CLASS-METHODS probe_file
+      IMPORTING iv_subdir        TYPE epsf-epssubdir
+                iv_name          TYPE string
+      EXPORTING ev_error         TYPE string
+                ev_long_dir      TYPE eps2path
+      RETURNING VALUE(rv_exists) TYPE abap_bool.
+
     "! Writes a new file through the EPS layer. ev_opened says a file was
     "! created, so that a failure after it knows what to delete.
     CLASS-METHODS write_file
@@ -611,42 +621,49 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
 
     lv_name = sy-sysid.
     lv_buffer_dir = '$TR_BUFF'.
-    CALL FUNCTION 'EPS_OPEN_INPUT_FILE'
-      EXPORTING
-        iv_long_file_name      = lv_name
-        dir_name               = lv_buffer_dir
-        pos                    = lv_pos
-      IMPORTING
-        ev_long_dir_name       = lv_long_dir
-        ev_long_file_path      = lv_path
-        ev_file_size_long      = lv_size
-      EXCEPTIONS
-        invalid_eps_subdir     = 1
-        sapgparam_failed       = 2
-        build_directory_failed = 3
-        no_authorization       = 4
-        build_path_failed      = 5
-        open_failed            = 6
-        read_directory_failed  = 7
-        read_attributes_failed = 8
-        OTHERS                 = 9.
-    DATA(lv_subrc) = sy-subrc.
-    IF lv_subrc = 0.
+    DATA lv_probe_error TYPE string.
+    DATA(lv_exists) = probe_file( EXPORTING iv_subdir = CONV #( lv_buffer_dir ) iv_name = CONV #( lv_name )
+                                  IMPORTING ev_error = lv_probe_error ).
+    IF lv_probe_error IS NOT INITIAL.
+      rs_response = err( iv_id = is_message-id iv_code = 'BUFFER_READ_FAILED'
+                         iv_message = |The import buffer file { lv_name } in DIR_TRANS ($TR_BUFF) could not be read: { lv_probe_error }| ).
+      RETURN.
+    ENDIF.
+
+    IF lv_exists = abap_true.
+      CALL FUNCTION 'EPS_OPEN_INPUT_FILE'
+        EXPORTING
+          iv_long_file_name      = lv_name
+          dir_name               = lv_buffer_dir
+          pos                    = lv_pos
+        IMPORTING
+          ev_long_dir_name       = lv_long_dir
+          ev_long_file_path      = lv_path
+          ev_file_size_long      = lv_size
+        EXCEPTIONS
+          invalid_eps_subdir     = 1
+          sapgparam_failed       = 2
+          build_directory_failed = 3
+          no_authorization       = 4
+          build_path_failed      = 5
+          open_failed            = 6
+          read_directory_failed  = 7
+          read_attributes_failed = 8
+          OTHERS                 = 9.
+      DATA(lv_subrc) = sy-subrc.
+      IF lv_subrc <> 0.
+        " It exists; failing to open it is an error, not an empty buffer.
+        rs_response = err( iv_id = is_message-id
+                           iv_code = COND #( WHEN lv_subrc = 4 THEN `NO_AUTHORIZATION` ELSE `BUFFER_READ_FAILED` )
+                           iv_message = |The import buffer file { lv_name } in DIR_TRANS ($TR_BUFF) could not be read (exception { lv_subrc }) { last_message( ) }| ).
+        RETURN.
+      ENDIF.
       CALL FUNCTION 'EPS_CLOSE_FILE'
         EXPORTING
           iv_long_file_name = lv_name
           iv_long_dir_name  = lv_long_dir
         EXCEPTIONS
           OTHERS            = 1.
-    ELSEIF lv_subrc <> 7 AND lv_subrc <> 8.
-      rs_response = err( iv_id = is_message-id
-                         iv_code = COND #( WHEN lv_subrc = 4 THEN `NO_AUTHORIZATION` ELSE `BUFFER_READ_FAILED` )
-                         iv_message = |The import buffer file { lv_name } in DIR_TRANS ($TR_BUFF) could not be read (exception { lv_subrc }) { last_message( ) }| ).
-      RETURN.
-    ENDIF.
-    " No buffer file: nothing was ever queued for this system.
-
-    IF lv_subrc = 0.
       IF lv_size > c_max_total.
         rs_response = err( iv_id = is_message-id iv_code = 'TOO_LARGE'
                            iv_message = |The import buffer file is { lv_size } bytes, over the { c_max_total }-byte limit| ).
@@ -655,10 +672,13 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       lv_dataset = lv_path.
       TRY.
           OPEN DATASET lv_dataset FOR INPUT IN BINARY MODE.
-          IF sy-subrc = 0.
-            READ DATASET lv_dataset INTO lv_content.
-            CLOSE DATASET lv_dataset.
+          IF sy-subrc <> 0.
+            rs_response = err( iv_id = is_message-id iv_code = 'BUFFER_READ_FAILED'
+                               iv_message = |The import buffer file { lv_name } could not be opened| ).
+            RETURN.
           ENDIF.
+          READ DATASET lv_dataset INTO lv_content.
+          CLOSE DATASET lv_dataset.
           lv_text = cl_abap_codepage=>convert_from( source = lv_content codepage = `UTF-8` ).
         CATCH cx_root INTO DATA(lx_read).
           CLOSE DATASET lv_dataset.
@@ -667,6 +687,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
           RETURN.
       ENDTRY.
     ENDIF.
+    " No buffer file (listed directory without it): nothing was ever queued.
 
     " One request per line: [/<n>/]<TRKORR> <type><release> <owner> ... ;
     " lines starting with '#' are comments.
@@ -702,7 +723,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ( zcl_vsp_utils=>json_str( iv_key = 'system' iv_value = CONV #( sy-sysid ) ) )
       ( zcl_vsp_utils=>json_str( iv_key = 'client' iv_value = CONV #( sy-mandt ) ) )
       ( zcl_vsp_utils=>json_str( iv_key = 'source' iv_value = |DIR_TRANS/buffer/{ sy-sysid }| ) )
-      ( zcl_vsp_utils=>json_bool( iv_key = 'file_exists' iv_value = xsdbool( lv_subrc = 0 ) ) )
+      ( zcl_vsp_utils=>json_bool( iv_key = 'file_exists' iv_value = lv_exists ) )
       ( zcl_vsp_utils=>json_int( iv_key = 'total' iv_value = lv_total ) )
       ( zcl_vsp_utils=>json_bool( iv_key = 'truncated' iv_value = xsdbool( lv_total > c_max_buffer_entries ) ) )
       ( |"entries":{ zcl_vsp_utils=>json_arr( zcl_vsp_utils=>json_join( lt_items ) ) }| )
@@ -1253,33 +1274,70 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
 
 
   METHOD file_exists.
-    DATA: lv_subdir   TYPE epsf-epssubdir,
-          lv_long_dir TYPE eps2path,
-          lv_name     TYPE eps2filnam.
+    rv_exists = probe_file( EXPORTING iv_subdir = CONV #( dir_of( iv_kind ) ) iv_name = iv_name
+                            IMPORTING ev_error = ev_error ).
+  ENDMETHOD.
 
-    CLEAR ev_error.
-    lv_subdir = dir_of( iv_kind ).
+
+  METHOD probe_file.
+    DATA: lv_name    TYPE eps2filnam,
+          lv_dirname TYPE eps2filnam,
+          lv_mask    TYPE epsf-epsfilnam,
+          lt_list    TYPE STANDARD TABLE OF eps2fili WITH DEFAULT KEY.
+
+    CLEAR: ev_error, ev_long_dir.
     lv_name = iv_name.
     CALL FUNCTION 'EPS_GET_DIRECTORY_PATH'
       EXPORTING
-        eps_subdir       = lv_subdir
+        eps_subdir       = iv_subdir
       IMPORTING
-        ev_long_dir_name = lv_long_dir
+        ev_long_dir_name = ev_long_dir
       EXCEPTIONS
         OTHERS           = 1.
-    IF sy-subrc <> 0 OR lv_long_dir IS INITIAL.
-      ev_error = |DIR_TRANS ({ lv_subdir }) could not be resolved: { last_message( ) }|.
+    IF sy-subrc <> 0 OR ev_long_dir IS INITIAL.
+      ev_error = |DIR_TRANS ({ iv_subdir }) could not be resolved: { last_message( ) }|.
       RETURN.
     ENDIF.
     CALL FUNCTION 'EPS_GET_FILE_ATTRIBUTES'
       EXPORTING
         iv_long_file_name      = lv_name
-        iv_long_dir_name       = lv_long_dir
+        iv_long_dir_name       = ev_long_dir
       EXCEPTIONS
         read_directory_failed  = 1
         read_attributes_failed = 2
         OTHERS                 = 3.
-    rv_exists = xsdbool( sy-subrc = 0 ).
+    IF sy-subrc = 0.
+      rv_exists = abap_true.
+      RETURN.
+    ENDIF.
+
+    " No attributes: missing, or unreadable? Only a listing of the
+    " directory without the file says missing.
+    lv_dirname = ev_long_dir.
+    lv_mask = iv_name.
+    CALL FUNCTION 'EPS2_GET_DIRECTORY_LISTING'
+      EXPORTING
+        iv_dir_name            = lv_dirname
+        file_mask              = lv_mask
+      TABLES
+        dir_list               = lt_list
+      EXCEPTIONS
+        invalid_eps_subdir     = 1
+        sapgparam_failed       = 2
+        build_directory_failed = 3
+        no_authorization       = 4
+        read_directory_failed  = 5
+        too_many_read_errors   = 6
+        empty_directory_list   = 7
+        OTHERS                 = 8.
+    DATA(lv_subrc) = sy-subrc.
+    IF lv_subrc = 7 OR ( lv_subrc = 0 AND NOT line_exists( lt_list[ name = lv_name ] ) ).
+      rv_exists = abap_false.
+    ELSEIF lv_subrc = 0.
+      ev_error = |{ iv_name } is listed in { ev_long_dir } but its attributes cannot be read|.
+    ELSE.
+      ev_error = |{ ev_long_dir } cannot be listed (exception { lv_subrc }) { last_message( ) }|.
+    ENDIF.
   ENDMETHOD.
 
 

@@ -19,15 +19,16 @@ import (
 // call. Everything else -- TRINT_TP_INTERFACE, TMS_TP_IMPORT, the TMS_MGR_*
 // and TMS_CI_* dispatchers, CTS_API_* -- is out.
 var transportServiceFunctions = map[string]bool{
-	"EPS_GET_DIRECTORY_PATH":  true,
-	"EPS_GET_FILE_ATTRIBUTES": true,
-	"EPS_OPEN_OUTPUT_FILE":    true,
-	"EPS_WRITE_BLOCK":         true,
-	"EPS_CLOSE_FILE":          true,
-	"EPS_DELETE_FILE":         true,
-	"EPS_OPEN_INPUT_FILE":     true,
-	"TMS_TP_MAINTAIN_BUFFER":  true,
-	"TMS_TP_SHOW_BUFFER":      true,
+	"EPS_GET_DIRECTORY_PATH":     true,
+	"EPS_GET_FILE_ATTRIBUTES":    true,
+	"EPS_OPEN_OUTPUT_FILE":       true,
+	"EPS_WRITE_BLOCK":            true,
+	"EPS_CLOSE_FILE":             true,
+	"EPS_DELETE_FILE":            true,
+	"EPS_OPEN_INPUT_FILE":        true,
+	"EPS2_GET_DIRECTORY_LISTING": true,
+	"TMS_TP_MAINTAIN_BUFFER":     true,
+	"TMS_TP_SHOW_BUFFER":         true,
 	// The tp step runs as a background job: an APC session may not make the
 	// synchronous RFC that starts tp.
 	"JOB_OPEN":             true,
@@ -410,5 +411,31 @@ func TestTransportServiceAbortChecksAssemblyID(t *testing.T) {
 	}
 	if guard < 0 || clear < 0 || clear < guard {
 		t.Errorf("upload_abort must check the assembly id before clearing: guard at %d, clear at %d", guard, clear)
+	}
+}
+
+// show_buffer must not take a directory or attribute read failure for "no
+// buffer file": that would report an empty queue that may not be empty.
+// Absence comes only from probe_file, which concludes it only from a
+// directory listing without the file.
+func TestShowBufferReportsReadFailures(t *testing.T) {
+	stmts := abapStatements(transportServiceSource(t))
+	show := strings.ToUpper(strings.Join(methodStatements(stmts, "HANDLE_SHOW_BUFFER"), "\n"))
+	if !strings.Contains(show, "PROBE_FILE(") {
+		t.Error("show_buffer does not use probe_file")
+	}
+	for _, bad := range []string{"LV_SUBRC <> 7", "LV_SUBRC = 7", "LV_SUBRC = 8", "LV_SUBRC <> 8"} {
+		if strings.Contains(show, bad) {
+			t.Errorf("show_buffer special-cases an EPS exception (%s)", bad)
+		}
+	}
+	probe := strings.ToUpper(strings.Join(methodStatements(stmts, "PROBE_FILE"), "\n"))
+	if !strings.Contains(probe, "CALL FUNCTION 'EPS2_GET_DIRECTORY_LISTING'") ||
+		!strings.Contains(probe, "IF LV_SUBRC = 7 OR ( LV_SUBRC = 0 AND NOT LINE_EXISTS( LT_LIST[ NAME = LV_NAME ] ) )") {
+		t.Error("probe_file does not conclude absence from a directory listing")
+	}
+	exists := strings.ToUpper(strings.Join(methodStatements(stmts, "FILE_EXISTS"), "\n"))
+	if !strings.Contains(exists, "PROBE_FILE(") {
+		t.Error("file_exists does not use probe_file")
 	}
 }
