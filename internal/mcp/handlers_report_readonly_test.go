@@ -62,3 +62,47 @@ func TestRunReport_WritableStillReachesSAP(t *testing.T) {
 		t.Error("RunReport never reached SAP without --read-only")
 	}
 }
+
+func TestSetTextElements_RefusedUnderReadOnlyBeforeTheWebSocket(t *testing.T) {
+	s, hits := reportTestServer(t, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, handled, err := s.routeReportAction(ctx, "debug", "SET_TEXT_ELEMENTS", "", map[string]any{
+		"program": "ZDEMO_REPORT", "text_symbols": `{"001":"Hello"}`,
+	})
+	if !handled || err != nil {
+		t.Fatalf("handled=%v err=%v", handled, err)
+	}
+	if !res.IsError || !strings.Contains(toolResultText(t, res), "blocked by safety configuration") {
+		t.Fatalf("want a safety refusal, got %q", toolResultText(t, res))
+	}
+	if n := hits(); n != 0 {
+		t.Errorf("a refused SetTextElements still reached SAP %d time(s)", n)
+	}
+}
+
+func TestTextElements_ReadsAndWritableWritesReachSAP(t *testing.T) {
+	cases := map[string]struct {
+		readOnly   bool
+		objectType string
+	}{
+		"read-only get": {true, "GET_TEXT_ELEMENTS"},
+		"writable set":  {false, "SET_TEXT_ELEMENTS"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, hits := reportTestServer(t, tc.readOnly)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			res, _, _ := s.routeReportAction(ctx, "debug", tc.objectType, "", map[string]any{
+				"program": "ZDEMO_REPORT", "text_symbols": `{"001":"Hello"}`,
+			})
+			if res != nil && strings.Contains(toolResultText(t, res), "blocked") {
+				t.Fatalf("refused: %q", toolResultText(t, res))
+			}
+			if hits() == 0 {
+				t.Error("never reached SAP")
+			}
+		})
+	}
+}
