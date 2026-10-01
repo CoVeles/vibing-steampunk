@@ -79,10 +79,10 @@ func TestDecompressPastPreallocCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Write(want); err != nil {
+	if _, err = w.Write(want); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Close(); err != nil {
+	if err = w.Close(); err != nil {
 		t.Fatal(err)
 	}
 	raw := d.Bytes()
