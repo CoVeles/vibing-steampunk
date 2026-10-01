@@ -100,11 +100,11 @@ func TestRunUnitTests_DangerousRefusedUnderReadOnly(t *testing.T) {
 	})
 }
 
-// A MODIFY lock under --read-only serves no write and strands an SM12 entry;
-// a READ lock stays allowed.
+// Under --read-only only a READ lock is allowed. A MODIFY lock (or any other
+// mode, known or not) serves no write and strands an SM12 entry.
 func TestLockObject_ModifyRefusedUnderReadOnly(t *testing.T) {
 	ctx := context.Background()
-	for _, mode := range []string{"MODIFY", "", "modify"} {
+	for _, mode := range []string{"MODIFY", "", "modify", "EXCLUSIVE", "SOMETHING_NEW"} {
 		t.Run("mode "+mode, func(t *testing.T) {
 			assertReadOnlyRefusal(t, func(c *Client) error {
 				_, err := c.LockObject(ctx, "/sap/bc/adt/programs/programs/zdemo", mode)
