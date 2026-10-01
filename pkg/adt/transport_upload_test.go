@@ -654,3 +654,17 @@ func TestUploadTransportFilesKept(t *testing.T) {
 		t.Errorf("%v %+v", err, res)
 	}
 }
+
+// A download needs --enable-transports itself: --allow-transportable-edits,
+// which opens transport reads, does not open it (PR #296 review).
+func TestDownloadNeedsEnableTransports(t *testing.T) {
+	s := UnrestrictedSafetyConfig()
+	s.AllowTransportableEdits = true
+	ws := newFakeTransportWS()
+	if _, err := uploadClient(s).DownloadTransportFiles(context.Background(), ws, "XYZK900001"); err == nil || !strings.Contains(err.Error(), "not enabled") {
+		t.Errorf("got %v", err)
+	}
+	if len(ws.actions()) != 0 {
+		t.Errorf("sent %v", ws.actions())
+	}
+}

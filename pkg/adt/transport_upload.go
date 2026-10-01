@@ -307,6 +307,11 @@ func (c *Client) CheckTransportDownload(request string) error {
 	if c.config.Safety.ReadOnly {
 		return fmt.Errorf("operation '%s' is blocked: read-only mode enabled (a data file can carry table contents)", op)
 	}
+	// The read gate also lets --allow-transportable-edits through; a
+	// download needs transports enabled outright.
+	if !c.config.Safety.EnableTransports {
+		return fmt.Errorf("operation '%s' is blocked: transports not enabled (use --enable-transports or SAP_ENABLE_TRANSPORTS=true)", op)
+	}
 	return c.CheckTransportBufferRead(request, op)
 }
 
