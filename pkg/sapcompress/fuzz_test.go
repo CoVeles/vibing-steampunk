@@ -2,6 +2,7 @@ package sapcompress
 
 import (
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -34,4 +35,25 @@ func FuzzDecompress(f *testing.F) {
 			t.Fatalf("header promised %d bytes, got %d", h.Length, len(out))
 		}
 	})
+}
+
+// TestHeaderLengthDoesNotReserveMemory: the length in the header is input.
+// A nine-byte stream claiming 4 GiB used to reserve 4 GiB before reading a
+// bit of it, and on 32-bit builds the conversion went negative and makeslice
+// panicked. Both corpus files in testdata/fuzz/FuzzDecompress replay that.
+func TestHeaderLengthDoesNotReserveMemory(t *testing.T) {
+	for _, in := range [][]byte{
+		{0xff, 0xff, 0xff, 0xff, 0x12, 0x1f, 0x9d, 0x02, 0x00},
+		{0xff, 0xff, 0xff, 0xff, 0x10, 0x1f, 0x9d, 0x90, 0x41, 0x42},
+	} {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if _, err := Decompress(in); err == nil {
+			t.Fatalf("% x decoded to 4 GiB", in)
+		}
+		runtime.ReadMemStats(&after)
+		if got := after.TotalAlloc - before.TotalAlloc; got > 64<<20 {
+			t.Fatalf("% x: allocated %d MiB for a %d-byte input", in, got>>20, len(in))
+		}
+	}
 }
