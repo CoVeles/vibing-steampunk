@@ -204,9 +204,20 @@ func TestUniversalToolDispatchesAdvertisedForms(t *testing.T) {
 			if err != nil {
 				t.Fatalf("handleUniversalTool returned an error: %v", err)
 			}
+			// Unrouted is the dispatcher's own answer when the chain runs
+			// out, which for analyze and system is "needs ..." rather than
+			// "No handler found".
 			text := resultText(result)
-			if strings.Contains(text, "No handler found") {
+			action, _ := tc.args["action"].(string)
+			target, _ := tc.args["target"].(string)
+			params, _ := tc.args["params"].(map[string]any)
+			target, _ = queryTargetSQL(action, target, params)
+			objectType, objectName := parseTarget(target)
+			if text == getUnhandledErrorMessage(action, objectType, objectName) || strings.Contains(text, "No handler found") {
 				t.Errorf("action was not dispatched: %s", text)
+			}
+			if strings.Contains(text, " needs one of: ") {
+				t.Errorf("the route took the action but not this form of it: %s", text)
 			}
 		})
 	}
