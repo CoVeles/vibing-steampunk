@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -328,15 +329,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// A system named by -s / SAP_SYSTEM that is not the one SAP_URL and
-		// SAP_CLIENT connect to: say so now. RFC use refuses it later.
-		if cfg.SystemName != "" {
-			if sys, ok := systemsCfg.Systems[cfg.SystemName]; ok {
-				if err := mcp.NamedSystemMismatch(cfg.SystemName, sys, cfg.BaseURL, cfg.Client); err != nil {
-					fmt.Fprintf(os.Stderr, "[WARNING] %v; RFC calls will be refused\n", err)
-				}
-			}
-		}
+		warnNamedSystemMismatch(os.Stderr, cfg, systemsCfg)
 
 		applyDefaultSystemSettings(cfg, systemsCfg)
 	}
@@ -358,6 +351,22 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return srv.ServeHTTP(addr)
 	default:
 		return srv.ServeStdio()
+	}
+}
+
+// warnNamedSystemMismatch says at startup when the system named by -s /
+// SAP_SYSTEM is not the one SAP_URL and SAP_CLIENT connect to. RFC use
+// refuses it later; this only makes the reason visible before then.
+func warnNamedSystemMismatch(w io.Writer, c *mcp.Config, systemsCfg *config.SystemsConfig) {
+	if c.SystemName == "" || systemsCfg == nil {
+		return
+	}
+	sys, ok := systemsCfg.Systems[c.SystemName]
+	if !ok {
+		return
+	}
+	if err := mcp.NamedSystemMismatch(c.SystemName, sys, c.BaseURL, c.Client); err != nil {
+		fmt.Fprintf(w, "[WARNING] %v; RFC calls will be refused\n", err)
 	}
 }
 
