@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -150,9 +151,17 @@ func (s *Server) handleUpdateSource(ctx context.Context, request mcp.CallToolReq
 		transport = t
 	}
 
-	// Append /source/main to object URL if not already present
+	// A class include (/oo/classes/<name>/includes/<include>) is written at
+	// its own URL and locked through its class. Every other object takes
+	// /source/main, appended if not already present (#242).
 	sourceURL := objectURL
-	if !strings.HasSuffix(sourceURL, "/source/main") {
+	classURL, includeSourceURL, isClassInclude, err := adt.SplitClassIncludeURL(objectURL)
+	switch {
+	case err != nil:
+		return newToolResultError(fmt.Sprintf("Failed to update source: %v", err)), nil
+	case isClassInclude:
+		objectURL, sourceURL = classURL, includeSourceURL
+	case !strings.HasSuffix(sourceURL, "/source/main"):
 		sourceURL = objectURL + "/source/main"
 	}
 
@@ -162,14 +171,13 @@ func (s *Server) handleUpdateSource(ctx context.Context, request mcp.CallToolReq
 		// lock. UpdateSource reuses this per-object marker, so it still runs
 		// every policy check but does not issue a stateless SearchObject inside
 		// the LOCK -> PUT -> UNLOCK window (#169).
-		var err error
 		updateCtx, err = s.adtClient.PrepareSourceUpdate(ctx, objectURL, transport)
 		if err != nil {
 			return newToolResultError(fmt.Sprintf("Failed to update source: %v", err)), nil
 		}
 	}
 
-	err := s.withObjectLock(updateCtx, objectURL, lockHandle, transport, func(handle string) error {
+	err = s.withObjectLock(updateCtx, objectURL, lockHandle, transport, func(handle string) error {
 		return s.adtClient.UpdateSource(updateCtx, sourceURL, source, handle, transport)
 	})
 	if err != nil {
@@ -365,16 +373,6 @@ func (s *Server) handleCreateTable(ctx context.Context, request mcp.CallToolRequ
 		return newToolResultError("fields is required (JSON array)"), nil
 	}
 
-	// Parse fields JSON
-	var fields []adt.TableField
-	if err := json.Unmarshal([]byte(fieldsJSON), &fields); err != nil {
-		return newToolResultError(fmt.Sprintf("Invalid fields JSON: %v", err)), nil
-	}
-
-	if len(fields) == 0 {
-		return newToolResultError("At least one field is required"), nil
-	}
-
 	// Optional parameters
 	pkg := "$TMP"
 	if p, ok := request.GetArguments()["package"].(string); ok && p != "" {
@@ -395,22 +393,51 @@ func (s *Server) handleCreateTable(ctx context.Context, request mcp.CallToolRequ
 		Name:          name,
 		Description:   description,
 		Package:       pkg,
-		Fields:        fields,
+		FieldsJSON:    fieldsJSON,
 		Transport:     transport,
 		DeliveryClass: deliveryClass,
 	}
 
-	err := s.adtClient.CreateTable(ctx, opts)
-	if err != nil {
+	// client_dependent: true/false (or "true"/"false"); left out, a client key
+	// field is added unless the first key field already is one. The fields
+	// and this flag are handed over raw: CreateTable parses them after its
+	// mutation gate (issue #254), so --read-only and --allowed-packages answer
+	// a blocked caller before any complaint about the spec does.
+	if v, present := request.GetArguments()["client_dependent"]; present && v != nil {
+		var raw string
+		switch t := v.(type) {
+		case bool:
+			raw = strconv.FormatBool(t)
+		case string:
+			raw = t
+		default:
+			raw = fmt.Sprintf("%v (%T)", v, v) // not a bool; refused after the gate
+		}
+		opts.ClientDependentArg = &raw
+	}
+
+	if err := s.adtClient.CreateTable(ctx, opts); err != nil {
 		return newToolResultError(fmt.Sprintf("Failed to create table: %v", err)), nil
 	}
+	// CreateTable accepted these, so neither call can fail here.
+	resolved, _ := adt.ResolveCreateTableSpec(opts)
+	clientField, clientAdded, _ := adt.TableClientField(resolved)
 
 	result := map[string]interface{}{
 		"status":      "created",
 		"table":       strings.ToUpper(name),
 		"package":     pkg,
 		"description": description,
-		"fields":      len(fields),
+		"fields":      len(resolved.Fields),
+	}
+	if clientField == "" {
+		result["client_dependent"] = false
+	} else {
+		result["client_dependent"] = true
+		result["client_field"] = clientField
+		if clientAdded {
+			result["client_field_added"] = true
+		}
 	}
 	output, _ := json.MarshalIndent(result, "", "  ")
 	return mcp.NewToolResultText(string(output)), nil
