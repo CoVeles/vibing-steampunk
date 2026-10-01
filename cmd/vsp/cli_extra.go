@@ -722,9 +722,13 @@ func runExecute(cmd *cobra.Command, args []string) error {
 		reportDumpsAfterRun(dumped, result.ProgramName, watch.User)
 	}
 
-	// The exit code is the part scripts read, so both kinds of failure have to
-	// reach it. The detail is on stderr already; this only has to be short and
-	// true.
+	return executeExitError(result, dumped)
+}
+
+// executeExitError is what `vsp execute` exits with. The exit code is the part
+// scripts read, so every kind of failure has to reach it. The detail is on
+// stderr already; this only has to be short and true.
+func executeExitError(result *adt.ExecuteABAPResult, dumped []adt.Dump) error {
 	switch {
 	case result.Failure != nil && result.Failure.Kind == adt.ExecuteFailureSyntax:
 		// Said apart from "did not finish", because it did not start. That
@@ -739,6 +743,11 @@ func runExecute(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("the code did not finish")
 	case len(dumped) > 0:
 		return fmt.Errorf("a runtime error appeared while this ran")
+	case !result.Success:
+		// No failure from the run, because there was no run: the temporary
+		// program could not be created, locked, written or activated. Its
+		// message is already on stderr; exiting 0 would call that a success.
+		return fmt.Errorf("the code did not run")
 	}
 	return nil
 }
