@@ -66,10 +66,11 @@ of the above and the readiness wait, and it runs the same locally.
 A note on isolation. My very first `osd doctor` run unpacked a 75 MB home into
 the real `~/.local/share/open-steamgate`, although `XDG_DATA_HOME` was set on
 the same command line. I removed it at once (it was 10 s old and nothing else
-was in it). I could not reproduce this; later runs honoured `XDG_DATA_HOME`.
-The binary's code reads `env.XDG_DATA_HOME` correctly, so the cause is
-unexplained. `osd-up.sh` now also sets `HOME` into the work dir, so a miss
-like that one lands in scratch. Open question Q1.
+was in it). dell could not reproduce this either. Their reading is that it was
+an `osd-home-<seedId>` from a start without `XDG_DATA_HOME`; `doctor` now
+prints the resolved directory (§8, question 1). `osd-up.sh` also sets `HOME`
+into the work dir, and the `osd: system home <path>` line at the top of
+`osd.log` shows where a run lives.
 
 ## 2. How the run was made
 
@@ -360,47 +361,52 @@ diff.
   `FindReferences` skips on any error, `StatelessClientRefusesDebugCalls…`).
   On OSD they pass or skip without testing anything. The classifier flags the
   ones it can see.
-- **Isolation.** See the unexplained write to the real data home in §1.
+- **Isolation.** See the write to the real data home in §1. It was not reproduced; check the `system home` line in each run's log.
 
-## 8. Open questions for the OSG team
+## 8. Open questions for the OSG team, and dell's answers
 
-1. **Data home leak.** One `osd doctor` with `XDG_DATA_HOME` set still
-   materialised into `~/.local/share/open-steamgate` (not reproduced since).
-   Is there a path, for example the first run or doctor, that resolves the
-   home before reading the env?
-2. **Lock and session model.** After LOCK, one stateless request on the same
-   cookie jar makes the next PUT fail with 409 "lock handle does not hold this
-   object in this session". Is OSD retiring the stateful context on a
-   stateless request more eagerly than A4H does (cf. vsp #91)? It breaks both
-   lock-race tests.
-3. **Enqueue.** Two sessions both get a lock on the same object. Is a
-   cross-session refusal planned?
-4. **Packages.** A package created under `$ZOSD_TEST` returns 201 and writes
-   `package.devc.xml`, but is then "does not exist" for nodestructure and
-   search. Is that intended? And LOCK/DELETE on `/packages/{n}` is not served,
-   so how should a test clean up?
-5. **No `$TMP`.** Could OSD ship a `$TMP` (or a documented scratch package)
-   so that SAP-shaped clients work unchanged?
-6. **Cross-reference columns.** Could `CROSS.PROG` and `WBCROSSGT.DIRECT` be
-   added? And could a refused freestyle query carry a message instead of an
-   empty `ExceptionResourceWrongData`?
-7. **Activation cost.** Is a full runtime reboot per activation inherent, or
-   can a single-object activation be incremental? It sets the CI wall time.
-8. **Test include.** POST `oo/classes/{n}/includes` (creating the
-   test-classes include) is not served, which blocks vsp's class-with-tests
-   flow. Is it planned?
-9. ~~**OSGo 0.5.**~~ Answered by dell:
-   - **Tag:** the first `vscode-v0.5.N` tag ships `osgo-*`, each with a
-     `.sha256`. dell will name the exact tag; it then goes into
-     `.github/ci/osgo.version`.
-   - **Readiness:** `GET /health` until `status` is `ready`, about 0.55 s.
-   - **Start:** `./osgo-linux-x64 -home <dir> -port 3095`. A fresh `-home` is a
-     full reset.
-   - **Scope:** OData only; no ADT yet (ADR 0007).
+dell answered on 2026-10-01. The fixes marked **0.4.x** ship in a 0.4.x patch
+release; when it is out, the pin moves and the matrix is rerun.
 
-   `osd-up.sh` and the workflow's OSGo row are wired to this.
-10. **`ModificationSupport: NoModification`** on a writable object's lock
-    response. Is this deliberate, and what does A4H return there?
+| # | Question | Answer (dell) | Effect on vsp's matrix |
+|---|---|---|---|
+| 1 | One `osd doctor` with `XDG_DATA_HOME` set materialised into `~/.local/share/open-steamgate` | **Not reproduced.** The 75 MB was probably an `osd-home-<seedId>` left by a start without `XDG_DATA_HOME`. `doctor` now prints the resolved directory. The rerun for the package capture logged `osd: system home <scratch>/xdg/open-steamgate/osd-home-…` and left the real home untouched | `osd-up.sh` keeps setting `HOME` as well; CI checks the `system home` line in `osd.log` |
+| 2 | A stateless request between LOCK and PUT makes the PUT fail with 409 | **Bug, being fixed (0.4.x).** A stateless hop clears the session's locks | both lock-race tests should pass after the patch |
+| 3 | Two sessions both get a lock | **Being fixed (0.4.x):** an enqueue across sessions | scenario S5's "B is refused" becomes testable |
+| 4 | Created package invisible; no LOCK/DELETE on packages | There is **no LOCK route for packages, by design**. To clean up, delete the objects, then `DELETE /packages/<name>` **without a lock**. The invisible package is **not reproduced by dell**; vsp's exact exchange is below | vsp's cleanup must not lock a package on OSD (it does on A4H); still open |
+| 5 | No `$TMP` | **A writable `$TMP` is planned** | `VSP_TEST_PACKAGE` becomes optional once it ships |
+| 6 | `CROSS.PROG` / `WBCROSSGT.DIRECT` missing; empty refusal message | **The empty message is being fixed (0.4.x).** `PROG` and `DIRECT` come in **0.6** | callees/callgraph (S9) stay a known gap until 0.6 |
+| 7 | Full runtime reboot per activation | `OSD_WARM=1 STG_DEV=1` gives saves of about 0.5 s for existing classes | worth trying in CI to cut the 25-30 s per activation; `VSP_TEST_TIMEOUT` stays for newly created objects |
+| 8 | POST `oo/classes/{n}/includes` (test include) not served | **Being fixed (0.4.x)** | ClassWithUnitTests and CreateClassWithTests should move |
+| 9 | OSGo 0.5 tag, readiness and start | Answered earlier: the first `vscode-v0.5.N` tag ships `osgo-*` with `.sha256`. Start with `-home <dir> -port 3095`; ready when `GET /health` says `ready` (about 0.55 s). OData only, no ADT yet (ADR 0007) | wired into `osd-up.sh` and the workflow |
+| 10 | `ModificationSupport: NoModification` on a writable object's lock | **Deliberate; A4H does the same.** A read-only object shows as an **empty lock handle** | vsp must decide modifiability from the handle, not from this field |
+| - | Versions do not grow on activation | **Deliberate.** Versions come from git commits, not from activation | the S6 diff records this as an expected difference, not a bug |
+
+### Still open: the invisible package (vsp's exact exchange)
+
+This was rerun on 2026-10-01 against `vscode-v0.4.1444`, on a fresh
+`XDG_DATA_HOME`, `HOME` and `STG_DB_PATH`, through a logging proxy. Cookies,
+CSRF tokens and authorization are dropped from the capture. It reproduces.
+
+1. `POST /sap/bc/adt/packages?sap-client=001&sap-language=EN`
+   - Headers: `Content-Type: application/*`, `X-Sap-Adt-Sessiontype: stateless`.
+   - Body: a `pack:package` with `adtcore:name="$ZOSD_TEST_VSPCI"`,
+     `adtcore:type="DEVC/K"`, `adtcore:responsible="DEVELOPER"`,
+     `pack:packageType="development"`,
+     `<pack:superPackage adtcore:name="$ZOSD_TEST"/>` and software component
+     `LOCAL`.
+   - Answer: **201**, with `Location: /sap/bc/adt/packages/%24zosd_test_vspci`.
+     `src/zosd_test/vspci/package.devc.xml` is written to the home.
+2. `POST /sap/bc/adt/repository/nodestructure?parent_name=%24ZOSD_TEST_VSPCI&parent_type=DEVC%2FK&withShortDescriptions=true`
+   (stateless, empty body).
+   - Answer: **404** `ExceptionResourceNotFound`, "DEVC $ZOSD_TEST_VSPCI does
+     not exist".
+3. `GET …/informationsystem/search?operation=quickSearch&query=%24ZOSD_TEST%2A&objectType=DEVC%2FK`.
+   - Answer: 200 with the five seeded `$ZOSD_TEST*` packages, but **not**
+     `$ZOSD_TEST_VSPCI`. It is still missing more than 10 s later.
+
+One difference from Eclipse may matter: vsp sends the create **stateless**,
+with no `adtcore:packageRef`, and nothing between the create and the lookup.
 
 ## 9. Reproduce locally
 
