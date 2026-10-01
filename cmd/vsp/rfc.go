@@ -400,6 +400,9 @@ var rfcReadTableCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		where, _ := cmd.Flags().GetString("where")
+		if err := rfcFreeSQLGate(cmd, where); err != nil {
+			return err
+		}
 		top, _ := cmd.Flags().GetInt("top")
 		var fields []string
 		if f, _ := cmd.Flags().GetString("fields"); f != "" {
@@ -430,6 +433,22 @@ func rfcWriteGate(cmd *cobra.Command, opName string) error {
 		return err
 	}
 	return cliWorkflowGate(cliReadOnly(params), opName)
+}
+
+// rfcFreeSQLGate refuses a caller's WHERE clause for RFC_READ_TABLE when the
+// system blocks free SQL (block_free_sql in .vsp.json, or SAP_BLOCK_FREE_SQL):
+// it is a free query on any table, as the MCP server's read_table treats it.
+// A read without one, and search's own TFDIR filter, are not affected.
+func rfcFreeSQLGate(cmd *cobra.Command, where string) error {
+	if strings.TrimSpace(where) == "" {
+		return nil
+	}
+	params, err := resolveSystemParams(cmd)
+	if err != nil {
+		return err
+	}
+	safety := adt.SafetyConfig{BlockFreeSQL: params.BlockFreeSQL} // block_free_sql or SAP_BLOCK_FREE_SQL
+	return safety.CheckOperation(adt.OpFreeSQL, "RFCReadTable")
 }
 
 // cliReadOnly says whether the selected system is read-only for the CLI:
@@ -565,7 +584,7 @@ func init() {
 	rfcCallCmd.Flags().Bool("stdin", false, "read JSON parameters from stdin")
 	rfcSearchCmd.Flags().Bool("all", false, "include function modules that are not RFC-enabled")
 	rfcSearchCmd.Flags().Int("top", 100, "maximum rows")
-	rfcReadTableCmd.Flags().String("where", "", "WHERE clause")
+	rfcReadTableCmd.Flags().String("where", "", "WHERE clause (refused when the system blocks free SQL)")
 	rfcReadTableCmd.Flags().String("fields", "", "comma-separated column list")
 	rfcReadTableCmd.Flags().Int("top", 0, "maximum rows (0 = all)")
 

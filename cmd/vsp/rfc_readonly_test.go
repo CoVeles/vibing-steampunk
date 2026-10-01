@@ -148,3 +148,84 @@ func TestRFCCLI_ReadsAndWritableWritesReachTheGateway(t *testing.T) {
 		})
 	}
 }
+
+// rfcCLIFreeSQLEnv is rfcCLITestEnv with block_free_sql set as given.
+func rfcCLIFreeSQLEnv(t *testing.T, block bool) func() int64 {
+	t.Helper()
+	dials := rfcCLITestEnv(t, false)
+	raw, err := os.ReadFile(".vsp.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := strings.Replace(string(raw), `"read_only":false`, fmt.Sprintf(`"read_only":false,"block_free_sql":%t`, block), 1)
+	if err := os.WriteFile(".vsp.json", []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dials
+}
+
+func runReadTable(t *testing.T, where string) error {
+	t.Helper()
+	if err := rfcReadTableCmd.Flags().Set("where", where); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rfcReadTableCmd.Flags().Set("where", "") })
+	return rfcReadTableCmd.RunE(rfcReadTableCmd, []string{"USR02"})
+}
+
+// A caller's --where is a free query; a system that blocks free SQL refuses
+// it before the gateway is dialled.
+func TestRFCCLI_ReadTableWhereRefusedWhenFreeSQLBlocked(t *testing.T) {
+	setups := map[string]func(t *testing.T) func() int64{
+		"block_free_sql": func(t *testing.T) func() int64 { return rfcCLIFreeSQLEnv(t, true) },
+		"SAP_BLOCK_FREE_SQL": func(t *testing.T) func() int64 {
+			d := rfcCLIFreeSQLEnv(t, false)
+			t.Setenv("SAP_BLOCK_FREE_SQL", "true")
+			return d
+		},
+		"env only": func(t *testing.T) func() int64 {
+			d := rfcCLITestEnv(t, false)
+			_ = os.Remove(".vsp.json")
+			t.Setenv("SAP_URL", "http://127.0.0.1:1")
+			t.Setenv("SAP_USER", "TESTUSER")
+			t.Setenv("SAP_PASSWORD", "secret")
+			t.Setenv("SAP_BLOCK_FREE_SQL", "true")
+			return d
+		},
+	}
+	for name, setup := range setups {
+		t.Run(name, func(t *testing.T) {
+			dials := setup(t)
+			err := runReadTable(t, "BNAME = 'TESTUSER'")
+			if err == nil || !strings.Contains(err.Error(), "blocked by safety configuration") || !strings.Contains(err.Error(), "type F") {
+				t.Fatalf("want a free-SQL refusal, got %v", err)
+			}
+			if n := cliWaitDials(dials, 1, 200*time.Millisecond); n != 0 {
+				t.Errorf("a refused read-table still dialled the gateway %d time(s)", n)
+			}
+		})
+	}
+}
+
+func TestRFCCLI_ReadTableOtherwiseReachesTheGateway(t *testing.T) {
+	cases := map[string]struct {
+		block bool
+		where string
+	}{
+		"blocked, no where": {true, ""},
+		"blocked, blank":    {true, "   "},
+		"unblocked, where":  {false, "BNAME = 'TESTUSER'"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dials := rfcCLIFreeSQLEnv(t, tc.block)
+			err := runReadTable(t, tc.where)
+			if err != nil && strings.Contains(err.Error(), "blocked") {
+				t.Fatalf("refused: %v", err)
+			}
+			if cliWaitDials(dials, 1, 2*time.Second) == 0 {
+				t.Errorf("never reached the gateway (err %v)", err)
+			}
+		})
+	}
+}
