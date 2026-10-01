@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/oisee/vibing-steampunk/pkg/sapcompress"
 )
@@ -239,7 +240,7 @@ type parser struct {
 }
 
 func (p *parser) need(n int) error {
-	if p.pos+n > len(p.data) {
+	if n < 0 || n > len(p.data)-p.pos {
 		return fmt.Errorf("truncated: need %d bytes at offset %d, have %d", n, p.pos, len(p.data)-p.pos)
 	}
 	return nil
@@ -249,9 +250,14 @@ func (p *parser) u32() (int, error) {
 	if err := p.need(4); err != nil {
 		return 0, err
 	}
-	v := int(binary.BigEndian.Uint32(p.data[p.pos:]))
+	u := binary.BigEndian.Uint32(p.data[p.pos:])
+	if uint64(u) > math.MaxInt32 {
+		// No length in a cluster comes near 2 GiB, and on a 32-bit build
+		// int(u) would turn negative, pass need() and slice backwards.
+		return 0, fmt.Errorf("length %#x at offset %d is out of range", u, p.pos)
+	}
 	p.pos += 4
-	return v, nil
+	return int(u), nil
 }
 
 // object reads one export: its header, its descriptor, its data.

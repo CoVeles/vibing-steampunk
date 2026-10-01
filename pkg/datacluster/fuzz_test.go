@@ -81,3 +81,20 @@ func TestTableRowCountDoesNotSizeAllocation(t *testing.T) {
 		t.Fatalf("allocated %d MiB for a %d-byte blob", got>>20, len(blob))
 	}
 }
+
+// TestRowLengthOutOfRange: the length after a BC marker is four bytes of
+// input. 0xFFFFFFFF used to become -1 on a 32-bit build, slip past need()
+// and panic slicing backwards; on 64-bit it was a 4 GiB "truncated" claim.
+// Run with GOARCH=386 to see the original panic.
+func TestRowLengthOutOfRange(t *testing.T) {
+	blob := loadHex(t, "indx_plain.hex")
+	at := bytes.IndexByte(blob[HeaderSize:], 0xBC) + HeaderSize
+	if at < HeaderSize {
+		t.Fatal("fixture has no row marker")
+	}
+	bad := append([]byte{}, blob...)
+	copy(bad[at+1:], []byte{0xFF, 0xFF, 0xFF, 0xFF})
+	if _, err := Parse(bad); err == nil {
+		t.Fatal("a row of 0xFFFFFFFF bytes parsed")
+	}
+}
