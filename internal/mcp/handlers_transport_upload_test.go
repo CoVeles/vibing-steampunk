@@ -246,3 +246,17 @@ func TestTransportBufferView(t *testing.T) {
 		t.Errorf("without --enable-transports: %s, dials %d", uploadResultText(res), ws.dialed())
 	}
 }
+
+// A .vsp.json that does not parse refuses the upload: the server's own system
+// cannot be confirmed from it.
+func TestUploadTransportRefusesUnreadableSystemsConfig(t *testing.T) {
+	co, da := uploadFiles(t)
+	s, ws := uploadServer(t, nil)
+	if err := os.WriteFile(".vsp.json", []byte(`{"systems": {`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := callUpload(t, s, map[string]any{"cofile_path": co, "datafile_path": da})
+	if !res.IsError || !strings.Contains(uploadResultText(res), "cannot be read") || ws.dialed() != 0 {
+		t.Errorf("got %q, dials %d", uploadResultText(res), ws.dialed())
+	}
+}

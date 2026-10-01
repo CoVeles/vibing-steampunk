@@ -47,7 +47,13 @@ func (s *Server) checkOwnTarget(args map[string]any) error {
 				"to upload to another system, use a server connected to it", k, s.config.BaseURL, orDefaultClient(s.config.Client))
 		}
 	}
-	if cfg, _, err := config.LoadSystems(); err == nil && cfg != nil {
+	// A .vsp.json that cannot be read is not "no .vsp.json": the entry that
+	// would have said which system this server is may be in it. Refuse.
+	cfg, path, err := config.LoadSystems()
+	if err != nil {
+		return fmt.Errorf("%s cannot be read, so this server's own system cannot be confirmed: %w", orDefault(path, ".vsp.json"), err)
+	}
+	if cfg != nil {
 		if _, _, _, oerr := s.ownSystem(cfg); oerr != nil {
 			return oerr
 		}
