@@ -2,6 +2,7 @@ package datacluster
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -62,17 +63,7 @@ func FuzzReadExport(f *testing.F) {
 // count went straight into make() and asked for 66 GB, which killed the
 // fuzzing process and would take down the server that parsed it.
 func TestTableRowCountDoesNotSizeAllocation(t *testing.T) {
-	data, err := os.ReadFile("testdata/fuzz/FuzzParse/table_row_count_66gb")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The corpus file is `go test fuzz v1` followed by one []byte literal.
-	lit := strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[1])
-	lit = strings.TrimSuffix(strings.TrimPrefix(lit, "[]byte("), ")")
-	blob, err := strconv.Unquote(lit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	blob := string(rowCountCrasher(t))
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 	if _, err := Parse([]byte(blob)); err == nil {
@@ -157,5 +148,46 @@ func TestHeaderLengthsOutOfRange(t *testing.T) {
 	blob = append(append(append(append([]byte{}, head...), obj...), desc...), row...)
 	if _, err := Parse(blob); err == nil {
 		t.Fatal("a descriptor of 0xFFFFFFFF bytes parsed")
+	}
+}
+
+// rowCountCrasher reads the FuzzParse corpus file whose nested table claims
+// 0xADBEEF00 rows; the count is its last four bytes.
+func rowCountCrasher(t *testing.T) []byte {
+	t.Helper()
+	data, err := os.ReadFile("testdata/fuzz/FuzzParse/table_row_count_66gb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The corpus file is `go test fuzz v1` followed by one []byte literal.
+	lit := strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[1])
+	lit = strings.TrimSuffix(strings.TrimPrefix(lit, "[]byte("), ")")
+	blob, err := strconv.Unquote(lit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []byte(blob)
+}
+
+// TestPaddedRowCountDoesNotScaleAllocation: refusing a count beyond the bytes
+// left is not enough on its own. A blob padded to cover its count passed that
+// check, and make() then reserved a 24-byte row header per claimed row, 24
+// times the input, before the first row failed to parse. Capacity now comes
+// from the rows actually read.
+func TestPaddedRowCountDoesNotScaleAllocation(t *testing.T) {
+	const rows = 4 << 20
+	crasher := rowCountCrasher(t)
+	at := len(crasher) - 4 // the count is the last four bytes
+	blob := append([]byte{}, crasher[:at]...)
+	blob = binary.BigEndian.AppendUint32(blob, rows)
+	blob = append(blob, make([]byte, rows)...) // 0x00 is no row marker
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := Parse(blob); err == nil {
+		t.Fatal("a table of padding parsed")
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > uint64(2*len(blob)) {
+		t.Fatalf("allocated %d MiB for a %d MiB blob", got>>20, len(blob)>>20)
 	}
 }

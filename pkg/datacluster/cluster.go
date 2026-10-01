@@ -586,6 +586,10 @@ func (p *parser) row(leaves []*Node) ([]any, error) {
 	return values, nil
 }
 
+// maxRowPrealloc bounds the rows tableRows reserves on the strength of the
+// count alone.
+const maxRowPrealloc = 1024
+
 // tableRows reads a nested table block, the BE marker already consumed:
 // line length, row count, the rows, and the closing BF.
 func (p *parser) tableRows(table *Node) ([][]any, error) {
@@ -606,16 +610,18 @@ func (p *parser) tableRows(table *Node) ([][]any, error) {
 	leaves := lineLeaves(table)
 	// The count is four bytes of input. Every row of a line with fields
 	// takes at least one byte of the stream (a BC, CA or BE marker), so a
-	// count beyond what is left is a corrupt block, and refusing it here is
-	// what keeps it from sizing the allocation below: 0xADBEEF00 rows from
-	// a 190-byte blob asked for 66 GB.
+	// count beyond what is left is a corrupt block. That check alone does
+	// not bound memory: a blob padded to cover its count would still reserve
+	// a 24-byte row header per claimed row before the first one failed. So
+	// the count never sizes the slice past maxRowPrealloc; rows beyond that
+	// grow it as they are actually read.
 	if len(leaves) == 0 && count > 0 {
 		return nil, fmt.Errorf("nested table claims %d rows of a line with no fields", count)
 	}
 	if left := len(p.data) - p.pos; count > left {
 		return nil, fmt.Errorf("nested table claims %d rows, only %d bytes remain", count, left)
 	}
-	rows := make([][]any, 0, count)
+	rows := make([][]any, 0, min(count, maxRowPrealloc))
 	for r := 0; r < count; r++ {
 		row, err := p.row(leaves)
 		if err != nil {
