@@ -133,3 +133,33 @@ func TestDebuggerSetVariableValue_RefusedUnderReadOnly(t *testing.T) {
 		return err
 	})
 }
+
+// GetCodeCoverage posts the same ABAP Unit run as RunUnitTests, so it takes
+// the same rule: no dangerous or critical tests under --read-only.
+func TestGetCodeCoverage_DangerousRefusedUnderReadOnly(t *testing.T) {
+	ctx := context.Background()
+	for name, flags := range map[string]UnitTestRunFlags{
+		"dangerous": {Harmless: true, Dangerous: true, Short: true},
+		"critical":  {Harmless: true, Critical: true, Short: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, mock := readOnlyMockClient(true)
+			_, err := c.GetCodeCoverage(ctx, "/sap/bc/adt/oo/classes/zcl_demo", &flags)
+			if err == nil || !strings.Contains(err.Error(), "is blocked: read-only mode enabled") {
+				t.Fatalf("want a read-only refusal, got %v", err)
+			}
+			if len(mock.requests) != 0 {
+				t.Errorf("a refused coverage run sent %d request(s)", len(mock.requests))
+			}
+		})
+	}
+	t.Run("harmless still runs", func(t *testing.T) {
+		c, mock := readOnlyMockClient(true)
+		if _, err := c.GetCodeCoverage(ctx, "/sap/bc/adt/oo/classes/zcl_demo", nil); err != nil && strings.Contains(err.Error(), "blocked") {
+			t.Fatalf("an ordinary coverage run was refused: %v", err)
+		}
+		if len(mock.requests) == 0 {
+			t.Error("an ordinary coverage run never reached SAP")
+		}
+	})
+}
