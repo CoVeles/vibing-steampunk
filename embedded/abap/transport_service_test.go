@@ -768,3 +768,33 @@ func TestWritePairReportsFilesLeft(t *testing.T) {
 		}
 	}
 }
+
+// The status call believes a job number only for its own request: the job's
+// log, or before that its variant's text, must name the request; another
+// request's job is refused, an untied one gives no verdict. The job checks
+// that its variant's text agrees with P_REQ (PR #296 review).
+func TestStatusTiesJobToRequest(t *testing.T) {
+	stmts := abapStatements(transportServiceSource(t))
+	st := strings.ToUpper(strings.Join(methodStatements(stmts, "HANDLE_ADD_STATUS"), "\n"))
+	for _, want := range []string{
+		"IF LS_LOG-TEXT CP 'VSP REQUEST=*'",
+		"INTO DATA(LV_VSP) DATA(LV_REQ_WORD) DATA(LV_TAIL)",
+		"LV_TIED_TO = TO_UPPER( SUBSTRING_AFTER( VAL = LV_REQ_WORD SUB = '=' ) )",
+		"FROM VARIT",
+		"IF LV_TIED_TO IS NOT INITIAL AND LV_TIED_TO <> LV_REQUEST",
+		"IV_CODE = 'JOB_NOT_FOR_REQUEST'",
+		"ELSEIF LV_JOB_FOUND = ABAP_FALSE OR LV_TIED_TO IS INITIAL",
+	} {
+		if !strings.Contains(st, want) {
+			t.Errorf("add_status lacks %s", want)
+		}
+	}
+	job := strings.ToUpper(strings.Join(methodStatements(stmts, "RUN_JOB"), "\n"))
+	if !strings.Contains(job, "IF SY-SUBRC <> 0 OR LV_VTEXT <> |VSP UPLOAD { TO_UPPER( IV_REQUEST ) }|") {
+		t.Error("run_job does not check that its variant's text names its request")
+	}
+	log := strings.ToUpper(strings.Join(methodStatements(stmts, "JOB_LOG"), "\n"))
+	if !strings.Contains(log, "LV_LINE = |VSP REQUEST={ IS_RESULT-REQUEST } OUTCOME=") {
+		t.Error("the job log does not name the request first")
+	}
+}

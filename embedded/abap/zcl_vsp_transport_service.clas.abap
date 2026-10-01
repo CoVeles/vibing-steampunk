@@ -992,6 +992,13 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     SELECT SINGLE protected, ename, aename FROM varid INTO @DATA(ls_varid)
       WHERE report = 'ZVSP_TRANSPORT_BUFFER' AND variant = @lv_own_variant.
     DATA(lv_variant_found) = xsdbool( sy-subrc = 0 ).
+    " Its text names the request too (start_job wrote both): what ties the
+    " job to the request for add_status, so it must agree with P_REQ.
+    SELECT SINGLE vtext FROM varit INTO @DATA(lv_vtext)
+      WHERE report = 'ZVSP_TRANSPORT_BUFFER' AND variant = @lv_own_variant.
+    IF sy-subrc <> 0 OR lv_vtext <> |vsp upload { to_upper( iv_request ) }|.
+      lv_variant_found = abap_false.
+    ENDIF.
     IF sy-slset <> lv_own_variant OR lv_variant_found = abap_false OR ls_varid-protected <> 'X'
        OR ls_varid-ename <> sy-uname OR ( ls_varid-aename IS NOT INITIAL AND ls_varid-aename <> sy-uname ).
       ls_res-outcome = `not_added`.
@@ -1152,7 +1159,8 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
           lv_outcome   TYPE string,
           lv_job_found TYPE abap_bool,
           lv_cof_err   TYPE string,
-          lv_dat_err   TYPE string.
+          lv_dat_err   TYPE string,
+          lv_tied_to   TYPE string.
 
     DATA(lv_request) = to_upper( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'request' ) ).
     IF request_parts( EXPORTING iv_request = lv_request IMPORTING ev_sid = lv_sid ev_number = lv_number ) = abap_false.
@@ -1190,7 +1198,30 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
             OTHERS                = 8.
         LOOP AT lt_log INTO DATA(ls_log) WHERE text CP 'VSP *'.
           APPEND |"{ zcl_vsp_utils=>escape_json( CONV #( ls_log-text ) ) }"| TO lt_log_json.
+          " The job names its request in its log.
+          IF ls_log-text CP 'VSP request=*'.
+            " "VSP request=<REQ> outcome=...": the second word.
+            SPLIT condense( CONV string( ls_log-text ) ) AT space INTO DATA(lv_vsp) DATA(lv_req_word) DATA(lv_tail).
+            lv_tied_to = to_upper( substring_after( val = lv_req_word sub = '=' ) ).
+          ENDIF.
         ENDLOOP.
+        " Before it has logged anything: its variant's text names it.
+        IF lv_tied_to IS INITIAL.
+          SELECT SINGLE vtext FROM varit
+            WHERE report = 'ZVSP_TRANSPORT_BUFFER' AND variant = @( CONV rsvar-variant( |VSP{ lv_job }| ) )
+            INTO @DATA(lv_vtext).
+          IF sy-subrc = 0.
+            IF lv_vtext CP 'vsp upload *'.
+              SPLIT condense( CONV string( lv_vtext ) ) AT space INTO DATA(lv_w1) DATA(lv_w2) DATA(lv_w3).
+              lv_tied_to = to_upper( lv_w3 ).
+            ENDIF.
+          ENDIF.
+        ENDIF.
+        IF lv_tied_to IS NOT INITIAL AND lv_tied_to <> lv_request.
+          rs_response = err( iv_id = is_message-id iv_code = 'JOB_NOT_FOR_REQUEST'
+                             iv_message = |Job { lv_job } does not belong to { lv_request }: it is for { lv_tied_to }| ).
+          RETURN.
+        ENDIF.
       ENDIF.
     ENDIF.
 
@@ -1207,7 +1238,8 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       lv_outcome = `unknown`.
     ELSEIF lv_job IS INITIAL.
       lv_outcome = COND #( WHEN lv_in_buffer = abap_true THEN `queued` ELSE `not_in_buffer` ).
-    ELSEIF lv_job_found = abap_false.
+    ELSEIF lv_job_found = abap_false OR lv_tied_to IS INITIAL.
+      " A job that cannot be tied to the request says nothing about it.
       lv_outcome = `unknown`.
     ELSEIF lv_status = 'P' OR lv_status = 'S' OR lv_status = 'Y' OR lv_status = 'Z' OR lv_status = 'R'.
       lv_outcome = `pending`.
@@ -1224,6 +1256,8 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ( zcl_vsp_utils=>json_str( iv_key = 'job' iv_value = CONV #( c_job_name ) ) )
       ( zcl_vsp_utils=>json_str( iv_key = 'job_count' iv_value = lv_job ) )
       ( zcl_vsp_utils=>json_bool( iv_key = 'job_found' iv_value = lv_job_found ) )
+      ( zcl_vsp_utils=>json_bool( iv_key = 'job_tied' iv_value = xsdbool( lv_tied_to = lv_request ) ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'job_request' iv_value = lv_tied_to ) )
       ( zcl_vsp_utils=>json_str( iv_key = 'job_status' iv_value = CONV #( lv_status ) ) )
       ( zcl_vsp_utils=>json_bool( iv_key = 'in_buffer' iv_value = lv_in_buffer ) )
       ( zcl_vsp_utils=>json_str( iv_key = 'buffer_error' iv_value = lv_error ) )
@@ -1413,7 +1447,8 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
   METHOD job_log.
     " Background job: MESSAGE TYPE 'S' goes to the job log.
     DATA lv_line TYPE c LENGTH 120.
-    lv_line = |VSP outcome={ is_result-outcome } code={ is_result-code } in_buffer={ is_result-in_buffer } rolled_back={ is_result-rolled_back } tp_rc={ is_result-tp_rc }|.
+    " The request first: add_status ties a job to its request by this line.
+    lv_line = |VSP request={ is_result-request } outcome={ is_result-outcome } code={ is_result-code } in_buffer={ is_result-in_buffer } rolled_back={ is_result-rolled_back } tp_rc={ is_result-tp_rc }|.
     MESSAGE lv_line TYPE 'S'.
     IF is_result-message IS NOT INITIAL.
       lv_line = |VSP message { is_result-message }|.

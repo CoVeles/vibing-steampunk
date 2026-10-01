@@ -54,7 +54,7 @@ func TestWaitTransportAddTakesThePush(t *testing.T) {
 	transportSafetyPoll = time.Hour
 	t.Cleanup(func() { transportSafetyPoll = saved })
 	ws := &pushFakeWS{fakeTransportWS: newFakeTransportWS(), push: pushFrame("47110001", "queued"), delay: 20 * time.Millisecond}
-	ws.statuses = []map[string]any{{"outcome": "queued", "job_status": "F", "in_buffer": true, "system": "QAS"}}
+	ws.statuses = []map[string]any{{"outcome": "queued", "job_status": "F", "in_buffer": true, "system": "QAS", "job_tied": true}}
 	st, err := uploadClient(enabled()).WaitTransportAdd(context.Background(), ws, "XYZK900001", "47110001", nil)
 	if err != nil || st.Outcome != TransportQueued || st.Push == nil || st.Push.TPRC != "0000" {
 		t.Fatalf("%+v %v", st, err)
@@ -67,7 +67,7 @@ func TestWaitTransportAddTakesThePush(t *testing.T) {
 // A push alone does not make "queued": the status call decides.
 func TestWaitTransportAddPushIsNotTheVerdict(t *testing.T) {
 	ws := &pushFakeWS{fakeTransportWS: newFakeTransportWS(), push: pushFrame("47110001", "queued")}
-	ws.statuses = []map[string]any{{"outcome": "job_failed", "job_status": "F", "in_buffer": false, "system": "QAS"}}
+	ws.statuses = []map[string]any{{"outcome": "job_failed", "job_status": "F", "in_buffer": false, "system": "QAS", "job_tied": true}}
 	st, _ := uploadClient(enabled()).WaitTransportAdd(context.Background(), ws, "XYZK900001", "47110001", nil)
 	if st.Outcome != TransportJobFailed {
 		t.Errorf("%+v", st)
@@ -78,7 +78,7 @@ func TestWaitTransportAddPushIsNotTheVerdict(t *testing.T) {
 func TestWaitTransportAddFallsBackOnDrop(t *testing.T) {
 	ws := &pushFakeWS{fakeTransportWS: newFakeTransportWS(), closedErr: true}
 	second := newFakeTransportWS()
-	second.statuses = []map[string]any{{"outcome": "queued", "job_status": "F", "in_buffer": true, "system": "QAS"}}
+	second.statuses = []map[string]any{{"outcome": "queued", "job_status": "F", "in_buffer": true, "system": "QAS", "job_tied": true}}
 	reconnects := 0
 	st, err := uploadClient(enabled()).WaitTransportAdd(context.Background(), ws, "XYZK900001", "47110001",
 		func(context.Context) (TransportService, error) { reconnects++; return second, nil })
@@ -167,5 +167,29 @@ func TestWebSocketPushRouting(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a waiter was not released when the connection ended")
+	}
+}
+
+// A job number is believed only for its own request: one shown to be
+// another's is refused, one that cannot be tied gives no verdict, and a wait
+// stops at the refusal (PR #296 review).
+func TestTransportAddStatusTiesTheJobToTheRequest(t *testing.T) {
+	ws := newFakeTransportWS()
+	ws.statusErr = &WSError{Code: "JOB_NOT_FOR_REQUEST", Message: "Job 47110001 does not belong to XYZK900001: it is for XYZK900002"}
+	if _, err := uploadClient(enabled()).TransportAddStatus(context.Background(), ws, "XYZK900001", "47110001"); err == nil || !strings.Contains(err.Error(), "does not belong") {
+		t.Errorf("got %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := uploadClient(enabled()).WaitTransportAdd(ctx, ws, "XYZK900001", "47110001", nil)
+	if err == nil || !strings.Contains(err.Error(), "does not belong") || st.Outcome != TransportUnknown || ctx.Err() != nil {
+		t.Errorf("wait: %v %+v (ctx %v)", err, st, ctx.Err())
+	}
+
+	ws = newFakeTransportWS()
+	ws.statuses = []map[string]any{{"outcome": "queued", "job_status": "F", "in_buffer": true, "system": "QAS", "job_tied": false}}
+	st, _ = uploadClient(enabled()).TransportAddStatus(context.Background(), ws, "XYZK900001", "47110001")
+	if st.Outcome != TransportUnknown {
+		t.Errorf("an untied job gave a verdict: %+v", st)
 	}
 }

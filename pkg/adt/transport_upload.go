@@ -477,12 +477,17 @@ type TransportJob struct {
 // TransportAddStatus is what add_status reports: the outcome, and what it is
 // based on.
 type TransportAddStatus struct {
-	Request       string   `json:"request"`
-	System        string   `json:"system"`
-	Outcome       string   `json:"outcome"`
-	Job           string   `json:"job,omitempty"`
-	JobCount      string   `json:"jobCount,omitempty"`
-	JobFound      bool     `json:"jobFound"`
+	Request  string `json:"request"`
+	System   string `json:"system"`
+	Outcome  string `json:"outcome"`
+	Job      string `json:"job,omitempty"`
+	JobCount string `json:"jobCount,omitempty"`
+	JobFound bool   `json:"jobFound"`
+	// JobTied says the job is this request's: its log or its variant
+	// names the request.
+	JobTied bool `json:"jobTied"`
+	// JobRequest is the request the job's log or variant names.
+	JobRequest    string   `json:"jobRequest,omitempty"`
 	JobStatus     string   `json:"jobStatus,omitempty"`
 	InBuffer      bool     `json:"inBuffer"`
 	BufferError   string   `json:"bufferError,omitempty"`
@@ -548,6 +553,8 @@ type transportStatusAnswer struct {
 	Job           string   `json:"job"`
 	JobCount      string   `json:"job_count"`
 	JobFound      bool     `json:"job_found"`
+	JobTied       bool     `json:"job_tied"`
+	JobRequest    string   `json:"job_request"`
 	JobStatus     string   `json:"job_status"`
 	InBuffer      bool     `json:"in_buffer"`
 	BufferError   string   `json:"buffer_error"`
@@ -575,13 +582,14 @@ func (c *Client) TransportAddStatus(ctx context.Context, ws TransportService, re
 		return nil, err
 	}
 	st := &TransportAddStatus{Request: request, System: a.System, Outcome: a.Outcome, Job: a.Job, JobCount: a.JobCount,
-		JobFound: a.JobFound, JobStatus: strings.TrimSpace(a.JobStatus), InBuffer: a.InBuffer, BufferError: a.BufferError,
+		JobFound: a.JobFound, JobTied: a.JobTied, JobRequest: a.JobRequest, JobStatus: strings.TrimSpace(a.JobStatus), InBuffer: a.InBuffer, BufferError: a.BufferError,
 		CofilePresent: a.CofilePresent, DataPresent: a.DataPresent, JobLog: a.JobLog}
 	if st.JobCount == "" {
 		st.JobCount = jobCount
 	}
-	// Without a buffer read there is no verdict either way.
-	if st.BufferError != "" {
+	// Without a buffer read there is no verdict either way; nor from a job
+	// that is not shown to be this request's.
+	if st.BufferError != "" || (st.JobCount != "" && !st.JobTied) {
 		st.Outcome = TransportUnknown
 	}
 	if st.Job == "" && st.JobCount != "" {
@@ -668,6 +676,14 @@ func (c *Client) pollTransportAdd(ctx context.Context, ws TransportService, requ
 	var last *TransportAddStatus
 	for {
 		st, err := c.TransportAddStatus(ctx, ws, request, jobCount)
+		var se *TransportServiceError
+		if errors.As(err, &se) {
+			// A refusal (the job is another request's, say) does not
+			// change by asking again.
+			out := unknownAfterWait(last, request, jobCount)
+			out.Push = push
+			return out, err
+		}
 		if err == nil {
 			if st.Push == nil {
 				st.Push = push

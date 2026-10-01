@@ -51,7 +51,7 @@ func (f *uploadFakeWS) SendDomainRequest(_ context.Context, domain, action strin
 		data = map[string]any{"status": "pending", "ticket": "47110001", "job": "ZVSP_TRANSPORT_BUFFER", "job_count": "47110001", "request": "XYZK900001"}
 	case "add_status":
 		data = map[string]any{"request": "XYZK900001", "system": "QAS", "outcome": "queued", "job_count": params["job"],
-			"job_status": "F", "in_buffer": true}
+			"job_status": "F", "in_buffer": true, "job_tied": true}
 	default:
 		data = map[string]any{}
 	}

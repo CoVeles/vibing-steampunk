@@ -594,7 +594,7 @@ func TestTransportAddStatusQueuedNeedsTheBuffer(t *testing.T) {
 	if err != nil || st.Outcome != TransportUnknown {
 		t.Fatalf("%+v %v", st, err)
 	}
-	ws.statuses = []map[string]any{{"request": "XYZK900001", "system": "QAS", "outcome": "queued", "job_status": "F", "in_buffer": true, "job_count": "47110001"}}
+	ws.statuses = []map[string]any{{"request": "XYZK900001", "system": "QAS", "outcome": "queued", "job_status": "F", "in_buffer": true, "job_count": "47110001", "job_tied": true}}
 	st, _ = uploadClient(enabled()).TransportAddStatus(context.Background(), ws, "XYZK900001", "47110001")
 	if st.Outcome != TransportQueued || !strings.Contains(st.Note, "NOT been imported") {
 		t.Errorf("%+v", st)
@@ -612,7 +612,7 @@ func TestWaitTransportAdd(t *testing.T) {
 	ws.statuses = []map[string]any{
 		{"outcome": "pending", "job_status": "R"},
 		{"outcome": "pending", "job_status": "R"},
-		{"outcome": "queued", "job_status": "F", "in_buffer": true, "system": "QAS"},
+		{"outcome": "queued", "job_status": "F", "in_buffer": true, "system": "QAS", "job_tied": true},
 	}
 	st, err := uploadClient(enabled()).WaitTransportAdd(context.Background(), ws, "XYZK900001", "47110001", nil)
 	if err != nil || st.Outcome != TransportQueued {
