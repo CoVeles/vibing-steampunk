@@ -42,9 +42,9 @@ func (s *Server) ensureDebugWSClient(ctx context.Context) error {
 		return nil
 	}
 
-	// Create new client
 	// Built from the ADT client, so the upgrade carries the session that
-	// client holds now (renewed if it lapsed), or its password without one.
+	// client holds at this moment (including the last refresh an HTTP call
+	// made; building it does not re-authenticate), or its password without one.
 	s.debugWSClient = s.adtClient.NewDebugWebSocketClient()
 
 	return s.debugWSClient.Connect(ctx)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -97,5 +98,78 @@ func TestAPCProbeUsesTheCurrentSession(t *testing.T) {
 	}
 	if got := h.Get("Cookie"); got != "MYSAPSSO2=renewed" {
 		t.Errorf("probe carried cookie %q, want the renewed session", got)
+	}
+}
+
+// A client on a password picks up SAP's session cookies in its jar as it
+// works. Those must not leak into CurrentCookies, or the WebSocket built from
+// the client would switch from basic auth to a cookie it was never configured
+// with.
+func TestWebSocketFromBasicAuthClient_StaysOnBasicAfterRequests(t *testing.T) {
+	var mu sync.Mutex
+	var upgrades []http.Header
+	var httpCookies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") == "" {
+			mu.Lock()
+			httpCookies = append(httpCookies, r.Header.Get("Cookie"))
+			mu.Unlock()
+		} else {
+			mu.Lock()
+			upgrades = append(upgrades, r.Header.Clone())
+			mu.Unlock()
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: "SAP_SESSIONID_DEV_100", Value: "issued", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "sap-usercontext", Value: "sap-client=100", Path: "/"})
+		w.Header().Set("x-csrf-token", "token")
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, "TESTUSER", "s3cret", WithClient("100"))
+	for i := 0; i < 2; i++ {
+		if _, err := c.transport.Request(context.Background(), "/sap/bc/adt/core/discovery", &RequestOptions{Method: http.MethodGet}); err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+	}
+	mu.Lock()
+	jarInPlay := false
+	for _, ck := range httpCookies {
+		jarInPlay = jarInPlay || strings.Contains(ck, "SAP_SESSIONID_DEV_100=issued")
+	}
+	mu.Unlock()
+	if !jarInPlay {
+		t.Fatalf("the HTTP requests never sent back the issued session (%q); the test proves nothing", httpCookies)
+	}
+	if got := c.CurrentCookies(); len(got) != 0 {
+		t.Fatalf("CurrentCookies() = %v after requests on basic auth, want empty", got)
+	}
+
+	for name, connect := range map[string]func(context.Context) error{
+		"debug": c.NewDebugWebSocketClient().Connect,
+		"amdp":  c.NewAMDPWebSocketClient().Connect,
+	} {
+		if err := connect(context.Background()); err == nil {
+			t.Fatalf("%s: the server refuses every upgrade; Connect succeeded", name)
+		}
+	}
+
+	want, _ := http.NewRequest(http.MethodGet, "/", nil)
+	want.SetBasicAuth("TESTUSER", "s3cret")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(upgrades) != 2 {
+		t.Fatalf("saw %d WebSocket upgrades, want 2", len(upgrades))
+	}
+	for i, h := range upgrades {
+		if got := h.Get("Authorization"); got != want.Header.Get("Authorization") {
+			t.Errorf("upgrade %d carried Authorization %q, want the client's basic auth", i, got)
+		}
+		if got := h.Get("Cookie"); got != "" {
+			t.Errorf("upgrade %d carried cookie %q from a basic-auth client", i, got)
+		}
 	}
 }

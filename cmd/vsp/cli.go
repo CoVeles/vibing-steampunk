@@ -433,8 +433,14 @@ func buildClient(params *systemParams) (*adt.Client, error) {
 // getWSClient creates an AMDP WebSocket client for GitExport, authenticated as
 // the system's ADT client is: its cookie_file, cookie_string or single sign-on
 // session, or its password when it has none.
+//
+// The ADT client exists only to derive the WebSocket's credentials, so it is
+// built without the response cache: with a cache_path that would open a
+// SQLite store nothing here uses or closes.
 func getWSClient(ctx context.Context, params *systemParams) (*adt.AMDPWebSocketClient, error) {
-	client, err := buildClient(params)
+	noCache := *params
+	noCache.Cache, noCache.CachePath = false, ""
+	client, err := buildClient(&noCache)
 	if err != nil {
 		return nil, err
 	}

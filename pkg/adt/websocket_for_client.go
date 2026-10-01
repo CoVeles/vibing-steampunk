@@ -13,7 +13,9 @@ package adt
 //
 // Building the WebSocket from the ADT client removes the choice: it carries
 // the same system, client and TLS setting, and the session that client is
-// using now -- refreshed if it was renewed. With a session, the password is
+// using at this moment -- including the last refresh one of its HTTP calls
+// made. Building a WebSocket does not re-authenticate; a session that lapsed
+// since the last HTTP call is still lapsed. With a session, the password is
 // left out, so the upgrade carries cookies or basic auth, never both.
 
 // wsCredentials is how a WebSocket built for c authenticates: the session c

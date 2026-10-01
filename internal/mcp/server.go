@@ -482,7 +482,8 @@ func newToolResultError(message string) *mcp.CallToolResult {
 func (s *Server) ensureWSConnected(ctx context.Context, toolName string) *mcp.CallToolResult {
 	if s.amdpWSClient == nil || !s.amdpWSClient.IsConnected() {
 		// Built from the ADT client, so the upgrade carries the session that
-		// client holds now (renewed if it lapsed), or its password without one.
+		// client holds at this moment (including the last refresh an HTTP call
+		// made; building it does not re-authenticate), or its password without one.
 		s.amdpWSClient = s.adtClient.NewAMDPWebSocketClient()
 		if err := s.amdpWSClient.Connect(ctx); err != nil {
 			s.amdpWSClient = nil
