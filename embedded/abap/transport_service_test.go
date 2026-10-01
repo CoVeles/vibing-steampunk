@@ -106,6 +106,26 @@ var (
 	}
 )
 
+// exportingParams returns the formal parameters bound in a CALL FUNCTION
+// statement's EXPORTING section.
+func exportingParams(upStmt string) []string {
+	i := strings.Index(upStmt, " EXPORTING ")
+	if i < 0 {
+		return nil
+	}
+	sec := upStmt[i+len(" EXPORTING "):]
+	for _, end := range []string{" IMPORTING ", " TABLES ", " CHANGING ", " EXCEPTIONS "} {
+		if j := strings.Index(sec, end); j >= 0 {
+			sec = sec[:j]
+		}
+	}
+	var out []string
+	for _, m := range regexp.MustCompile(`(\w+)\s*=`).FindAllStringSubmatch(sec, -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
+
 // methodStatements returns the statements of one method's implementation.
 func methodStatements(stmts []string, method string) []string {
 	var out []string
@@ -138,6 +158,14 @@ func checkTransportService(src string) []string {
 				continue
 			}
 			name = strings.ToUpper(strings.Trim(name, "'"))
+			// Every call runs here, in this system and this task: no RFC
+			// destination (another system), no new task, no background or
+			// update task.
+			for _, kw := range []string{" DESTINATION ", " STARTING NEW TASK", " IN BACKGROUND TASK", " IN BACKGROUND UNIT", " IN UPDATE TASK"} {
+				if strings.Contains(up+" ", kw) {
+					bad = append(bad, "CALL FUNCTION '"+name+"' with"+kw+": every call must run here, synchronously")
+				}
+			}
 			if !transportServiceFunctions[name] {
 				bad = append(bad, "CALL FUNCTION '"+name+"' is not one the transport service may call")
 			}
@@ -158,10 +186,14 @@ func checkTransportService(src string) []string {
 				if m := bindingRe("IV_SYSTEM_NAME").FindStringSubmatch(up); m == nil || m[1] != "LV_SYSTEM" {
 					bad = append(bad, "TMS_TP_MAINTAIN_BUFFER: iv_system_name must be lv_system (sy-sysid)")
 				}
-				for _, p := range []string{"IV_TP_OPTIONS", "IV_NO_DELIVERY", "IV_WRONG_POS", "IV_REMOTE_SYS", "IV_OLDCLI", "IV_TARCLI", "TT_BUFFER"} {
-					if regexp.MustCompile(`\b` + p + `\s*=`).MatchString(up) {
-						bad = append(bad, "TMS_TP_MAINTAIN_BUFFER: "+p+" must not be passed")
+				// An allow-list, not a deny-list: exactly these three.
+				for _, p := range exportingParams(up) {
+					if p != "IV_TP_COMMAND" && p != "IV_SYSTEM_NAME" && p != "IV_REQUEST" {
+						bad = append(bad, "TMS_TP_MAINTAIN_BUFFER: "+p+" must not be passed (only iv_tp_command, iv_system_name, iv_request)")
 					}
+				}
+				if regexp.MustCompile(`\bTT_BUFFER\s*=`).MatchString(up) {
+					bad = append(bad, "TMS_TP_MAINTAIN_BUFFER: TT_BUFFER must not be passed")
 				}
 			case "TMS_TP_SHOW_BUFFER":
 				show++
@@ -174,6 +206,12 @@ func checkTransportService(src string) []string {
 					}
 				}
 			case "JOB_SUBMIT":
+				// The step runs as the caller, or JOB_SUBMIT's default.
+				for _, m := range bindingRe("AUTHCKNAM").FindAllStringSubmatch(up, -1) {
+					if m[1] != "SY-UNAME" {
+						bad = append(bad, "JOB_SUBMIT: authcknam must be sy-uname (or omitted)")
+					}
+				}
 				// The job runs this service's own step and nothing else.
 				if m := bindingRe("REPORT").FindStringSubmatch(up); m == nil || m[1] != "'ZVSP_TRANSPORT_BUFFER'" {
 					bad = append(bad, "JOB_SUBMIT: report must be the literal 'ZVSP_TRANSPORT_BUFFER'")
@@ -354,23 +392,27 @@ func TestTransportServiceOnlyAddsToBuffer(t *testing.T) {
 func TestTransportServiceGuardBites(t *testing.T) {
 	src := transportServiceSource(t)
 	mutations := map[string]struct{ old, new string }{
-		"another tp command":         {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = 'IMPORT'`},
-		"command from a variable":    {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = lv_cmd`},
-		"another system":             {"iv_system_name     = lv_system\n              iv_request", "iv_system_name     = lv_sid\n              iv_request"},
-		"lv_system not sy-sysid":     {"    lv_system = sy-sysid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'", "    lv_system = lv_sid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'"},
-		"lv_system changed later":    {"        lv_trkorr = ls_ticket-request.\n", "        lv_trkorr = ls_ticket-request.\n        CONCATENATE lv_sid space INTO lv_system.\n"},
-		"tp options":                 {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_tp_options      = lv_msg\n"},
-		"job runs another report":    {"report            = 'ZVSP_TRANSPORT_BUFFER'", "report            = 'RSBDCSUB'"},
-		"job runs a command":         {"report            = 'ZVSP_TRANSPORT_BUFFER'\n", "report            = 'ZVSP_TRANSPORT_BUFFER'\n        commandname       = 'ZCMD'\n"},
-		"a second tp FM":             {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'", "    CALL FUNCTION 'TRINT_TP_INTERFACE'"},
-		"dynamic call":               {"CALL FUNCTION 'EPS_DELETE_FILE'", "CALL FUNCTION lv_fm"},
-		"overwrite":                  {"overwrite_mode         = space", "overwrite_mode         = 'F'"},
-		"a caller's directory":       {"dir_name               = lv_dir\n            overwrite_mode", "dir_name               = lv_dir\n            iv_long_dir_name       = lv_path\n            overwrite_mode"},
-		"another logical dir":        {"THEN '$TR_COFI' ELSE '$TR_DATA'", "THEN '$TR_COFI' ELSE '$TR_BUFFER'"},
-		"dir_of maps the buffer dir": {"THEN '$TR_COFI' ELSE '$TR_DATA'", "THEN '$TR_COFI' ELSE '$TR_BUFF'"},
-		"show_buffer starts a job":   {"    lv_name = sy-sysid.\n    lv_buffer_dir", "    start_job( EXPORTING iv_action = `SHOW` iv_request = lv_request ).\n    lv_name = sy-sysid.\n    lv_buffer_dir"},
-		"show_buffer reads via tp":   {"    lv_name = sy-sysid.\n    lv_buffer_dir", "    CALL FUNCTION 'TMS_TP_SHOW_BUFFER' EXPORTING iv_system_name = lv_system.\n    lv_name = sy-sysid.\n    lv_buffer_dir"},
-		"plain file write":           {"CLOSE DATASET lv_dataset.\n          ELSE.", "CLOSE DATASET lv_dataset.\n            TRANSFER lv_chunk TO lv_dataset.\n          ELSE."},
+		"another tp command":                      {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = 'IMPORT'`},
+		"command from a variable":                 {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = lv_cmd`},
+		"another system":                          {"iv_system_name     = lv_system\n              iv_request", "iv_system_name     = lv_sid\n              iv_request"},
+		"lv_system not sy-sysid":                  {"    lv_system = sy-sysid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'", "    lv_system = lv_sid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'"},
+		"lv_system changed later":                 {"        lv_trkorr = ls_ticket-request.\n", "        lv_trkorr = ls_ticket-request.\n        CONCATENATE lv_sid space INTO lv_system.\n"},
+		"tp options":                              {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_tp_options      = lv_msg\n"},
+		"tp step on another system (DESTINATION)": {"          CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'\n", "          CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER' DESTINATION 'NONE'\n"},
+		"job step as another user":                {"report            = 'ZVSP_TRANSPORT_BUFFER'\n", "report            = 'ZVSP_TRANSPORT_BUFFER'\n        authcknam         = 'DDIC'\n"},
+		"tp parameter outside the allow-list":     {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_prid_text       = lv_msg\n"},
+		"buffer read in a new task":               {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'\n", "    CALL FUNCTION 'TMS_TP_SHOW_BUFFER' STARTING NEW TASK 'T'\n"},
+		"job runs another report":                 {"report            = 'ZVSP_TRANSPORT_BUFFER'", "report            = 'RSBDCSUB'"},
+		"job runs a command":                      {"report            = 'ZVSP_TRANSPORT_BUFFER'\n", "report            = 'ZVSP_TRANSPORT_BUFFER'\n        commandname       = 'ZCMD'\n"},
+		"a second tp FM":                          {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'", "    CALL FUNCTION 'TRINT_TP_INTERFACE'"},
+		"dynamic call":                            {"CALL FUNCTION 'EPS_DELETE_FILE'", "CALL FUNCTION lv_fm"},
+		"overwrite":                               {"overwrite_mode         = space", "overwrite_mode         = 'F'"},
+		"a caller's directory":                    {"dir_name               = lv_dir\n            overwrite_mode", "dir_name               = lv_dir\n            iv_long_dir_name       = lv_path\n            overwrite_mode"},
+		"another logical dir":                     {"THEN '$TR_COFI' ELSE '$TR_DATA'", "THEN '$TR_COFI' ELSE '$TR_BUFFER'"},
+		"dir_of maps the buffer dir":              {"THEN '$TR_COFI' ELSE '$TR_DATA'", "THEN '$TR_COFI' ELSE '$TR_BUFF'"},
+		"show_buffer starts a job":                {"    lv_name = sy-sysid.\n    lv_buffer_dir", "    start_job( EXPORTING iv_action = `SHOW` iv_request = lv_request ).\n    lv_name = sy-sysid.\n    lv_buffer_dir"},
+		"show_buffer reads via tp":                {"    lv_name = sy-sysid.\n    lv_buffer_dir", "    CALL FUNCTION 'TMS_TP_SHOW_BUFFER' EXPORTING iv_system_name = lv_system.\n    lv_name = sy-sysid.\n    lv_buffer_dir"},
+		"plain file write":                        {"CLOSE DATASET lv_dataset.\n          ELSE.", "CLOSE DATASET lv_dataset.\n            TRANSFER lv_chunk TO lv_dataset.\n          ELSE."},
 		"show buffer clears locks": {"iv_system_name     = lv_system\n      IMPORTING\n        ev_tp_cmd_strg     = lv_cmd\n        ev_tp_ret_code     = lv_rc\n        ev_tp_message      = lv_msg\n      TABLES\n        tt_stdout          = et_stdout",
 			"iv_system_name     = lv_system\n        iv_clear_locks     = 'X'\n      IMPORTING\n        ev_tp_cmd_strg     = lv_cmd\n        ev_tp_ret_code     = lv_rc\n        ev_tp_message      = lv_msg\n      TABLES\n        tt_stdout          = et_stdout"},
 	}
