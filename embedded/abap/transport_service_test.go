@@ -1,0 +1,286 @@
+package embedded
+
+import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"testing"
+)
+
+// ZCL_VSP_TRANSPORT_SERVICE adds a request to an import buffer and must never
+// be able to do more: no import, no other tp command, no file outside
+// DIR_TRANS/cofiles and DIR_TRANS/data. These checks read the source that vsp
+// install deploys (src/, which TestEmbeddedSourcesMatchSrc keeps equal to the
+// embedded copy) and fail on any statement that would widen what it can do.
+
+// transportServiceFunctions are the only function modules the service may
+// call. Everything else -- TRINT_TP_INTERFACE, TMS_TP_IMPORT, the TMS_MGR_*
+// and TMS_CI_* dispatchers, CTS_API_* -- is out.
+var transportServiceFunctions = map[string]bool{
+	"EPS_GET_DIRECTORY_PATH":  true,
+	"EPS_GET_FILE_ATTRIBUTES": true,
+	"EPS_OPEN_OUTPUT_FILE":    true,
+	"EPS_WRITE_BLOCK":         true,
+	"EPS_CLOSE_FILE":          true,
+	"EPS_DELETE_FILE":         true,
+	"EPS_OPEN_INPUT_FILE":     true,
+	"TMS_TP_MAINTAIN_BUFFER":  true,
+	"TMS_TP_SHOW_BUFFER":      true,
+}
+
+// tpCommands are tp commands (LSTPACON) and TMS buffer commands. Only
+// ADDTOBUFFER may appear as a literal in the service, once.
+var tpCommands = []string{
+	"ADDTOBUFFER", "IMPORT", "IMPSYNC", "IMPND", "CMD", "R3I", "R3H", "TST",
+	"IMPORTPREVIEW", "POSTLANGUAGEIMPORT", "DELIVER", "PUT", "VCSSYNCHRONIZE",
+	"LOCKSYS", "UNLOCKSYS", "LOCK_EU", "UNLOCK_EU", "LOCK_DDL", "UNLOCK_DDL",
+	"DELFROMBUFFER", "CLEANBUFFER", "PREPAREBUFFER", "FILLCLIENT", "MODCLIENT",
+	"MODBUFFER", "SETSTOPMARK", "DELSTOPMARK", "MVSTOPMARK", "SETSYNCMARK",
+	"DELSYNCMARK", "SETACTIVE", "LSETACTIVE", "SETINACTIVE", "LSETINACTIVE",
+	"SUSPEND", "RECOVERBUFFER", "CHECKIN", "CHECKINMOVE", "CHECKOUT", "CLEAROLD",
+	"WRITELOG", "SHOWBUFFER", "COUNT", "EXPORT", "EXPWBO", "CONNECT",
+}
+
+// abapStatements splits ABAP source into statements: comments removed,
+// periods inside literals and templates ignored.
+func abapStatements(src string) []string {
+	var out []string
+	var cur strings.Builder
+	for _, line := range strings.Split(strings.ReplaceAll(src, "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(line, "*") {
+			continue
+		}
+		var quote rune
+		for i, r := range line {
+			if quote != 0 {
+				cur.WriteRune(r)
+				if r == quote {
+					quote = 0
+				}
+				continue
+			}
+			switch r {
+			case '\'', '`', '|':
+				quote = r
+				cur.WriteRune(r)
+			case '"':
+				// Rest of the line is a comment.
+				goto next
+			case '.':
+				// A period ends a statement unless it is part of a word
+				// (cl_abap_char_utilities=>cr_lf(1), 2.4.0 never occurs
+				// outside literals in this class).
+				if i+1 >= len(line) || line[i+1] == ' ' || line[i+1] == '\t' {
+					out = append(out, strings.Join(strings.Fields(cur.String()), " "))
+					cur.Reset()
+					continue
+				}
+				cur.WriteRune(r)
+			default:
+				cur.WriteRune(r)
+			}
+		}
+	next:
+		cur.WriteRune(' ')
+	}
+	if s := strings.TrimSpace(cur.String()); s != "" {
+		out = append(out, strings.Join(strings.Fields(s), " "))
+	}
+	return out
+}
+
+var (
+	callFunctionRe = regexp.MustCompile(`(?i)^CALL FUNCTION (\S+)`)
+	quotedLitRe    = regexp.MustCompile(`'([^']*)'|` + "`([^`]*)`")
+	bindingRe      = func(name string) *regexp.Regexp {
+		return regexp.MustCompile(`(?i)\b` + name + `\s*=\s*(\S+)`)
+	}
+)
+
+// checkTransportService returns every rule src breaks.
+func checkTransportService(src string) []string {
+	var bad []string
+	stmts := abapStatements(src)
+	maintain, show := 0, 0
+	for _, st := range stmts {
+		up := strings.ToUpper(st)
+		if m := callFunctionRe.FindStringSubmatch(st); m != nil {
+			name := m[1]
+			if !strings.HasPrefix(name, "'") || !strings.HasSuffix(name, "'") {
+				bad = append(bad, "dynamic CALL FUNCTION "+name+": the function called must be a literal")
+				continue
+			}
+			name = strings.ToUpper(strings.Trim(name, "'"))
+			if !transportServiceFunctions[name] {
+				bad = append(bad, "CALL FUNCTION '"+name+"' is not one the transport service may call")
+			}
+			exporting := up
+			if i := strings.Index(up, " IMPORTING "); i >= 0 {
+				exporting = up[:i]
+			} else if i := strings.Index(up, " TABLES "); i >= 0 {
+				exporting = up[:i]
+			} else if i := strings.Index(up, " EXCEPTIONS "); i >= 0 {
+				exporting = up[:i]
+			}
+			switch name {
+			case "TMS_TP_MAINTAIN_BUFFER":
+				maintain++
+				if m := bindingRe("IV_TP_COMMAND").FindStringSubmatch(up); m == nil || m[1] != "'ADDTOBUFFER'" {
+					bad = append(bad, "TMS_TP_MAINTAIN_BUFFER: iv_tp_command must be the literal 'ADDTOBUFFER'")
+				}
+				if m := bindingRe("IV_SYSTEM_NAME").FindStringSubmatch(up); m == nil || m[1] != "LV_SYSTEM" {
+					bad = append(bad, "TMS_TP_MAINTAIN_BUFFER: iv_system_name must be lv_system (sy-sysid)")
+				}
+				for _, p := range []string{"IV_TP_OPTIONS", "IV_NO_DELIVERY", "IV_WRONG_POS", "IV_REMOTE_SYS", "IV_OLDCLI", "IV_TARCLI", "TT_BUFFER"} {
+					if regexp.MustCompile(`\b` + p + `\s*=`).MatchString(up) {
+						bad = append(bad, "TMS_TP_MAINTAIN_BUFFER: "+p+" must not be passed")
+					}
+				}
+			case "TMS_TP_SHOW_BUFFER":
+				show++
+				if m := bindingRe("IV_SYSTEM_NAME").FindStringSubmatch(up); m == nil || m[1] != "LV_SYSTEM" {
+					bad = append(bad, "TMS_TP_SHOW_BUFFER: iv_system_name must be lv_system (sy-sysid)")
+				}
+				for _, p := range []string{"IV_CLEAR_LOCKS", "IV_READ_LOCKS", "IV_COUNT_ONLY"} {
+					if regexp.MustCompile(`\b` + p + `\s*=`).MatchString(up) {
+						bad = append(bad, "TMS_TP_SHOW_BUFFER: "+p+" must not be passed")
+					}
+				}
+			case "EPS_OPEN_OUTPUT_FILE", "EPS_DELETE_FILE":
+				// The directory is the logical one from dir_of, never a path.
+				if m := bindingRe("DIR_NAME").FindStringSubmatch(exporting); m == nil || m[1] != "LV_DIR" {
+					bad = append(bad, name+": dir_name must be lv_dir (from dir_of)")
+				}
+				if strings.Contains(exporting, "IV_LONG_DIR_NAME") {
+					bad = append(bad, name+": iv_long_dir_name must not be passed (it would bypass $TR_COFI/$TR_DATA)")
+				}
+				if name == "EPS_OPEN_OUTPUT_FILE" {
+					if m := bindingRe("OVERWRITE_MODE").FindStringSubmatch(exporting); m == nil || m[1] != "SPACE" {
+						bad = append(bad, "EPS_OPEN_OUTPUT_FILE: overwrite_mode must be space (never overwrite)")
+					}
+				}
+			}
+		}
+		// lv_system is the system tp is told to act on. It is declared,
+		// set from sy-sysid, and handed to the two TMS calls -- nothing else.
+		if regexp.MustCompile(`\bLV_SYSTEM\b`).MatchString(up) {
+			switch {
+			case regexp.MustCompile(`^DATA\b.*\bLV_SYSTEM TYPE STPA-SYSNAME\b`).MatchString(up):
+			case up == "LV_SYSTEM = SY-SYSID":
+			case callFunctionRe.MatchString(st) && strings.Count(up, "LV_SYSTEM") == 1 && bindingRe("IV_SYSTEM_NAME").FindStringSubmatch(up) != nil:
+			default:
+				bad = append(bad, "lv_system used other than declared, set from sy-sysid, or passed as iv_system_name: "+st)
+			}
+		}
+		// File statements outside the EPS layer: only reading is allowed.
+		for _, kw := range []string{"DELETE DATASET", "TRANSFER ", "SUBMIT ", "CALL 'SYSTEM'", "CALL TRANSACTION", "GENERATE SUBROUTINE", "INSERT REPORT", "EXEC SQL"} {
+			if strings.HasPrefix(up, kw) || strings.Contains(up, " "+kw) {
+				bad = append(bad, "statement not allowed in the transport service: "+st)
+			}
+		}
+		if strings.HasPrefix(up, "OPEN DATASET") && !strings.Contains(up, " FOR INPUT ") {
+			bad = append(bad, "OPEN DATASET other than FOR INPUT: "+st)
+		}
+	}
+	if maintain != 1 {
+		bad = append(bad, "TMS_TP_MAINTAIN_BUFFER must be called exactly once")
+	}
+	if show != 1 {
+		bad = append(bad, "TMS_TP_SHOW_BUFFER must be called exactly once (the one buffer read)")
+	}
+
+	// Literals: one 'ADDTOBUFFER', no other tp command, and no $TR_ directory
+	// but cofiles and data.
+	var addLits int
+	dirs := map[string]bool{}
+	for _, st := range stmts {
+		for _, m := range quotedLitRe.FindAllStringSubmatch(st, -1) {
+			lit := strings.ToUpper(strings.TrimSpace(m[1] + m[2]))
+			if lit == "ADDTOBUFFER" {
+				addLits++
+				continue
+			}
+			for _, cmd := range tpCommands {
+				if lit == cmd {
+					bad = append(bad, "tp command literal '"+cmd+"' in the transport service")
+				}
+			}
+			if strings.HasPrefix(lit, "$TR") {
+				dirs[lit] = true
+			}
+		}
+	}
+	if addLits != 1 {
+		bad = append(bad, "the literal 'ADDTOBUFFER' must appear exactly once, as TMS_TP_MAINTAIN_BUFFER's command")
+	}
+	for d := range dirs {
+		if d != "$TR_COFI" && d != "$TR_DATA" {
+			bad = append(bad, "logical directory "+d+" in the transport service: only $TR_COFI and $TR_DATA")
+		}
+	}
+	sort.Strings(bad)
+	return bad
+}
+
+func transportServiceSource(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "..", "src", "zcl_vsp_transport_service.clas.abap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestTransportServiceOnlyAddsToBuffer(t *testing.T) {
+	src := transportServiceSource(t)
+	for _, b := range checkTransportService(src) {
+		t.Error(b)
+	}
+	// And the copy vsp install deploys is the same class.
+	for _, o := range GetObjects() {
+		if o.Name == "ZCL_VSP_TRANSPORT_SERVICE" {
+			if strings.ReplaceAll(o.Source, "\r\n", "\n") != strings.ReplaceAll(src, "\r\n", "\n") {
+				t.Error("the embedded ZCL_VSP_TRANSPORT_SERVICE differs from src/: go generate ./embedded/abap")
+			}
+			return
+		}
+	}
+	t.Error("ZCL_VSP_TRANSPORT_SERVICE is not among the objects vsp install deploys")
+}
+
+// TestTransportServiceGuardBites mutates the real source the ways a change
+// could widen it, and requires the guard to object to each.
+func TestTransportServiceGuardBites(t *testing.T) {
+	src := transportServiceSource(t)
+	mutations := map[string]struct{ old, new string }{
+		"another tp command":      {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = 'IMPORT'`},
+		"command from a variable": {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = lv_cmd`},
+		"another system":          {"iv_system_name     = lv_system\n        iv_request", "iv_system_name     = lv_sid\n        iv_request"},
+		"lv_system not sy-sysid":  {"    lv_system = sy-sysid.\n\n    DATA(lv_request)", "    lv_system = lv_sid.\n\n    DATA(lv_request)"},
+		"lv_system changed later": {"    lv_trkorr = lv_request.\n", "    lv_trkorr = lv_request.\n    CONCATENATE lv_sid space INTO lv_system.\n"},
+		"tp options":              {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n        iv_tp_options      = lv_msg\n"},
+		"a second tp FM":          {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'", "    CALL FUNCTION 'TRINT_TP_INTERFACE'"},
+		"dynamic call":            {"CALL FUNCTION 'EPS_DELETE_FILE'", "CALL FUNCTION lv_fm"},
+		"overwrite":               {"overwrite_mode         = space", "overwrite_mode         = 'F'"},
+		"a caller's directory":    {"dir_name               = lv_dir\n            overwrite_mode", "dir_name               = lv_dir\n            iv_long_dir_name       = lv_path\n            overwrite_mode"},
+		"another logical dir":     {"THEN '$TR_COFI' ELSE '$TR_DATA'", "THEN '$TR_COFI' ELSE '$TR_BUFFER'"},
+		"plain file write":        {"CLOSE DATASET lv_dataset.\n          ELSE.", "CLOSE DATASET lv_dataset.\n            TRANSFER lv_chunk TO lv_dataset.\n          ELSE."},
+		"show buffer clears locks": {"iv_system_name     = lv_system\n      IMPORTING\n        ev_tp_cmd_strg     = lv_cmd\n        ev_tp_ret_code     = lv_rc\n        ev_tp_message      = lv_msg\n      TABLES\n        tt_stdout          = et_stdout",
+			"iv_system_name     = lv_system\n        iv_clear_locks     = 'X'\n      IMPORTING\n        ev_tp_cmd_strg     = lv_cmd\n        ev_tp_ret_code     = lv_rc\n        ev_tp_message      = lv_msg\n      TABLES\n        tt_stdout          = et_stdout"},
+	}
+	if len(checkTransportService(src)) != 0 {
+		t.Fatal("the unmutated source must pass first")
+	}
+	for name, m := range mutations {
+		if !strings.Contains(src, m.old) {
+			t.Errorf("%s: the source no longer contains %q; update the mutation", name, m.old)
+			continue
+		}
+		mutated := strings.Replace(src, m.old, m.new, 1)
+		if len(checkTransportService(mutated)) == 0 {
+			t.Errorf("%s: the guard accepted the mutated source", name)
+		}
+	}
+}

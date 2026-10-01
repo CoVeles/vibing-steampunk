@@ -43,6 +43,9 @@ var ZclVspGitService string
 //go:embed zcl_vsp_report_service.clas.abap
 var ZclVspReportService string
 
+//go:embed zcl_vsp_transport_service.clas.abap
+var ZclVspTransportService string
+
 //go:embed zcl_vsp_apc_handler.clas.abap
 var ZclVspApcHandler string
 
@@ -121,6 +124,13 @@ func GetObjects() []ObjectInfo {
 			Name:        "ZCL_VSP_REPORT_SERVICE",
 			Source:      ZclVspReportService,
 			Description: "Report domain - background job execution with spool output",
+			Optional:    false,
+		},
+		{
+			Type:        "CLAS",
+			Name:        "ZCL_VSP_TRANSPORT_SERVICE",
+			Source:      ZclVspTransportService,
+			Description: "Transport domain - upload K/R files, add to import buffer",
 			Optional:    false,
 		},
 		{
