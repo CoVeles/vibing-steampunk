@@ -22,7 +22,7 @@ func assertReadOnlyRefusal(t *testing.T, op func(*Client) error) {
 	t.Helper()
 	c, mock := readOnlyMockClient(true)
 	err := op(c)
-	if err == nil || !strings.Contains(err.Error(), "blocked by safety configuration") {
+	if err == nil || !strings.Contains(err.Error(), "is blocked") {
 		t.Fatalf("want a safety refusal, got %v", err)
 	}
 	if len(mock.requests) != 0 {
@@ -96,6 +96,30 @@ func TestRunUnitTests_DangerousRefusedUnderReadOnly(t *testing.T) {
 		}
 		if len(mock.requests) == 0 {
 			t.Error("never reached SAP")
+		}
+	})
+}
+
+// A MODIFY lock under --read-only serves no write and strands an SM12 entry;
+// a READ lock stays allowed.
+func TestLockObject_ModifyRefusedUnderReadOnly(t *testing.T) {
+	ctx := context.Background()
+	for _, mode := range []string{"MODIFY", "", "modify"} {
+		t.Run("mode "+mode, func(t *testing.T) {
+			assertReadOnlyRefusal(t, func(c *Client) error {
+				_, err := c.LockObject(ctx, "/sap/bc/adt/programs/programs/zdemo", mode)
+				return err
+			})
+		})
+	}
+	t.Run("READ", func(t *testing.T) {
+		c, mock := readOnlyMockClient(true)
+		_, err := c.LockObject(ctx, "/sap/bc/adt/programs/programs/zdemo", "READ")
+		if err != nil && strings.Contains(err.Error(), "blocked") {
+			t.Fatalf("a READ lock was refused: %v", err)
+		}
+		if len(mock.requests) == 0 {
+			t.Error("a READ lock never reached SAP")
 		}
 	})
 }

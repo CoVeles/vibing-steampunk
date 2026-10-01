@@ -40,10 +40,17 @@ func (c *Client) LockObject(ctx context.Context, objectURL string, accessMode st
 	if len(corrNr) > 0 {
 		transport = corrNr[0]
 	}
-	// Safety check - only check for MODIFY locks, READ locks are safe
+	// Safety check - only check for MODIFY locks, READ locks are safe. The
+	// mode is compared case-insensitively: "modify" is a MODIFY lock to SAP.
+	accessMode = strings.ToUpper(strings.TrimSpace(accessMode))
 	if accessMode == "" || accessMode == "MODIFY" {
 		if err := c.checkSafety(OpLock, "LockObject"); err != nil {
 			return nil, err
+		}
+		// A MODIFY lock exists to write, which --read-only refuses; taking
+		// one anyway only leaves an ENQUEUE entry in SM12.
+		if c.config.Safety.ReadOnly && !c.config.Safety.DryRun {
+			return nil, fmt.Errorf("operation 'LockObject' (MODIFY) is blocked: read-only mode enabled")
 		}
 	}
 
