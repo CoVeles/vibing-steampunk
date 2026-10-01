@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -139,6 +140,9 @@ func init() {
 
 	// Session keep-alive
 	rootCmd.Flags().Duration("keepalive", 0, "Session keep-alive interval (e.g., 60s, 5m). Prevents session timeout during idle periods. 0 = disabled (default; see #168)")
+
+	// Long calls
+	rootCmd.Flags().Int("call-timeout", 0, "Default budget in seconds of one long MCP call (ExecuteABAP, ABAP Unit, deploy) that names no params.timeout. 0 = none: each request to SAP is limited to 60s")
 
 	// Safety options
 	rootCmd.Flags().BoolVar(&cfg.ReadOnly, "read-only", false, "Block all write operations (create, update, delete, activate)")
@@ -342,16 +346,27 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// Create and start MCP server
 	srv := mcp.NewServer(cfg)
 
-	switch cfg.Transport {
-	case "http":
-		addr := cfg.HTTPAddr
-		if cfg.Verbose {
-			fmt.Fprintf(os.Stderr, "[VERBOSE] Transport: Streamable HTTP on %s\n", addr)
+	return serveMCP(cmd, func() error {
+		switch cfg.Transport {
+		case "http":
+			addr := cfg.HTTPAddr
+			if cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "[VERBOSE] Transport: Streamable HTTP on %s\n", addr)
+			}
+			return srv.ServeHTTP(addr)
+		default:
+			return srv.ServeStdio()
 		}
-		return srv.ServeHTTP(addr)
-	default:
-		return srv.ServeStdio()
-	}
+	})
+}
+
+// serveMCP runs the server once the command line is known to be good. From
+// here on an error is the server's, not the caller's spelling of a flag, so
+// cobra must not answer it with the usage text: an MCP client reads stderr as
+// the server's log, and a shutdown used to fill it with every flag vsp has.
+func serveMCP(cmd *cobra.Command, serve func() error) error {
+	cmd.SilenceUsage = true
+	return serve()
 }
 
 // warnNamedSystemMismatch says at startup when the system named by -s /
@@ -562,6 +577,9 @@ func resolveConfig(cmd *cobra.Command) {
 		}
 	}
 
+	// Long-call budget: flag > SAP_CALL_TIMEOUT env (seconds)
+	cfg.CallTimeout = resolveCallTimeout(cmd)
+
 	// Keep-alive interval: flag > SAP_KEEPALIVE env
 	if !cmd.Flags().Changed("keepalive") {
 		if v := viper.GetString("KEEPALIVE"); v != "" {
@@ -572,6 +590,25 @@ func resolveConfig(cmd *cobra.Command) {
 	} else {
 		cfg.KeepAliveInterval, _ = cmd.Flags().GetDuration("keepalive")
 	}
+}
+
+// resolveCallTimeout reads --call-timeout, else SAP_CALL_TIMEOUT, in
+// seconds. An unparsable or negative value means none.
+func resolveCallTimeout(cmd *cobra.Command) time.Duration {
+	secs := 0
+	if cmd.Flags().Changed("call-timeout") {
+		secs, _ = cmd.Flags().GetInt("call-timeout")
+	} else if v := strings.TrimSpace(viper.GetString("CALL_TIMEOUT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			secs = n
+		} else if d, err := time.ParseDuration(v); err == nil {
+			secs = int(d.Seconds())
+		}
+	}
+	if secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
 
 func validateConfig() error {

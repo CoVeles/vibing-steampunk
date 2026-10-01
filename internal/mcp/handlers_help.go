@@ -159,6 +159,7 @@ of a client-specific table cannot be in the WHERE condition.`)
 Unit tests:
   SAP(action="test", target="CLAS ZCL_TEST", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test"})
   SAP(action="test", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test", "include_dangerous": true})
+  SAP(action="test", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test", "timeout": 600})  — seconds; the run may continue on SAP after it
 
 ATC check:
   SAP(action="test", params={"type": "atc", "object_url": "/sap/bc/adt/oo/classes/zcl_test"})`)
@@ -427,6 +428,10 @@ Transport analysis:
 
 Execute ABAP:
   SAP(action="analyze", params={"type": "execute_abap", "code": "WRITE 'Hello'."})
+  Long calls (execute_abap, unit tests, deploy_from_file, deploy_zip) take "timeout" in seconds:
+    SAP(action="analyze", params={"type": "execute_abap", "code": "...", "timeout": 300})
+    Default: the server's --call-timeout (SAP_CALL_TIMEOUT); without one each request to SAP is limited to 60s.
+    When it runs out the call says "timed out after Ns; the operation may still be running on SAP".
 
 Runtime errors (ST22) — a listing, and a post-mortem around one dump:
   SAP(action="analyze", params={"type": "list_dumps", "since": "2026-08-01", "program": "ZDEMO_POST"})
@@ -555,6 +560,7 @@ Install tools:
   SAP(action="system", params={"type": "install_dummy_test"})
   SAP(action="system", params={"type": "list_dependencies"})
   SAP(action="system", params={"type": "deploy_zip", "source": "abapgit-standalone", "package": "$ZGIT"})
+      deploy_zip and deploy_from_file take "timeout" (seconds) for the whole call.
 
 File operations:
   SAP(action="system", params={"type": "deploy_from_file", "file_path": "/path/to/file.prog.abap", "package_name": "$TMP"})

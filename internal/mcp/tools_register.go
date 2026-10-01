@@ -866,6 +866,9 @@ func (s *Server) registerDevTools(shouldRegister func(string) bool) {
 			mcp.WithBoolean("include_long",
 				mcp.Description("Include long duration tests (default: false)"),
 			),
+			mcp.WithNumber("timeout",
+				mcp.Description(callTimeoutDescription),
+			),
 		), s.handleRunUnitTests)
 	}
 
@@ -946,6 +949,9 @@ func (s *Server) registerDevTools(shouldRegister func(string) bool) {
 			),
 			mcp.WithString("program_prefix",
 				mcp.Description("Prefix for temp program name (default: ZTEMP_EXEC_)"),
+			),
+			mcp.WithNumber("timeout",
+				mcp.Description(callTimeoutDescription),
 			),
 		), s.handleExecuteABAP)
 	}
@@ -1437,6 +1443,9 @@ func (s *Server) registerFileTools(shouldRegister func(string) bool) {
 			),
 			mcp.WithString("expected_source_hash",
 				mcp.Description("Optional sourceHash returned by GetSource(include_hash=true). Refuse an existing-object deployment if SAP source has changed."),
+			),
+			mcp.WithNumber("timeout",
+				mcp.Description(callTimeoutDescription),
 			),
 		), s.handleDeployFromFile)
 	}
@@ -2271,6 +2280,9 @@ func (s *Server) registerInstallTools(shouldRegister func(string) bool) {
 			),
 			mcp.WithString("name_filter",
 				mcp.Description("Deploy only objects matching this name pattern (e.g., 'ZCL_ABAPGIT_*')"),
+			),
+			mcp.WithNumber("timeout",
+				mcp.Description(callTimeoutDescription),
 			),
 		), s.handleDeployZip)
 	}
