@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -110,5 +111,35 @@ func TestRouteSearchExact(t *testing.T) {
 	}))
 	if !res.IsError || !strings.Contains(resultText(res), "not a pattern") {
 		t.Fatalf("exact with a wildcard must be refused, got %s", resultText(res))
+	}
+}
+
+// A full search window is said next to the exact hits, not swallowed: more
+// objects of that name may lie beyond it.
+func TestRouteSearchExactFullWindowSaysIncomplete(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var sb strings.Builder
+		sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">`)
+		sb.WriteString(`<adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_order" adtcore:type="CLAS/OC" adtcore:name="ZCL_ORDER"/>`)
+		for i := 1; i < 1000; i++ {
+			fmt.Fprintf(&sb, `<adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_order_%04d" adtcore:type="CLAS/OC" adtcore:name="ZCL_ORDER_%04d"/>`, i, i)
+		}
+		sb.WriteString(`</adtcore:objectReferences>`)
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(sb.String()))
+	}))
+	defer ts.Close()
+	server := NewServer(&Config{BaseURL: ts.URL, Username: "u", Password: "p", Client: "001", Language: "EN"})
+
+	res, err := server.handleUniversalTool(context.Background(), newRequest(map[string]any{
+		"action": "search", "target": "ZCL_ORDER", "params": map[string]any{"exact": true},
+	}))
+	if err != nil || res.IsError {
+		t.Fatalf("search failed: %v %+v", err, res)
+	}
+	text := resultText(res)
+	if !strings.Contains(text, `"results"`) || !strings.Contains(text, `"ZCL_ORDER"`) ||
+		!strings.Contains(text, `"incomplete"`) || !strings.Contains(text, "pass type") {
+		t.Fatalf("want the hit and an incomplete note, got %s", text)
 	}
 }

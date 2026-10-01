@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
 	"github.com/oisee/vibing-steampunk/pkg/adt"
 )
 
@@ -44,12 +45,19 @@ func callBudget(args map[string]any, serverDefault time.Duration) (time.Duration
 	default:
 		return 0, fmt.Errorf("timeout must be a number of seconds, got %v", raw)
 	}
-	if math.IsNaN(secs) || secs <= 0 {
+	if math.IsNaN(secs) || math.IsInf(secs, 0) || secs <= 0 {
 		return 0, fmt.Errorf("timeout must be a positive number of seconds, got %v", raw)
 	}
+	// Capped in seconds, before the conversion: a huge value converted
+	// first overflows int64 nanoseconds to a non-positive Duration, which
+	// would leave the call without any deadline.
+	if secs >= MaxCallTimeout.Seconds() {
+		return MaxCallTimeout, nil
+	}
 	d := time.Duration(secs * float64(time.Second))
-	if d > MaxCallTimeout {
-		d = MaxCallTimeout
+	if d <= 0 {
+		// Below a nanosecond: zero would read as "no budget".
+		return 0, fmt.Errorf("timeout must be a positive number of seconds, got %v", raw)
 	}
 	return d, nil
 }

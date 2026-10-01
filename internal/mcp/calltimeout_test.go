@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -127,6 +128,10 @@ func slowSAP(t *testing.T, delay time.Duration) *Server {
 // The long calls are wired through longCall, from the universal tool too.
 func TestLongCallsHonourTimeoutParam(t *testing.T) {
 	s := slowSAP(t, 3*time.Second)
+	file := filepath.Join(t.TempDir(), "zdemo_long.prog.abap")
+	if err := os.WriteFile(file, []byte("REPORT zdemo_long.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name   string
 		params map[string]any
@@ -136,18 +141,8 @@ func TestLongCallsHonourTimeoutParam(t *testing.T) {
 	}{
 		{"execute_abap", map[string]any{"type": "execute_abap", "code": "lv_result = 1.", "timeout": 0.2}, "analyze", "", "execute_abap timed out"},
 		{"unit tests", map[string]any{"object_url": "/sap/bc/adt/oo/classes/zcl_x", "timeout": 0.2}, "test", "", "ABAP Unit run timed out"},
+		{"deploy_from_file", map[string]any{"type": "deploy_from_file", "file_path": file, "package_name": "$TMP", "timeout": 0.2}, "system", "", "deploy_from_file timed out"},
 	}
-	file := filepath.Join(t.TempDir(), "zdemo_long.prog.abap")
-	if err := os.WriteFile(file, []byte("REPORT zdemo_long.\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cases = append(cases, struct {
-		name   string
-		params map[string]any
-		action string
-		target string
-		op     string
-	}{"deploy_from_file", map[string]any{"type": "deploy_from_file", "file_path": file, "package_name": "$TMP", "timeout": 0.2}, "system", "", "deploy_from_file timed out"})
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			start := time.Now()
@@ -348,5 +343,25 @@ func TestDeployZipUnlocksAfterTheCallContextEnds(t *testing.T) {
 	}
 	if unlocks != locks {
 		t.Fatalf("LOCK %d, UNLOCK %d: a lock taken before the call ended was not released", locks, unlocks)
+	}
+}
+
+// A budget beyond the cap is capped in seconds, before it becomes a
+// Duration: converted first, a huge value overflows to a non-positive
+// Duration and the call would run with no deadline at all.
+func TestCallBudgetCapsBeforeConverting(t *testing.T) {
+	for _, v := range []any{3600.0, 1e10, 1e300, math.MaxFloat64, "1e300", 9.3e9} {
+		d, err := callBudget(map[string]any{"timeout": v}, 0)
+		if err != nil || d != MaxCallTimeout {
+			t.Errorf("timeout %v: got %v, %v; want the %v cap", v, d, err, MaxCallTimeout)
+		}
+	}
+	if d, err := callBudget(map[string]any{"timeout": 1.5}, 0); err != nil || d != 1500*time.Millisecond {
+		t.Errorf("timeout 1.5: got %v, %v", d, err)
+	}
+	for _, v := range []any{math.NaN(), math.Inf(1), math.Inf(-1), -1.0, 0.0, -1e300, "Inf", "-Inf", "NaN", "+Inf", 1e-12} {
+		if d, err := callBudget(map[string]any{"timeout": v}, 0); err == nil {
+			t.Errorf("timeout %v: want an error, got budget %v", v, d)
+		}
 	}
 }

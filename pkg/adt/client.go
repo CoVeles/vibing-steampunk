@@ -404,47 +404,63 @@ func (c *Client) SearchObjectByType(ctx context.Context, query, objectType strin
 }
 
 // exactSearchFetch is how many hits an exact-name search asks the quick
-// search for before keeping the equal names. The quick search matches a
-// name as a prefix, so the object itself competes with every longer name it
-// begins; the window is wide so that it is not cut off by them.
+// search for before keeping the equal names.
+//
+// The name is sent as it is, without a wildcard. On the systems checked
+// (A4H, 7.5x) the quick search then matches the whole name only, ignoring
+// case, across types: CL_ABAP finds nothing where CL_ABAP* finds 599, and
+// BUKRS finds its domain, data element and authorization object. The window
+// is for a release that reads a bare name as a prefix instead: the equal
+// names are filtered out of it, and a window that comes back full is
+// reported, since an equal name can lie beyond it.
 const exactSearchFetch = 1000
 
 // ErrExactSearchWindowFull is returned by SearchObjectExact when the quick
-// search filled the whole window with longer names and the name itself was
-// not among them: whether it exists is unknown, not "no".
+// search filled the whole window and the name itself was not among the hits:
+// whether it exists is unknown, not "no".
 var ErrExactSearchWindowFull = errors.New("exact search inconclusive")
 
 // SearchObjectExact returns the objects whose name equals name, ignoring
 // case, optionally of one type, at most maxResults of them (0: no limit).
 // A name can belong to several objects of different types (a program and a
-// class, a function group and its main program), so the answer is a list.
-func (c *Client) SearchObjectExact(ctx context.Context, name, objectType string, maxResults int) ([]SearchResult, error) {
+// class, a domain and a data element), so the answer is a list.
+//
+// incomplete is set when the quick search filled its window and fewer than
+// maxResults equal names were found in it: other objects of that name may lie
+// beyond the window. With no equal name in a full window the answer is
+// ErrExactSearchWindowFull instead.
+func (c *Client) SearchObjectExact(ctx context.Context, name, objectType string, maxResults int) (results []SearchResult, incomplete string, err error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return nil, fmt.Errorf("exact search needs a name")
+		return nil, "", fmt.Errorf("exact search needs a name")
 	}
 	if strings.ContainsAny(name, "*?") {
-		return nil, fmt.Errorf("exact search takes a name, not a pattern: %q (drop exact to search by pattern)", name)
+		return nil, "", fmt.Errorf("exact search takes a name, not a pattern: %q (drop exact to search by pattern)", name)
 	}
-	results, err := c.SearchObjectByType(ctx, name, objectType, exactSearchFetch)
+	hits, err := c.SearchObjectByType(ctx, name, objectType, exactSearchFetch)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	out := FilterExactName(results, name)
-	if len(out) == 0 && len(results) >= exactSearchFetch {
-		// A full window without the name says nothing about whether it
-		// exists: it may be ranked beyond the window.
-		narrow := "pass type to narrow"
-		if objectType != "" {
-			narrow = "even with type " + objectType + "; the name cannot be found this way"
-		}
-		return nil, fmt.Errorf("%w: %q not found within the first %d prefix matches; %s",
-			ErrExactSearchWindowFull, name, exactSearchFetch, narrow)
-	}
+	out := FilterExactName(hits, name)
 	if maxResults > 0 && len(out) > maxResults {
 		out = out[:maxResults]
 	}
-	return out, nil
+	windowFull := len(hits) >= exactSearchFetch
+	if !windowFull || (maxResults > 0 && len(out) >= maxResults) {
+		return out, "", nil
+	}
+	narrow := "pass type to narrow"
+	if objectType != "" {
+		narrow = "even with type " + objectType + "; the name cannot be found this way"
+	}
+	if len(out) == 0 {
+		// A full window without the name says nothing about whether it
+		// exists: it may be ranked beyond the window.
+		return nil, "", fmt.Errorf("%w: %q not found within the first %d matches; %s",
+			ErrExactSearchWindowFull, name, exactSearchFetch, narrow)
+	}
+	return out, fmt.Sprintf("the result may be incomplete: the quick search returned its full window of %d matches, and more objects named %q may lie beyond it; %s",
+		exactSearchFetch, name, narrow), nil
 }
 
 // FilterExactName keeps the results whose name equals name, ignoring case.

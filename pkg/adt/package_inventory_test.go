@@ -2,6 +2,7 @@ package adt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // previewXML renders data preview rows for the given columns.
@@ -46,6 +48,11 @@ type inventorySAP struct {
 	queries   []string
 	paths     []string
 	noAbapGit bool
+	// stallOn, when set, is a table whose SELECT is not answered: onStall
+	// runs (it ends the caller's context) and the request waits for its
+	// context to end.
+	stallOn string
+	onStall func()
 }
 
 func (f *inventorySAP) serve(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +64,14 @@ func (f *inventorySAP) serve(w http.ResponseWriter, r *http.Request) {
 		f.queries = append(f.queries, sql)
 	}
 	f.mu.Unlock()
+	if f.stallOn != "" && strings.Contains(sql, "from "+f.stallOn) {
+		f.onStall()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+		return
+	}
 	w.Header().Set("X-CSRF-Token", "t")
 	w.Header().Set("Content-Type", "application/xml")
 	switch {
@@ -207,5 +222,31 @@ func TestPackageInventoryTruncatedOnlyBeyondTheLimit(t *testing.T) {
 	}
 	if !inv.ObjectsTruncated || len(inv.Objects) != 2 {
 		t.Fatalf("beyond the limit: truncated=%v, %d objects", inv.ObjectsTruncated, len(inv.Objects))
+	}
+}
+
+// A data source that fails is worked around; a context that ends is not a
+// failing data source. Whichever SELECT the cancellation or deadline lands
+// in, the inventory returns the context's error, not a partial inventory.
+func TestPackageInventoryReturnsCancellation(t *testing.T) {
+	for _, table := range []string{"tadir", "tdevc", "dd02l", "zabapgit"} {
+		t.Run(table+"/canceled", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f := &inventorySAP{stallOn: table, onStall: cancel}
+			inv, err := newInventoryClient(t, f).PackageInventory(ctx, "$ZDEMO")
+			if !errors.Is(err, context.Canceled) || inv != nil {
+				t.Fatalf("want context.Canceled and no inventory, got %+v, %v", inv, err)
+			}
+		})
+		t.Run(table+"/deadline", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			f := &inventorySAP{stallOn: table, onStall: func() {}}
+			inv, err := newInventoryClient(t, f).PackageInventory(ctx, "$ZDEMO")
+			if !errors.Is(err, context.DeadlineExceeded) || inv != nil {
+				t.Fatalf("want context.DeadlineExceeded and no inventory, got %+v, %v", inv, err)
+			}
+		})
 	}
 }

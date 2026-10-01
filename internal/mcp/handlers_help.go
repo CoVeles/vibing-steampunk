@@ -143,8 +143,10 @@ High-level create (with source):
   SAP(action="search", target="ZCL_ORDER", params={"exact": true})            — only objects named exactly ZCL_ORDER (case-insensitive)
   SAP(action="search", target="ZCL_ORDER", params={"exact": true, "type": "CLAS"})
 
-  exact reads the first 1000 prefix matches of the name. If all of them are
-  longer names it reports the search as inconclusive; add "type" to narrow.`)
+  exact sends the name without a wildcard and keeps the equal names. If the
+  search returns its full window of 1000 matches, it says so: inconclusive
+  when none was equal, "incomplete" next to the results when some were; add
+  "type" to narrow.`)
 
 	case "query":
 		return mcp.NewToolResultText(`SAP(action="query") - Database queries

@@ -66,14 +66,22 @@ func (s *Server) handleSearchObject(ctx context.Context, request mcp.CallToolReq
 	objectType, _ := request.GetArguments()["objectType"].(string)
 
 	// Exact: only the objects whose name is the query, whatever their type.
-	// Every hit is in the answer, so there is nothing to mark truncated
-	// beyond max itself.
+	// Marked incomplete when the search window came back full.
 	if exact, _ := request.GetArguments()["exact"].(bool); exact {
-		results, err := s.adtClient.SearchObjectExact(ctx, query, objectType, maxResults)
+		results, incomplete, err := s.adtClient.SearchObjectExact(ctx, query, objectType, maxResults)
 		if err != nil {
 			return newToolResultError(fmt.Sprintf("Failed to search: %v", err)), nil
 		}
-		output, _ := json.MarshalIndent(results, "", "  ")
+		if incomplete == "" {
+			output, _ := json.MarshalIndent(results, "", "  ")
+			return mcp.NewToolResultText(string(output)), nil
+		}
+		// Like the truncated pattern search: the wrapper appears only when
+		// there is something to say.
+		output, _ := json.MarshalIndent(map[string]any{
+			"results":    results,
+			"incomplete": incomplete,
+		}, "", "  ")
 		return mcp.NewToolResultText(string(output)), nil
 	}
 

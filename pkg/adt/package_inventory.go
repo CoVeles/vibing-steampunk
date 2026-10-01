@@ -2,6 +2,7 @@ package adt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"regexp"
@@ -99,6 +100,9 @@ func (c *Client) PackageInventory(ctx context.Context, packageName string) (*Pac
 		// not reported as truncated.
 		inventoryMaxObjects+1)
 	if err != nil {
+		if cerr := inventoryCancelled(ctx, err); cerr != nil {
+			return nil, cerr
+		}
 		inv.Notes = append(inv.Notes, fmt.Sprintf("TADIR could not be read (%v); objects are from the ADT package contents, without author and created on", err))
 		objectsFromADT = true
 	} else {
@@ -124,6 +128,9 @@ func (c *Client) PackageInventory(ctx context.Context, packageName string) (*Pac
 	rows, err = c.RunQuery(ctx, fmt.Sprintf(
 		"SELECT devclass, as4user, created_on FROM tdevc WHERE parentcl = '%s'", pkg), 1000)
 	if err != nil {
+		if cerr := inventoryCancelled(ctx, err); cerr != nil {
+			return nil, cerr
+		}
 		inv.Notes = append(inv.Notes, fmt.Sprintf("TDEVC could not be read (%v); subpackages are from the ADT package contents", err))
 		subsFromADT = true
 	} else {
@@ -138,13 +145,33 @@ func (c *Client) PackageInventory(ctx context.Context, packageName string) (*Pac
 
 	if objectsFromADT || subsFromADT {
 		if err := c.inventoryFromADT(ctx, inv, objectsFromADT, subsFromADT); err != nil {
+			if cerr := inventoryCancelled(ctx, err); cerr != nil {
+				return nil, cerr
+			}
 			inv.Notes = append(inv.Notes, fmt.Sprintf("ADT package contents could not be read either: %v", err))
 		}
 	}
 
-	c.inventoryAbapGit(ctx, inv)
+	if err := c.inventoryAbapGit(ctx, inv); err != nil {
+		return nil, err
+	}
 	sortInventory(inv)
 	return inv, nil
+}
+
+// inventoryCancelled tells a call that ended because its context did from a
+// data source that failed. A source that failed is worked around (a fallback,
+// a note); a context that ended is the caller's answer to the whole call, and
+// going on would only answer a partial inventory, on a dead context, with no
+// error.
+func inventoryCancelled(ctx context.Context, err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("package inventory: %w", err)
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("package inventory: %w (%v)", cerr, err)
+	}
+	return nil
 }
 
 // inventoryFromADT fills objects and/or subpackages from the ADT
@@ -188,21 +215,30 @@ var (
 // repository as XML in DATA_STR); a system without abapGit has no such table,
 // so its existence is checked in DD02L first instead of letting the SELECT
 // fail.
-func (c *Client) inventoryAbapGit(ctx context.Context, inv *PackageInventory) {
+//
+// It returns an error only when the context ended; a query that failed
+// otherwise is a note.
+func (c *Client) inventoryAbapGit(ctx context.Context, inv *PackageInventory) error {
 	rows, err := c.RunQuery(ctx, "SELECT tabname FROM dd02l WHERE tabname = 'ZABAPGIT' AND as4local = 'A'", 1)
 	if err != nil {
+		if cerr := inventoryCancelled(ctx, err); cerr != nil {
+			return cerr
+		}
 		inv.Notes = append(inv.Notes, fmt.Sprintf("abapGit: could not check for table ZABAPGIT (%v)", err))
-		return
+		return nil
 	}
 	if len(rows.Rows) == 0 {
 		inv.AbapGitRepos = []AbapGitRepo{}
 		inv.Notes = append(inv.Notes, "abapGit: not installed (no table ZABAPGIT)")
-		return
+		return nil
 	}
 	rows, err = c.RunQuery(ctx, "SELECT value, data_str FROM zabapgit WHERE type = 'REPO'", 1000)
 	if err != nil {
+		if cerr := inventoryCancelled(ctx, err); cerr != nil {
+			return cerr
+		}
 		inv.Notes = append(inv.Notes, fmt.Sprintf("abapGit: table ZABAPGIT could not be read (%v)", err))
-		return
+		return nil
 	}
 	inv.AbapGitRepos = []AbapGitRepo{}
 	for _, r := range rows.Rows {
@@ -211,6 +247,7 @@ func (c *Client) inventoryAbapGit(ctx context.Context, inv *PackageInventory) {
 			inv.AbapGitRepos = append(inv.AbapGitRepos, repo)
 		}
 	}
+	return nil
 }
 
 // parseAbapGitRepo reads the fields of one ZABAPGIT REPO row. DATA_STR is

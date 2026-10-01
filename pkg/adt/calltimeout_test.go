@@ -90,7 +90,7 @@ func TestCallDeadlineLiftsTimeoutOnIsolatedStatelessRequest(t *testing.T) {
 	tr.contextInFlight.Add(1)
 	defer tr.contextInFlight.Add(-1)
 
-	if _, err := tr.Request(context.Background(), "/sap/bc/adt/slow", &RequestOptions{Method: http.MethodGet}); err == nil {
+	if _, err = tr.Request(context.Background(), "/sap/bc/adt/slow", &RequestOptions{Method: http.MethodGet}); err == nil {
 		t.Fatal("unmarked isolated request: want the client Timeout to cut it off")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

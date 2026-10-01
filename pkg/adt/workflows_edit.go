@@ -415,7 +415,7 @@ func (c *Client) EditSourceWithOptions(ctx context.Context, objectURL, oldString
 		if !unlocked {
 			if unlockErr := c.releaseLockAfterFailure(ctx, lockURL, lockResult.LockHandle); unlockErr != nil {
 				result.Message = fmt.Sprintf("%s — %s", result.Message, strandedLockAdvice(lockURL, unlockErr))
-			} else if unlockErr == nil && unlockRetried && result != nil {
+			} else if unlockRetried && result != nil {
 				result.Message += " — the lock was released on a retry"
 			}
 		}

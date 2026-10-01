@@ -545,8 +545,10 @@ var searchCmd = &cobra.Command{
 
 With --exact the query is a name, not a pattern: only objects whose name
 equals it (case-insensitive) are listed, still filtered by --type and --max.
-It reads the first 1000 prefix matches; when all of them are longer names
-the search says it is inconclusive rather than "not found" — add --type.
+The name is sent without a wildcard, which the quick search matches whole.
+On a release that reads it as a prefix, at most 1000 matches are read: a
+full window is reported, as inconclusive when it held no equal name or as
+possibly incomplete when it did — add --type.
 
 Examples:
   vsp -s a4h search "ZCL_*"
@@ -560,7 +562,7 @@ Examples:
 func init() {
 	searchCmd.Flags().StringVarP(&objectType, "type", "t", "", "Filter by object type (CLAS, PROG, INTF, etc.)")
 	searchCmd.Flags().IntVarP(&maxResults, "max", "m", 100, "Maximum results")
-	searchCmd.Flags().Bool("exact", false, "Only objects whose name equals the query (case-insensitive, no wildcards); reads the first 1000 prefix matches, so add --type for a short name")
+	searchCmd.Flags().Bool("exact", false, "Only objects whose name equals the query (case-insensitive, no wildcards); a full 1000-match window is reported as inconclusive or incomplete, so add --type")
 }
 
 func runSearch(cmd *cobra.Command, args []string) error {
@@ -603,7 +605,11 @@ func searchObjects(ctx context.Context, client *adt.Client, query, adtType strin
 	var results []adt.SearchResult
 	var err error
 	if exact {
-		results, err = client.SearchObjectExact(ctx, query, adtType, maxResults)
+		var incomplete string
+		results, incomplete, err = client.SearchObjectExact(ctx, query, adtType, maxResults)
+		if err == nil && incomplete != "" {
+			fmt.Fprintf(os.Stderr, "Note: %s\n", incomplete)
+		}
 	} else {
 		results, err = client.SearchObjectByType(ctx, query, adtType, maxResults)
 	}
