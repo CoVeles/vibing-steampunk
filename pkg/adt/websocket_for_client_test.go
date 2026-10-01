@@ -73,7 +73,7 @@ func TestWebSocketFromClient_PasswordWithoutSession(t *testing.T) {
 	if h == nil {
 		t.Fatal("no WebSocket upgrade reached the server")
 	}
-	want, _ := http.NewRequest(http.MethodGet, "/", nil)
+	want, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
 	want.SetBasicAuth("TESTUSER", "s3cret")
 	if got := h.Get("Authorization"); got != want.Header.Get("Authorization") {
 		t.Errorf("upgrade carried Authorization %q, want the client's basic auth", got)
@@ -157,7 +157,7 @@ func TestWebSocketFromBasicAuthClient_StaysOnBasicAfterRequests(t *testing.T) {
 		}
 	}
 
-	want, _ := http.NewRequest(http.MethodGet, "/", nil)
+	want, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
 	want.SetBasicAuth("TESTUSER", "s3cret")
 	mu.Lock()
 	defer mu.Unlock()

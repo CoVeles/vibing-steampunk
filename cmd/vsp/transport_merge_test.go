@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -90,7 +91,7 @@ func TestTransportBridgeUsesTheProfilePassword(t *testing.T) {
 	if !got.seen {
 		t.Fatal("the bridge never attempted the WebSocket upgrade")
 	}
-	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
 	req.SetBasicAuth("TESTUSER", "s3cret")
 	if got.basic != req.Header.Get("Authorization") {
 		t.Errorf("the upgrade carried Authorization %q, want the profile's basic auth", got.basic)
