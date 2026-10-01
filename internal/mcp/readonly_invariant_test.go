@@ -1251,6 +1251,7 @@ func (env *invariantEnv) attributeCases(t *testing.T, order []string, cases []ac
 	defer func() {
 		s.closeDebugSession(context.Background())
 		s.dropSharedRFC(context.Background())
+		env.settle(s)
 		env.sap.take()
 	}()
 	out := map[string]string{}
@@ -1355,12 +1356,19 @@ type probeOutcome struct {
 	Requests []sentRequest
 	WSDials  int
 	RFCDials int64
-	Took     time.Duration
+	// Late is what arrived after the handler returned, while the test
+	// waited for the server to go quiet.
+	Late         []sentRequest
+	LateWSDials  int
+	LateRFCDials int64
+	Took         time.Duration
 }
 
-func (o probeOutcome) writes() []sentRequest {
+func (o probeOutcome) writes() []sentRequest { return writesIn(o.Requests) }
+
+func writesIn(reqs []sentRequest) []sentRequest {
 	var w []sentRequest
-	for _, r := range o.Requests {
+	for _, r := range reqs {
 		if r.Upgrade == "" && isWrite(r) {
 			w = append(w, r)
 		}
@@ -1401,6 +1409,45 @@ func newInvariantEnv(t *testing.T, cfg func(base string) *Config) *invariantEnv 
 
 const probeTimeout = 2 * time.Second
 
+// Settling: after a call returns, the server is given until it has been
+// quiet for settleQuiet, and none of its async tasks is still running, up to
+// settleMax.
+const (
+	settleQuiet = 3 * time.Millisecond
+	settleMax   = time.Second
+)
+
+// settle waits for traffic a handler left running behind it: tasks the
+// server tracks as running (RunReportAsync and the like), and any request or
+// gateway dial still arriving.
+func (env *invariantEnv) settle(s *Server) {
+	deadline := time.Now().Add(settleMax)
+	count := func() (int, int64) {
+		env.sap.mu.Lock()
+		defer env.sap.mu.Unlock()
+		return len(env.sap.reqs), env.gateway.dials.Load()
+	}
+	running := func() bool {
+		s.asyncTasksMu.RLock()
+		defer s.asyncTasksMu.RUnlock()
+		for _, task := range s.asyncTasks {
+			if task.Status == "running" {
+				return true
+			}
+		}
+		return false
+	}
+	n, d := count()
+	for time.Now().Before(deadline) {
+		time.Sleep(settleQuiet)
+		n2, d2 := count()
+		if n2 == n && d2 == d && !running() {
+			return
+		}
+		n, d = n2, d2
+	}
+}
+
 func (env *invariantEnv) run(name string, call func(ctx context.Context, s *Server) (*mcp.CallToolResult, error), mode string) probeOutcome {
 	cfg := env.cfg()
 	cfg.Mode = mode
@@ -1413,8 +1460,20 @@ func (env *invariantEnv) run(name string, call func(ctx context.Context, s *Serv
 	took := time.Since(start)
 	cancel()
 	requests := env.sap.take()
+	// The gateway counts a connection before it hangs up, and a client only
+	// fails its logon once the hang-up arrives, so a dial that happened has
+	// been counted by the time the call returns.
+	during := env.gateway.dials.Load()
+
+	// What arrives after the handler returned — a goroutine it started, such
+	// as RunReportAsync's — is the call's too. Wait for it, then keep it.
+	env.settle(s)
+	late := env.sap.take()
+	afterLate := env.gateway.dials.Load()
+
 	// The server's own shutdown releases a debug session it opened; that is
-	// not the call under test, and what it sends is not attributed to it.
+	// the test tearing the server down, not the call under test, and what it
+	// sends is not attributed to it.
 	s.closeDebugSession(context.Background())
 	s.dropSharedRFC(context.Background())
 	env.sap.take()
@@ -1431,10 +1490,14 @@ func (env *invariantEnv) run(name string, call func(ctx context.Context, s *Serv
 			o.WSDials++
 		}
 	}
-	// The gateway counts a connection before it hangs up, and a client only
-	// fails its logon once the hang-up arrives, so a dial that happened has
-	// been counted by the time the call returns.
-	o.RFCDials = env.gateway.dials.Load() - before
+	o.RFCDials = during - before
+	o.Late = late
+	for _, r := range late {
+		if r.Upgrade != "" {
+			o.LateWSDials++
+		}
+	}
+	o.LateRFCDials = afterLate - during
 	o.Class, o.Known = readOnlyClasses[name]
 	return o
 }
@@ -1560,6 +1623,18 @@ func assertReadOnlyInvariant(t *testing.T, outcomes []probeOutcome, unrouted []s
 			if o.RFCDials > 0 {
 				bad = append(bad, fmt.Sprintf("%d RFC gateway dial(s)", o.RFCDials))
 			}
+		}
+
+		// After the call returned, nothing may write or dial, whatever the
+		// class: a READ has no business leaving a writer behind either.
+		for _, r := range writesIn(o.Late) {
+			bad = append(bad, "after the call returned: "+r.String())
+		}
+		if o.LateWSDials > 0 {
+			bad = append(bad, fmt.Sprintf("after the call returned: %d ZADT_VSP WebSocket dial(s)", o.LateWSDials))
+		}
+		if o.LateRFCDials > 0 {
+			bad = append(bad, fmt.Sprintf("after the call returned: %d RFC gateway dial(s)", o.LateRFCDials))
 		}
 
 		if o.Class.KnownGap != "" {
@@ -1736,6 +1811,12 @@ func testPackageGate(t *testing.T) {
 		}
 		if o.RFCDials > 0 {
 			bad = append(bad, fmt.Sprintf("%d RFC gateway dial(s)", o.RFCDials))
+		}
+		for _, r := range writesIn(o.Late) {
+			bad = append(bad, "after the call returned: "+r.String())
+		}
+		if o.LateWSDials+int(o.LateRFCDials) > 0 {
+			bad = append(bad, fmt.Sprintf("after the call returned: %d WebSocket and %d RFC dial(s)", o.LateWSDials, o.LateRFCDials))
 		}
 		if why := packageGated[name]; why != "" {
 			gaps++
