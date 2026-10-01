@@ -44,9 +44,9 @@ func mainProgramXML(names ...string) string {
 	return b.String()
 }
 
-// includeServer answers the where-used POST with refs and every mainprograms
+// mainProgramsServer answers the where-used POST with refs and every mainprograms
 // GET with lookup(include name in lower case).
-func includeServer(t *testing.T, refs string, lookup func(w http.ResponseWriter, include string)) *httptest.Server {
+func mainProgramsServer(t *testing.T, refs string, lookup func(w http.ResponseWriter, include string)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-csrf-token", "test-token")
@@ -70,7 +70,7 @@ const fmURI = "/sap/bc/adt/functions/groups/zdemo_fg/fmodules/zdemo_fm"
 // why. Before, they were passed on silently and the answer read as whole.
 func TestWhereUsedNamesTheIncludesLeftOverByTheCap(t *testing.T) {
 	var lookups atomic.Int32
-	srv := includeServer(t, includeRowsXML(maxIncludeLookups+2), func(w http.ResponseWriter, include string) {
+	srv := mainProgramsServer(t, includeRowsXML(maxIncludeLookups+2), func(w http.ResponseWriter, include string) {
 		lookups.Add(1)
 		_, _ = w.Write([]byte(mainProgramXML("ZDEMO_PROG_" + strings.ToUpper(include[len(include)-3:]))))
 	})
@@ -104,7 +104,7 @@ func TestWhereUsedNamesTheIncludesLeftOverByTheCap(t *testing.T) {
 
 // A failed lookup leaves the include as itself and says so.
 func TestWhereUsedReportsAFailedIncludeLookup(t *testing.T) {
-	srv := includeServer(t, includeRowsXML(2), func(w http.ResponseWriter, include string) {
+	srv := mainProgramsServer(t, includeRowsXML(2), func(w http.ResponseWriter, include string) {
 		if include == "zdemo_incl_001" {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte("boom"))
@@ -137,7 +137,7 @@ func TestWhereUsedReportsAFailedIncludeLookup(t *testing.T) {
 func TestWhereUsedReturnsTheContextErrorWhenCancelledMidLookup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	srv := includeServer(t, includeRowsXML(3), func(w http.ResponseWriter, include string) {
+	srv := mainProgramsServer(t, includeRowsXML(3), func(w http.ResponseWriter, include string) {
 		cancel()
 		_, _ = w.Write([]byte(mainProgramXML("ZDEMO_PROG")))
 	})
@@ -157,7 +157,7 @@ func TestWhereUsedReturnsTheContextErrorWhenCancelledMidLookup(t *testing.T) {
 func TestDumpImpactStopsOnACancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	srv := includeServer(t, includeRowsXML(1), func(w http.ResponseWriter, include string) {
+	srv := mainProgramsServer(t, includeRowsXML(1), func(w http.ResponseWriter, include string) {
 		cancel()
 		_, _ = w.Write([]byte(mainProgramXML("ZDEMO_PROG")))
 	})
@@ -172,7 +172,7 @@ func TestDumpImpactStopsOnACancelledContext(t *testing.T) {
 // On the dump path the gap lands on the unit, beside its callers, and does not
 // mark the unit as unasked.
 func TestDumpImpactPutsUnresolvedIncludesOnTheUnit(t *testing.T) {
-	srv := includeServer(t, includeRowsXML(1), func(w http.ResponseWriter, include string) {
+	srv := mainProgramsServer(t, includeRowsXML(1), func(w http.ResponseWriter, include string) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	defer srv.Close()
@@ -193,7 +193,7 @@ func TestDumpImpactPutsUnresolvedIncludesOnTheUnit(t *testing.T) {
 // Lookups run in parallel, but no more than includeLookupWorkers at once.
 func TestIncludeLookupsAreBoundedInParallel(t *testing.T) {
 	var inFlight, peak atomic.Int32
-	srv := includeServer(t, includeRowsXML(12), func(w http.ResponseWriter, include string) {
+	srv := mainProgramsServer(t, includeRowsXML(12), func(w http.ResponseWriter, include string) {
 		n := inFlight.Add(1)
 		for {
 			p := peak.Load()
@@ -219,7 +219,7 @@ func TestIncludeLookupsAreBoundedInParallel(t *testing.T) {
 func TestIncludeResolverAsksAboutAnIncludeOnce(t *testing.T) {
 	var mu sync.Mutex
 	asked := map[string]int{}
-	srv := includeServer(t, "", func(w http.ResponseWriter, include string) {
+	srv := mainProgramsServer(t, "", func(w http.ResponseWriter, include string) {
 		mu.Lock()
 		asked[include]++
 		mu.Unlock()
@@ -242,7 +242,7 @@ func TestIncludeResolverAsksAboutAnIncludeOnce(t *testing.T) {
 
 // An include in several programs is a caller through each of them.
 func TestAnIncludeInSeveralProgramsListsThemAll(t *testing.T) {
-	srv := includeServer(t, includeRowsXML(1), func(w http.ResponseWriter, include string) {
+	srv := mainProgramsServer(t, includeRowsXML(1), func(w http.ResponseWriter, include string) {
 		_, _ = w.Write([]byte(mainProgramXML("ZDEMO_PROG_A", "ZDEMO_PROG_B")))
 	})
 	defer srv.Close()

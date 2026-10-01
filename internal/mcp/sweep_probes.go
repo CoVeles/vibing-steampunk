@@ -554,8 +554,10 @@ func oracleWhereUsed(ctx context.Context, c *adt.Client, t SweepTargets) (int, s
 	// repository already, in the handler and then in a probe, which is twice
 	// more than a rule needs to be worth following.
 	uri := adt.GetObjectURL(adt.ObjectTypeClass, t.Referenced, "")
-	// Unresolved includes are still counted, as themselves, so the count
-	// does not depend on whether their main programs could be read.
+	// The unresolved-include gap is ignored on purpose. Those includes are in
+	// this list as themselves, exactly as they are in the call_graph answer
+	// this oracle checks — both read WhereUsed — so the two counts stay
+	// comparable either way.
 	callers, _, err := c.WhereUsed(ctx, uri)
 	if err != nil {
 		return 0, "the where-used list", err

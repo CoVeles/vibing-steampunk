@@ -436,6 +436,12 @@ func impactOfDump(ctx context.Context, client *adt.Client, cmd *cobra.Command, d
 		return emitJSON(result)
 	}
 
+	printDumpImpact(dump, result)
+	return nil
+}
+
+// printDumpImpact is the human rendering of an impact answer.
+func printDumpImpact(dump adt.Dump, result *adt.DumpImpactResult) {
 	fmt.Printf("%s  %s\n", stamp(dump.At), dump.ErrorType)
 	fmt.Printf("  program %s, user %s\n", dump.Program, dump.User)
 	if dump.Message != "" {
@@ -497,7 +503,6 @@ func impactOfDump(ctx context.Context, client *adt.Client, cmd *cobra.Command, d
 	}
 
 	fmt.Fprintln(os.Stderr, "\nWho can reach the bug, not who caused it. Object level: the where-used list resolves a method to its class, so a caller here reaches the class and not necessarily the failing method.")
-	return nil
 }
 
 func callerNamesOf(callers []adt.ExposedCaller) []string {
