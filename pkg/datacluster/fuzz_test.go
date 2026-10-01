@@ -134,3 +134,28 @@ func TestTableCountReadErrorIsNotAnEmptyTable(t *testing.T) {
 		t.Fatal("a nested table without its row count parsed")
 	}
 }
+
+// TestHeaderLengthsOutOfRange: the object header's row length and the
+// descriptor's lengths are read straight from the blob too. 0xFFFFFFFF in
+// an elementary object's row length became -1 on a 32-bit build, matched the
+// -1 its single field summed to, and the row's run[:leaf.Length] panicked.
+// Run with GOARCH=386 to see the original panic.
+func TestHeaderLengthsOutOfRange(t *testing.T) {
+	head := loadHex(t, "indx_plain.hex")[:HeaderSize]
+	obj := make([]byte, 32)
+	obj[0], obj[1] = 7, 0x00 // elementary, type code 0
+	copy(obj[3:], []byte{0xFF, 0xFF, 0xFF, 0xFF})
+	row := []byte{0xBC, 0, 0, 0, 1, 'x', 0xBD, 0x04}
+	blob := append(append(append([]byte{}, head...), obj...), row...)
+	if _, err := Parse(blob); err == nil {
+		t.Fatal("an object of 0xFFFFFFFF bytes parsed")
+	}
+
+	// The same length in a structure's descriptor entries.
+	obj[0] = 2
+	desc := []byte{0xAB, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xAA, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xAC, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF}
+	blob = append(append(append(append([]byte{}, head...), obj...), desc...), row...)
+	if _, err := Parse(blob); err == nil {
+		t.Fatal("a descriptor of 0xFFFFFFFF bytes parsed")
+	}
+}

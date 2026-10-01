@@ -250,13 +250,23 @@ func (p *parser) u32() (int, error) {
 	if err := p.need(4); err != nil {
 		return 0, err
 	}
-	u := binary.BigEndian.Uint32(p.data[p.pos:])
-	if uint64(u) > math.MaxInt32 {
-		// No length in a cluster comes near 2 GiB, and on a 32-bit build
-		// int(u) would turn negative, pass need() and slice backwards.
-		return 0, fmt.Errorf("length %#x at offset %d is out of range", u, p.pos)
+	v, err := length32(p.data[p.pos:], p.pos)
+	if err != nil {
+		return 0, err
 	}
 	p.pos += 4
+	return v, nil
+}
+
+// length32 reads a big-endian length at b[0:4], at stream offset off for the
+// message. No length in a cluster comes near 2 GiB, and on a 32-bit build
+// int() of a larger one turns negative, slips past every bounds check and
+// slices backwards; every four-byte length in the stream goes through here.
+func length32(b []byte, off int) (int, error) {
+	u := binary.BigEndian.Uint32(b)
+	if uint64(u) > math.MaxInt32 {
+		return 0, fmt.Errorf("length %#x at offset %d is out of range", u, off)
+	}
 	return int(u), nil
 }
 
@@ -290,8 +300,15 @@ func (p *parser) object() (*Object, error) {
 	case 7:
 		obj.Kind = Elementary
 	}
-	obj.RowLength = int(binary.BigEndian.Uint32(h[3:]))
-	obj.Size = int(binary.BigEndian.Uint32(h[7:]))
+	rowLen, rowErr := length32(h[3:], p.pos+3)
+	if rowErr != nil {
+		return nil, fmt.Errorf("row length: %w", rowErr)
+	}
+	size, sizeErr := length32(h[7:], p.pos+7)
+	if sizeErr != nil {
+		return nil, fmt.Errorf("object size: %w", sizeErr)
+	}
+	obj.RowLength, obj.Size = rowLen, size
 	nameLen := int(h[11])
 	p.pos += 32
 	if err := p.need(nameLen * 2); err != nil {
@@ -368,9 +385,13 @@ func (p *parser) descriptor(kind Kind) (*Node, error) {
 	if p.data[p.pos] != open {
 		return nil, fmt.Errorf("expected descriptor marker %#02x at offset %d, found %#02x", open, p.pos, p.data[p.pos])
 	}
-	root := &Node{TypeCode: p.data[p.pos+1], Decimals: int(p.data[p.pos+2]), Length: int(binary.BigEndian.Uint32(p.data[p.pos+3:]))}
+	length, err := length32(p.data[p.pos+3:], p.pos+3)
+	if err != nil {
+		return nil, fmt.Errorf("descriptor: %w", err)
+	}
+	root := &Node{TypeCode: p.data[p.pos+1], Decimals: int(p.data[p.pos+2]), Length: length}
 	p.pos += descriptorEntrySize
-	if err := p.children(root, close, ""); err != nil {
+	if err = p.children(root, close, ""); err != nil {
 		return nil, err
 	}
 	return root, nil
@@ -382,7 +403,11 @@ func (p *parser) children(parent *Node, close byte, prefix string) error {
 			return err
 		}
 		e := p.data[p.pos:]
-		marker, code, dec, length := e[0], e[1], int(e[2]), int(binary.BigEndian.Uint32(e[3:]))
+		marker, code, dec := e[0], e[1], int(e[2])
+		length, err := length32(e[3:], p.pos+3)
+		if err != nil {
+			return fmt.Errorf("descriptor: %w", err)
+		}
 		p.pos += descriptorEntrySize
 		if marker == close {
 			if length != parent.Length {
@@ -402,7 +427,7 @@ func (p *parser) children(parent *Node, close byte, prefix string) error {
 			if marker == markIncludeBegin {
 				end = markIncludeEnd
 			}
-			if err := p.children(child, end, path+"."); err != nil {
+			if err = p.children(child, end, path+"."); err != nil {
 				return err
 			}
 			parent.Children = append(parent.Children, child)
@@ -410,7 +435,7 @@ func (p *parser) children(parent *Node, close byte, prefix string) error {
 			// A table-typed component: the nested descriptor is its line
 			// type, and the length here is the line's, not the slot's.
 			child := &Node{Path: path, TypeCode: code, Decimals: dec, Length: length, Table: true}
-			if err := p.children(child, markObjTableEnd, path+"."); err != nil {
+			if err = p.children(child, markObjTableEnd, path+"."); err != nil {
 				return err
 			}
 			parent.Children = append(parent.Children, child)
