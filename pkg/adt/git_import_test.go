@@ -1081,6 +1081,29 @@ func TestDeleteGitObjectsRefusesAMovedObject(t *testing.T) {
 	uris := map[string]string{"ZDEMO_MOVED": "/sap/bc/adt/programs/programs/zdemo_moved"}
 	for name, route := range map[string]http.HandlerFunc{
 		"moved": gitDeleteRoute(map[string]string{"ZDEMO_MOVED": "$ZOTHER"}, uris, nil),
+		"hit without a package": func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "informationsystem/search") {
+				w.Header().Set("Content-Type", "application/xml")
+				fmt.Fprint(w, `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference adtcore:uri="/sap/bc/adt/programs/programs/zdemo_moved" adtcore:type="PROG/P" adtcore:name="ZDEMO_MOVED"/></adtcore:objectReferences>`)
+				return
+			}
+			gitDeleteRoute(nil, uris, nil)(w, r)
+		},
+		"search window full": func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "informationsystem/search") {
+				// A full window of other types: a PROG hit may be past it.
+				var b strings.Builder
+				b.WriteString(`<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">`)
+				for i := 0; i < 1000; i++ {
+					fmt.Fprintf(&b, `<adtcore:objectReference adtcore:uri="/sap/bc/adt/ddic/dataelements/zdemo_moved%d" adtcore:type="DTEL/DE" adtcore:name="ZDEMO_MOVED" adtcore:packageName="$ZDEMO"/>`, i)
+				}
+				b.WriteString(`</adtcore:objectReferences>`)
+				w.Header().Set("Content-Type", "application/xml")
+				fmt.Fprint(w, b.String())
+				return
+			}
+			gitDeleteRoute(nil, uris, nil)(w, r)
+		},
 		"search fails": func(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(r.URL.Path, "informationsystem/search") {
 				w.WriteHeader(http.StatusInternalServerError)
@@ -1098,6 +1121,9 @@ func TestDeleteGitObjectsRefusesAMovedObject(t *testing.T) {
 		}
 		if name == "moved" && !strings.Contains(res.Objects[0].Reason, "$ZOTHER") {
 			t.Errorf("%s: the reason does not name the new package: %s", name, res.Objects[0].Reason)
+		}
+		if want := map[string]string{"hit without a package": "did not say which package", "search window full": "may be incomplete"}[name]; want != "" && !strings.Contains(res.Objects[0].Reason, want) {
+			t.Errorf("%s: reason %q, want it to say %q", name, res.Objects[0].Reason, want)
 		}
 		for _, c := range rec.snapshot() {
 			if c.method == http.MethodDelete || (c.method == http.MethodPost && c.query.Get("_action") == "LOCK") {

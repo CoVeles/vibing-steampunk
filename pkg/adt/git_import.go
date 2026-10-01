@@ -1344,7 +1344,8 @@ func (c *Client) deleteGated(ctx context.Context, objectURL, transport string) (
 // after the package was read: that is an error, and the object is not
 // deleted -- the static address would reach it in its new package, and
 // DeleteObject's gate checks only the whitelist, not this package. A search
-// that fails is an error too: the package cannot be confirmed. Only when
+// that fails, comes back incomplete, or returns a hit without a package is
+// an error too: the package cannot be confirmed. Only when
 // the search finds no object of that type at all is the collection the
 // type usually lives in used (a DELETE there of something absent fails).
 func (c *Client) gitDeleteURL(ctx context.Context, objType, name, pkg string) (string, error) {
@@ -1353,9 +1354,14 @@ func (c *Client) gitDeleteURL(ctx context.Context, objType, name, pkg string) (s
 	if !ok {
 		return "", fmt.Errorf("no ADT delete for type %s here; delete it in SE80", objType)
 	}
-	hits, _, err := c.SearchObjectExact(ctx, name, "", 0)
+	hits, incomplete, err := c.SearchObjectExact(ctx, name, "", 0)
 	if err != nil {
 		return "", fmt.Errorf("its ADT address could not be looked up, so its package could not be confirmed: %w; not deleted", err)
+	}
+	if incomplete != "" {
+		// The window filled: a hit of this type may be past it, so "none
+		// found" cannot pick the fallback.
+		return "", fmt.Errorf("the search for its ADT address may be incomplete, so its package could not be confirmed; not deleted")
 	}
 	found := ""
 	for _, h := range hits {
@@ -1363,7 +1369,12 @@ func (c *Client) gitDeleteURL(ctx context.Context, objType, name, pkg string) (s
 		if main != objType {
 			continue
 		}
-		if hp := strings.TrimSpace(h.PackageName); hp != "" && !strings.EqualFold(hp, pkg) {
+		hp := strings.TrimSpace(h.PackageName)
+		if hp == "" {
+			// No package on the hit: it cannot be shown to be still in pkg.
+			return "", fmt.Errorf("the search did not say which package it is in, so that could not be confirmed; not deleted")
+		}
+		if !strings.EqualFold(hp, pkg) {
 			return "", fmt.Errorf("it is in package %s now, not %s (it moved after the package was read); not deleted", strings.ToUpper(hp), pkg)
 		}
 		u := strings.TrimSpace(h.URI)
