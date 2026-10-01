@@ -625,7 +625,8 @@ URL, system number from its port, gateway port `3300 + sysnr`. Override per syst
 `--sysnr`, `--port`). RFC logon uses `rfc_user`/`rfc_password`, else `SAP_USER`/
 `SAP_PASSWORD`, else the system's own credentials. An MCP server takes the RFC
 settings of its own system (the one named by `-s`/`SAP_SYSTEM`, else the entry whose
-URL and client match its own), and logs on with that entry's `rfc_user`/`rfc_password`,
+URL and client match its own; a named entry whose URL or client is not the server's
+is refused), and logs on with that entry's `rfc_user`/`rfc_password`,
 else its own credentials. `SAP_USER`/`SAP_PASSWORD` are used only by a server without
 credentials of its own (cookie or SSO logon), and only when `SAP_URL` and
 `SAP_CLIENT` name its system.
@@ -798,6 +799,27 @@ Earlier: **[Still Only 5%](articles/2026-08-25-still-five-percent.md)** · **[VS
 ## What's New
 
 The headline changes are in the **"New in the last three releases"** callout at the top of this README; the full version history is in [CHANGELOG.md](CHANGELOG.md). Latest release: **[v2.57.0 — the dump's own why](https://github.com/oisee/vibing-steampunk/releases/tag/v2.57.0)**.
+
+### Unreleased — behaviour changes since v2.58.0
+
+- **`--read-only` covers more.** Besides object edits it now refuses transport
+  writes (create, release, delete, merge, move, entry add/remove — with
+  `--enable-transports` too), `SAP(action="rfc")` `call`, `RunReport` /
+  `RunReportAsync`, and gCTS create, delete, clone, pull, commit and
+  switch-branch. Reads stay allowed. The CLI's `vsp rfc call`, `rfc run` and
+  non-GET `rfc adt` now honour `read_only` in `.vsp.json` and `SAP_READ_ONLY`.
+- **A named system must be the connected one.** When `-s` / `SAP_SYSTEM` names a
+  `.vsp.json` entry whose `url`/`client` differ from `SAP_URL`/`SAP_CLIENT`, the
+  server warns at startup and refuses RFC use. An entry without a `url` (gateway
+  only) still applies. A per-call `host` or `sysnr` on `SAP(action="rfc")` that
+  differs from the server's own gateway is refused, so the configured RFC
+  credentials are never sent to a caller-chosen host.
+- **`--block-free-sql` covers `rfc read_table`** when the caller passes a
+  `where`. Reads without one, and `search`, are unchanged.
+- **Go toolchain:** `go.mod` pins `toolchain go1.26.8`.
+- **HTTP transport:** mcp-go v1.1.0 answers 403 to a request from a loopback
+  address that carries a non-loopback `Host` header (DNS-rebinding protection).
+  A reverse proxy on the same host must rewrite `Host` to reach vsp.
 
 ### Hyperfocused Mode — 1 Tool to Rule Them All (Recommended)
 
@@ -1933,7 +1955,7 @@ Uses **ABAP SQL syntax**, not standard SQL:
 make build          # Current platform
 make build-all      # All 9 platforms
 
-# Test
+# Test (go.mod pins toolchain go1.26.8)
 go test ./...                              # Unit tests (1354)
 go test -tags=integration -v ./pkg/adt/    # Integration tests (34+)
 ```
