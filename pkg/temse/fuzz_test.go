@@ -32,9 +32,36 @@ func FuzzDecodeList(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if l.Pages < 0 || l.Records < len(l.Lines) {
-			t.Fatalf("pages %d, records %d, lines %d", l.Pages, l.Records, len(l.Lines))
+		if l.Records < len(l.Lines) {
+			t.Fatalf("records %d, lines %d", l.Records, len(l.Lines))
+		}
+		// Every page end opens a page, except a page end that is the last
+		// line: the page after it has nothing on it and is not counted.
+		ends := 0
+		for _, line := range l.Lines {
+			if line.Control == string(ctlPageEnd) {
+				ends++
+			}
+		}
+		want := ends + 1
+		if n := len(l.Lines); n > 0 && l.Lines[n-1].Control == string(ctlPageEnd) {
+			want--
+		}
+		if l.Pages != want {
+			t.Fatalf("%d pages for %d page ends (last line %q): an empty page was counted", l.Pages, ends, lastControl(l))
+		}
+		for i, line := range l.Lines {
+			if line.Page < 1 || line.Page > l.Pages {
+				t.Fatalf("line %d is on page %d of %d", i, line.Page, l.Pages)
+			}
 		}
 		_ = l.Text()
 	})
+}
+
+func lastControl(l *List) string {
+	if len(l.Lines) == 0 {
+		return ""
+	}
+	return l.Lines[len(l.Lines)-1].Control
 }
