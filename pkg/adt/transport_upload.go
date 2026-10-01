@@ -394,6 +394,57 @@ func transportCall(ctx context.Context, ws TransportService, action string, para
 	return nil
 }
 
+// The tp step does not run in the ZADT_VSP session: tp is started over
+// synchronous RFC, which an ABAP Push Channel may not do. add_to_buffer and
+// show_buffer schedule background job ZVSP_TRANSPORT_BUFFER and answer with a
+// ticket; buffer_result answers "pending" until the job has stored its result.
+var (
+	transportPollInterval = 2 * time.Second
+	transportJobTimeout   = 5 * time.Minute
+)
+
+type transportJobStarted struct {
+	Status string `json:"status"`
+	Ticket string `json:"ticket"`
+	Job    string `json:"job"`
+}
+
+// transportJob starts a buffer job with action and waits for its result,
+// which is decoded into out.
+func transportJob(ctx context.Context, ws TransportService, action string, params map[string]any, out any) error {
+	var started transportJobStarted
+	if err := transportCall(ctx, ws, action, params, time.Minute, &started); err != nil {
+		return err
+	}
+	if started.Ticket == "" {
+		return fmt.Errorf("transport.%s: ZADT_VSP started no job", action)
+	}
+	deadline := time.Now().Add(transportJobTimeout)
+	for {
+		var raw json.RawMessage
+		if err := transportCall(ctx, ws, "buffer_result", map[string]any{"ticket": started.Ticket}, time.Minute, &raw); err != nil {
+			return err
+		}
+		var st struct {
+			Status    string `json:"status"`
+			JobStatus string `json:"job_status"`
+		}
+		_ = json.Unmarshal(raw, &st)
+		if st.Status != "pending" {
+			return json.Unmarshal(raw, out)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("background job %s %s has not finished after %s (status %q); see SM37 -- what it did to the buffer is unknown",
+				started.Job, started.Ticket, transportJobTimeout, st.JobStatus)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(transportPollInterval):
+		}
+	}
+}
+
 // TransportServiceError is a refusal or failure reported by
 // ZCL_VSP_TRANSPORT_SERVICE.
 type TransportServiceError struct {
@@ -548,13 +599,13 @@ func (c *Client) UploadTransport(ctx context.Context, ws TransportService, files
 	if err := transportCall(ctx, ws, "upload_files", map[string]any{
 		"step": "commit", "assembly_id": begin.AssemblyID,
 	}, 5*time.Minute, &commit); err != nil {
-		return nil, fmt.Errorf("%w (whatever this commit wrote was deleted again; nothing else was touched)", err)
+		return nil, err
 	}
 	res.FilesWritten = true
 	res.CofilePath, res.DataPath = commit.CofilePath, commit.DataPath
 
 	var add transportAddAnswer
-	addErr := transportCall(ctx, ws, "add_to_buffer", map[string]any{"request": files.Request}, 5*time.Minute, &add)
+	addErr := transportJob(ctx, ws, "add_to_buffer", map[string]any{"request": files.Request}, &add)
 	if addErr != nil {
 		var se *TransportServiceError
 		if errors.As(addErr, &se) && se.Code == "ADD_FAILED_ROLLED_BACK" {
@@ -587,7 +638,7 @@ func (c *Client) TransportBuffer(ctx context.Context, ws TransportService, reque
 		params["request"] = request
 	}
 	var a transportBufferAnswer
-	if err := transportCall(ctx, ws, "show_buffer", params, 2*time.Minute, &a); err != nil {
+	if err := transportJob(ctx, ws, "show_buffer", params, &a); err != nil {
 		return nil, err
 	}
 	out := &TransportBufferResult{System: a.System, Client: a.Client, Request: request, Total: a.Total, Truncated: a.Truncated,

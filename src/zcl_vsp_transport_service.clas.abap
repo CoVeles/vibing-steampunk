@@ -15,6 +15,11 @@
 "!   TMS_TP_MAINTAIN_BUFFER, and only for the request this session uploaded;
 "!   the buffer is read through TMS_TP_SHOW_BUFFER;
 "! - there is no dynamic CALL FUNCTION.
+"! tp is started over synchronous RFC, which an ABAP Push Channel may not do
+"! (APC_ILLEGAL_STATEMENT), so the buffer step runs as a background job,
+"! ZVSP_TRANSPORT_BUFFER, which calls run_job. The session hands the job its
+"! work through INDX under the job's own number and polls for the result
+"! with buffer_result; the job does nothing without such a ticket.
 "! Authority is SAP's own: S_CTS_ADMI EPS1 for the files (EPS layer), TADD
 "! for the buffer (tp interface). A refusal is reported, not worked around.
 CLASS zcl_vsp_transport_service DEFINITION
@@ -33,6 +38,13 @@ CLASS zcl_vsp_transport_service DEFINITION
     CONSTANTS c_max_chunk TYPE i VALUE 1048576.
     "! Buffer lines returned by show_buffer.
     CONSTANTS c_max_buffer_entries TYPE i VALUE 500.
+    "! The background job (and its program) that runs the tp step.
+    CONSTANTS c_job_name TYPE tbtcjob-jobname VALUE 'ZVSP_TRANSPORT_BUFFER'.
+
+    "! The background step: reads this job's ticket, reads the buffer and,
+    "! for an ADD ticket, adds its request; stores the result for the session.
+    "! Outside a ZVSP_TRANSPORT_BUFFER job, or without a ticket, it does nothing.
+    CLASS-METHODS run_job.
 
     "! The request two file names belong to: ev_request is &lt;SID&gt;K&lt;nr&gt;.
     "! ev_error is set, and the rest initial, when they are not a pair.
@@ -70,6 +82,27 @@ CLASS zcl_vsp_transport_service DEFINITION
         cofile_name TYPE string,
         data_name   TYPE string,
       END OF ty_written,
+      BEGIN OF ty_ticket,
+        action  TYPE string,
+        request TYPE string,
+      END OF ty_ticket,
+      BEGIN OF ty_job_result,
+        action       TYPE string,
+        request      TYPE string,
+        system       TYPE string,
+        code         TYPE string,
+        message      TYPE string,
+        tp_cmd       TYPE string,
+        tp_rc        TYPE string,
+        tp_msg       TYPE string,
+        buffer_known TYPE abap_bool,
+        in_buffer    TYPE abap_bool,
+      END OF ty_job_result,
+      BEGIN OF ty_pending,
+        ticket  TYPE string,
+        action  TYPE string,
+        request TYPE string,
+      END OF ty_pending,
       tt_tpbuffer TYPE STANDARD TABLE OF tpbuffer WITH DEFAULT KEY,
       tt_tpstdout TYPE STANDARD TABLE OF tpstdout WITH DEFAULT KEY.
 
@@ -79,6 +112,8 @@ CLASS zcl_vsp_transport_service DEFINITION
     "! to the buffer. Only this request may be added, and only these files
     "! are deleted when the add fails.
     DATA ms_written TYPE ty_written.
+    "! The buffer job this session started and has not collected yet.
+    DATA ms_pending TYPE ty_pending.
 
     METHODS handle_upload_files
       IMPORTING is_message         TYPE zif_vsp_service=>ty_message
@@ -108,13 +143,32 @@ CLASS zcl_vsp_transport_service DEFINITION
       IMPORTING is_message         TYPE zif_vsp_service=>ty_message
       RETURNING VALUE(rs_response) TYPE zif_vsp_service=>ty_response.
 
+    METHODS handle_buffer_result
+      IMPORTING is_message         TYPE zif_vsp_service=>ty_message
+      RETURNING VALUE(rs_response) TYPE zif_vsp_service=>ty_response.
+
+    "! Schedules ZVSP_TRANSPORT_BUFFER with a ticket for one action.
+    CLASS-METHODS start_job
+      IMPORTING iv_action   TYPE string
+                iv_request  TYPE string
+      EXPORTING ev_jobcount TYPE string
+                ev_error    TYPE string.
+
+    CLASS-METHODS job_key
+      IMPORTING iv_jobcount   TYPE csequence
+      RETURNING VALUE(rv_key) TYPE indx-srtfd.
+
+    CLASS-METHODS buffer_entries_json
+      IMPORTING it_buffer      TYPE tt_tpbuffer
+      RETURNING VALUE(rv_json) TYPE string.
+
     "! The logical directory of a kind of file: $TR_COFI or $TR_DATA.
     CLASS-METHODS dir_of
       IMPORTING iv_kind       TYPE string
       RETURNING VALUE(rv_dir) TYPE epsf-epsdirnam.
 
     "! Whether a file of that kind and name exists in DIR_TRANS, at any size.
-    METHODS file_exists
+    CLASS-METHODS file_exists
       IMPORTING iv_kind          TYPE string
                 iv_name          TYPE string
       EXPORTING ev_error         TYPE string
@@ -122,7 +176,7 @@ CLASS zcl_vsp_transport_service DEFINITION
 
     "! Writes a new file through the EPS layer. ev_opened says a file was
     "! created, so that a failure after it knows what to delete.
-    METHODS write_file
+    CLASS-METHODS write_file
       IMPORTING iv_kind    TYPE string
                 iv_name    TYPE string
                 iv_content TYPE xstring
@@ -130,12 +184,12 @@ CLASS zcl_vsp_transport_service DEFINITION
                 ev_path    TYPE string
                 ev_error   TYPE string.
 
-    METHODS delete_file
+    CLASS-METHODS delete_file
       IMPORTING iv_kind TYPE string
                 iv_name TYPE string.
 
     "! This system's import buffer, read-only.
-    METHODS read_buffer
+    CLASS-METHODS read_buffer
       EXPORTING et_buffer TYPE tt_tpbuffer
                 et_stdout TYPE tt_tpstdout
                 ev_cmd    TYPE string
@@ -186,6 +240,8 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         rs_response = handle_show_buffer( is_message ).
       WHEN 'download_files'.
         rs_response = handle_download_files( is_message ).
+      WHEN 'buffer_result'.
+        rs_response = handle_buffer_result( is_message ).
       WHEN OTHERS.
         rs_response = err( iv_id = is_message-id iv_code = 'UNKNOWN_ACTION'
                            iv_message = |Action '{ is_message-action }' not supported| ).
@@ -194,7 +250,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
 
 
   METHOD zif_vsp_service~on_disconnect.
-    CLEAR: ms_assembly, ms_written.
+    CLEAR: ms_assembly, ms_written, ms_pending.
   ENDMETHOD.
 
 
@@ -421,7 +477,9 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         delete_file( iv_kind = `data` iv_name = ls_up-data_name ).
       ENDIF.
       rs_response = err( iv_id = is_message-id iv_code = 'WRITE_FAILED'
-                         iv_message = |{ ls_up-data_name }: { lv_error }. What this call wrote was deleted.| ).
+                         iv_message = |{ ls_up-data_name }: { lv_error }. | &&
+                                      COND string( WHEN lv_data_open = abap_true THEN `What this call wrote was deleted again.`
+                                                   ELSE `Nothing was written.` ) ).
       RETURN.
     ENDIF.
 
@@ -433,7 +491,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ENDIF.
       delete_file( iv_kind = `data` iv_name = ls_up-data_name ).
       rs_response = err( iv_id = is_message-id iv_code = 'WRITE_FAILED'
-                         iv_message = |{ ls_up-cofile_name }: { lv_error }. What this call wrote was deleted.| ).
+                         iv_message = |{ ls_up-cofile_name }: { lv_error }. What this call wrote was deleted again.| ).
       RETURN.
     ENDIF.
 
@@ -450,23 +508,11 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
 
 
   METHOD handle_add_to_buffer.
-    DATA: lv_sid     TYPE string,
-          lv_number  TYPE string,
-          lv_error   TYPE string,
-          lv_trkorr  TYPE trkorr,
-          lv_cmd     TYPE stpa-cmdstring,
-          lv_rc      TYPE stpa-retcode,
-          lv_msg     TYPE stpa-message,
-          lt_stdout  TYPE tt_tpstdout,
-          lt_buffer  TYPE tt_tpbuffer,
-          lv_bufcmd  TYPE string,
-          lv_bufrc   TYPE string,
-          lv_bufmsg  TYPE string,
-          lt_bufout  TYPE tt_tpstdout,
-          lv_system  TYPE stpa-sysname.
-
-    " This system, and only ever this system (STPA-SYSNAME is CHAR10).
-    lv_system = sy-sysid.
+    DATA: lv_sid      TYPE string,
+          lv_number   TYPE string,
+          lv_error    TYPE string,
+          lv_trkorr   TYPE trkorr,
+          lv_jobcount TYPE string.
 
     DATA(lv_request) = to_upper( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'request' ) ).
     IF request_parts( EXPORTING iv_request = lv_request IMPORTING ev_sid = lv_sid ev_number = lv_number ) = abap_false.
@@ -482,6 +528,11 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
                          iv_message = |{ lv_request } was not uploaded in this session; only an uploaded request is added to the buffer| ).
       RETURN.
     ENDIF.
+    IF ms_pending-ticket IS NOT INITIAL.
+      rs_response = err( iv_id = is_message-id iv_code = 'BUSY'
+                         iv_message = |Buffer job { ms_pending-ticket } of this session has not been collected yet (buffer_result)| ).
+      RETURN.
+    ENDIF.
 
     DATA(lt_kinds) = VALUE string_table( ( `data` ) ( `cofile` ) ).
     LOOP AT lt_kinds INTO DATA(lv_kind).
@@ -494,95 +545,34 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ENDIF.
     ENDLOOP.
 
-    " Never twice: a request already in the queue is left alone.
-    read_buffer( IMPORTING et_buffer = lt_buffer et_stdout = lt_bufout ev_cmd = lv_bufcmd
-                           ev_rc = lv_bufrc ev_msg = lv_bufmsg ev_error = lv_error ).
+    start_job( EXPORTING iv_action = `ADD` iv_request = lv_request
+               IMPORTING ev_jobcount = lv_jobcount ev_error = lv_error ).
     IF lv_error IS NOT INITIAL.
-      rs_response = err( iv_id = is_message-id iv_code = 'BUFFER_READ_FAILED'
-                         iv_message = |The import buffer of { sy-sysid } could not be read, so { lv_request } was not added: { lv_error }| ).
-      RETURN.
-    ENDIF.
-    IF line_exists( lt_buffer[ trkorr = lv_trkorr ] ).
+      " Nothing reached tp: the request is not in the buffer, so this
+      " upload's files go again.
+      delete_file( iv_kind = `cofile` iv_name = ms_written-cofile_name ).
+      delete_file( iv_kind = `data` iv_name = ms_written-data_name ).
       CLEAR ms_written.
-      rs_response = err( iv_id = is_message-id iv_code = 'ALREADY_IN_BUFFER'
-                         iv_message = |{ lv_request } is already in the import buffer of { sy-sysid }; it was not added again| ).
+      rs_response = err( iv_id = is_message-id iv_code = 'ADD_FAILED_ROLLED_BACK'
+                         iv_message = |The buffer job could not be started: { lv_error }. The files this upload wrote were deleted again.| ).
       RETURN.
     ENDIF.
+    ms_pending = VALUE #( ticket = lv_jobcount action = `ADD` request = lv_request ).
 
-    " The one tp command this class sends. The command is a literal, the
-    " system is this one, and no option, client or flag is passed.
-    CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'
-      EXPORTING
-        iv_tp_command      = 'ADDTOBUFFER'
-        iv_system_name     = lv_system
-        iv_request         = lv_trkorr
-      IMPORTING
-        ev_tp_cmd_strg     = lv_cmd
-        ev_tp_ret_code     = lv_rc
-        ev_tp_message      = lv_msg
-      TABLES
-        tt_stdout          = lt_stdout
-      EXCEPTIONS
-        invalid_command    = 1
-        permission_denied  = 2
-        tp_call_failed     = 3
-        tp_interface_error = 4
-        tp_reported_error  = 5
-        OTHERS             = 6.
-    DATA(lv_subrc) = sy-subrc.
-    DATA(lv_sysmsg) = COND string( WHEN lv_subrc <> 0 THEN last_message( ) ).
-
-    IF lv_subrc <> 0.
-      DATA(lv_code) = SWITCH string( lv_subrc
-        WHEN 2 THEN `PERMISSION_DENIED`
-        WHEN 3 THEN `TP_CALL_FAILED`
-        WHEN 5 THEN `TP_REPORTED_ERROR`
-        ELSE `ADD_FAILED` ).
-      DATA(lv_text) = |ADDTOBUFFER { lv_request } { sy-sysid } failed ({ lv_code }, tp rc { lv_rc }): { lv_sysmsg } { lv_msg }|.
-      IF lv_subrc = 2.
-        lv_text = lv_text && ` -- adding to the buffer needs S_CTS_ADMI with CTS_ADMFCT TADD (or IMPT).`.
-      ENDIF.
-      " Undo this upload's files, but only when the request is certainly not
-      " in the buffer: a buffer line without its cofile is worse than both.
-      CLEAR lt_buffer.
-      read_buffer( IMPORTING et_buffer = lt_buffer et_stdout = lt_bufout ev_cmd = lv_bufcmd
-                             ev_rc = lv_bufrc ev_msg = lv_bufmsg ev_error = lv_error ).
-      IF lv_error IS INITIAL AND NOT line_exists( lt_buffer[ trkorr = lv_trkorr ] ).
-        delete_file( iv_kind = `cofile` iv_name = ms_written-cofile_name ).
-        delete_file( iv_kind = `data` iv_name = ms_written-data_name ).
-        CLEAR ms_written.
-        rs_response = err( iv_id = is_message-id iv_code = 'ADD_FAILED_ROLLED_BACK'
-                           iv_message = lv_text && ` The files this upload wrote were deleted again.` ).
-      ELSE.
-        CLEAR ms_written.
-        rs_response = err( iv_id = is_message-id iv_code = lv_code
-                           iv_message = lv_text && ` The uploaded files were kept: the buffer could not be confirmed free of the request.` ).
-      ENDIF.
-      RETURN.
-    ENDIF.
-
-    CLEAR ms_written.
     rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
+      ( zcl_vsp_utils=>json_str( iv_key = 'status' iv_value = `started` ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'ticket' iv_value = lv_jobcount ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'job' iv_value = CONV #( c_job_name ) ) )
       ( zcl_vsp_utils=>json_str( iv_key = 'request' iv_value = lv_request ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'system' iv_value = CONV #( sy-sysid ) ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'tp_command' iv_value = CONV #( lv_cmd ) ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'tp_rc' iv_value = CONV #( lv_rc ) ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'tp_message' iv_value = CONV #( lv_msg ) ) )
-      ( |"stdout":{ stdout_json( lt_stdout ) }| )
     ) ) ) ).
   ENDMETHOD.
 
 
   METHOD handle_show_buffer.
-    DATA: lv_sid    TYPE string,
-          lv_number TYPE string,
-          lt_buffer TYPE tt_tpbuffer,
-          lt_stdout TYPE tt_tpstdout,
-          lv_cmd    TYPE string,
-          lv_rc     TYPE string,
-          lv_msg    TYPE string,
-          lv_error  TYPE string,
-          lt_items  TYPE string_table.
+    DATA: lv_sid      TYPE string,
+          lv_number   TYPE string,
+          lv_error    TYPE string,
+          lv_jobcount TYPE string.
 
     DATA(lv_request) = to_upper( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'request' ) ).
     IF lv_request IS NOT INITIAL AND
@@ -591,19 +581,215 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
                          iv_message = |Request '{ lv_request }' is not <SID>K<6 digits>| ).
       RETURN.
     ENDIF.
-
-    read_buffer( IMPORTING et_buffer = lt_buffer et_stdout = lt_stdout ev_cmd = lv_cmd
-                           ev_rc = lv_rc ev_msg = lv_msg ev_error = lv_error ).
-    IF lv_error IS NOT INITIAL.
-      rs_response = err( iv_id = is_message-id iv_code = 'BUFFER_READ_FAILED' iv_message = lv_error ).
+    IF ms_pending-ticket IS NOT INITIAL.
+      rs_response = err( iv_id = is_message-id iv_code = 'BUSY'
+                         iv_message = |Buffer job { ms_pending-ticket } of this session has not been collected yet (buffer_result)| ).
       RETURN.
     ENDIF.
-    IF lv_request IS NOT INITIAL.
-      DELETE lt_buffer WHERE trkorr <> lv_request.
+
+    start_job( EXPORTING iv_action = `SHOW` iv_request = lv_request
+               IMPORTING ev_jobcount = lv_jobcount ev_error = lv_error ).
+    IF lv_error IS NOT INITIAL.
+      rs_response = err( iv_id = is_message-id iv_code = 'JOB_FAILED'
+                         iv_message = |The buffer job could not be started: { lv_error }| ).
+      RETURN.
+    ENDIF.
+    ms_pending = VALUE #( ticket = lv_jobcount action = `SHOW` request = lv_request ).
+
+    rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
+      ( zcl_vsp_utils=>json_str( iv_key = 'status' iv_value = `started` ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'ticket' iv_value = lv_jobcount ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'job' iv_value = CONV #( c_job_name ) ) )
+    ) ) ) ).
+  ENDMETHOD.
+
+
+  METHOD handle_buffer_result.
+    DATA: ls_res    TYPE ty_job_result,
+          lt_buffer TYPE tt_tpbuffer,
+          lt_stdout TYPE tt_tpstdout,
+          ls_indx   TYPE indx,
+          lv_status TYPE tbtco-status.
+
+    DATA(lv_ticket) = zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'ticket' ).
+    IF ms_pending-ticket IS INITIAL OR lv_ticket <> ms_pending-ticket.
+      rs_response = err( iv_id = is_message-id iv_code = 'NO_SUCH_JOB'
+                         iv_message = |No buffer job { lv_ticket } is pending in this session| ).
+      RETURN.
+    ENDIF.
+    DATA(lv_key) = job_key( lv_ticket ).
+
+    IMPORT result = ls_res buffer = lt_buffer stdout = lt_stdout
+      FROM DATABASE indx(zu) TO ls_indx ID lv_key.
+    IF sy-subrc <> 0.
+      SELECT SINGLE status FROM tbtco INTO @lv_status
+        WHERE jobname = @c_job_name AND jobcount = @lv_ticket.
+      IF sy-subrc <> 0 OR lv_status = 'A'.
+        DATA(ls_lost) = ms_pending.
+        CLEAR: ms_pending, ms_written.
+        rs_response = err( iv_id = is_message-id iv_code = 'JOB_FAILED'
+                           iv_message = |Background job { c_job_name } { lv_ticket } ended without a result (status '{ lv_status }'); see SM37.| &&
+                                        COND string( WHEN ls_lost-action = `ADD`
+                                                     THEN | Whether { ls_lost-request } reached the buffer is unknown; the uploaded files were kept.| ) ).
+        RETURN.
+      ENDIF.
+      rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
+        ( zcl_vsp_utils=>json_str( iv_key = 'status' iv_value = `pending` ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'job_status' iv_value = CONV #( lv_status ) ) )
+      ) ) ) ).
+      RETURN.
     ENDIF.
 
-    DATA(lv_total) = lines( lt_buffer ).
-    LOOP AT lt_buffer INTO DATA(ls_buf) TO c_max_buffer_entries.
+    DELETE FROM DATABASE indx(zu) ID lv_key.
+    DATA(ls_pend) = ms_pending.
+    CLEAR ms_pending.
+
+    IF ls_pend-action = `SHOW`.
+      IF ls_res-code IS NOT INITIAL.
+        rs_response = err( iv_id = is_message-id iv_code = ls_res-code iv_message = ls_res-message ).
+        RETURN.
+      ENDIF.
+      IF ls_pend-request IS NOT INITIAL.
+        DELETE lt_buffer WHERE trkorr <> ls_pend-request.
+      ENDIF.
+      DATA(lv_total) = lines( lt_buffer ).
+      rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
+        ( zcl_vsp_utils=>json_str( iv_key = 'status' iv_value = `done` ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'system' iv_value = ls_res-system ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'client' iv_value = CONV #( sy-mandt ) ) )
+        ( zcl_vsp_utils=>json_int( iv_key = 'total' iv_value = lv_total ) )
+        ( zcl_vsp_utils=>json_bool( iv_key = 'truncated' iv_value = xsdbool( lv_total > c_max_buffer_entries ) ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'tp_command' iv_value = ls_res-tp_cmd ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'tp_rc' iv_value = ls_res-tp_rc ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'tp_message' iv_value = ls_res-tp_msg ) )
+        ( |"entries":{ buffer_entries_json( lt_buffer ) }| )
+      ) ) ) ).
+      RETURN.
+    ENDIF.
+
+    " ADD
+    IF ls_res-code IS INITIAL.
+      CLEAR ms_written.
+      rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
+        ( zcl_vsp_utils=>json_str( iv_key = 'status' iv_value = `done` ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'request' iv_value = ls_res-request ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'system' iv_value = ls_res-system ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'tp_command' iv_value = ls_res-tp_cmd ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'tp_rc' iv_value = ls_res-tp_rc ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'tp_message' iv_value = ls_res-tp_msg ) )
+        ( |"stdout":{ stdout_json( lt_stdout ) }| )
+      ) ) ) ).
+      RETURN.
+    ENDIF.
+
+    " Undo this upload's files, but only when the request is certainly not
+    " in the buffer: a buffer line without its cofile is worse than both.
+    IF ls_res-buffer_known = abap_true AND ls_res-in_buffer = abap_false AND ms_written-request = ls_pend-request.
+      delete_file( iv_kind = `cofile` iv_name = ms_written-cofile_name ).
+      delete_file( iv_kind = `data` iv_name = ms_written-data_name ).
+      CLEAR ms_written.
+      rs_response = err( iv_id = is_message-id iv_code = 'ADD_FAILED_ROLLED_BACK'
+                         iv_message = ls_res-message && ` The files this upload wrote were deleted again.` ).
+      RETURN.
+    ENDIF.
+    CLEAR ms_written.
+    rs_response = err( iv_id = is_message-id iv_code = ls_res-code
+                       iv_message = ls_res-message && COND string( WHEN ls_res-code <> `ALREADY_IN_BUFFER`
+                                                                   THEN ` The uploaded files were kept: the buffer could not be confirmed free of the request.` ) ).
+  ENDMETHOD.
+
+
+  METHOD start_job.
+    DATA: lv_jobname  TYPE tbtcjob-jobname,
+          lv_jobcount TYPE tbtcjob-jobcount,
+          lv_released TYPE btch0000-char1,
+          ls_indx     TYPE indx.
+
+    CLEAR: ev_jobcount, ev_error.
+    lv_jobname = c_job_name.
+    CALL FUNCTION 'JOB_OPEN'
+      EXPORTING
+        jobname          = lv_jobname
+      IMPORTING
+        jobcount         = lv_jobcount
+      EXCEPTIONS
+        cant_create_job  = 1
+        invalid_job_data = 2
+        jobname_missing  = 3
+        OTHERS           = 4.
+    IF sy-subrc <> 0.
+      ev_error = |JOB_OPEN failed (exception { sy-subrc }) { last_message( ) }|.
+      RETURN.
+    ENDIF.
+
+    " The ticket: what the job is to do, under the job's own number.
+    DATA(ls_ticket) = VALUE ty_ticket( action = iv_action request = iv_request ).
+    DATA(lv_key) = job_key( lv_jobcount ).
+    EXPORT ticket = ls_ticket TO DATABASE indx(zt) FROM ls_indx ID lv_key.
+
+    CALL FUNCTION 'JOB_SUBMIT'
+      EXPORTING
+        authcknam         = sy-uname
+        jobcount          = lv_jobcount
+        jobname           = lv_jobname
+        report            = 'ZVSP_TRANSPORT_BUFFER'
+      EXCEPTIONS
+        bad_priparams     = 1
+        bad_xpgflags      = 2
+        invalid_jobdata   = 3
+        jobname_missing   = 4
+        job_notex         = 5
+        job_submit_failed = 6
+        lock_failed       = 7
+        OTHERS            = 8.
+    IF sy-subrc <> 0.
+      ev_error = |JOB_SUBMIT failed (exception { sy-subrc }) { last_message( ) }|.
+      DELETE FROM DATABASE indx(zt) ID lv_key.
+      RETURN.
+    ENDIF.
+
+    " A start time within ten seconds is an immediate start (JOB_CLOSE).
+    CALL FUNCTION 'JOB_CLOSE'
+      EXPORTING
+        jobcount             = lv_jobcount
+        jobname              = lv_jobname
+        sdlstrtdt            = sy-datum
+        sdlstrttm            = sy-uzeit
+      IMPORTING
+        job_was_released     = lv_released
+      EXCEPTIONS
+        cant_start_immediate = 1
+        invalid_startdate    = 2
+        jobname_missing      = 3
+        job_close_failed     = 4
+        job_nosteps          = 5
+        job_notex            = 6
+        lock_failed          = 7
+        invalid_target       = 8
+        invalid_time_zone    = 9
+        OTHERS               = 10.
+    IF sy-subrc <> 0.
+      ev_error = |JOB_CLOSE failed (exception { sy-subrc }) { last_message( ) }|.
+      DELETE FROM DATABASE indx(zt) ID lv_key.
+      RETURN.
+    ENDIF.
+    IF lv_released IS INITIAL.
+      ev_error = |job { lv_jobname } { lv_jobcount } was scheduled but not released: releasing it needs S_BTCH_JOB with JOBACTION RELE; delete it in SM37|.
+      DELETE FROM DATABASE indx(zt) ID lv_key.
+      RETURN.
+    ENDIF.
+    ev_jobcount = lv_jobcount.
+  ENDMETHOD.
+
+
+  METHOD job_key.
+    rv_key = |ZVSPTR{ iv_jobcount }|.
+  ENDMETHOD.
+
+
+  METHOD buffer_entries_json.
+    DATA lt_items TYPE string_table.
+    LOOP AT it_buffer INTO DATA(ls_buf) TO c_max_buffer_entries.
       APPEND zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
         ( zcl_vsp_utils=>json_str( iv_key = 'trkorr' iv_value = CONV #( ls_buf-trkorr ) ) )
         ( zcl_vsp_utils=>json_str( iv_key = 'tarcli' iv_value = CONV #( ls_buf-tarcli ) ) )
@@ -616,17 +802,131 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         ( zcl_vsp_utils=>json_str( iv_key = 'impflg' iv_value = CONV #( ls_buf-impflg ) ) )
       ) ) ) TO lt_items.
     ENDLOOP.
+    rv_json = zcl_vsp_utils=>json_arr( zcl_vsp_utils=>json_join( lt_items ) ).
+  ENDMETHOD.
 
-    rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
-      ( zcl_vsp_utils=>json_str( iv_key = 'system' iv_value = CONV #( sy-sysid ) ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'client' iv_value = CONV #( sy-mandt ) ) )
-      ( zcl_vsp_utils=>json_int( iv_key = 'total' iv_value = lv_total ) )
-      ( zcl_vsp_utils=>json_bool( iv_key = 'truncated' iv_value = xsdbool( lv_total > c_max_buffer_entries ) ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'tp_command' iv_value = lv_cmd ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'tp_rc' iv_value = lv_rc ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'tp_message' iv_value = lv_msg ) )
-      ( |"entries":{ zcl_vsp_utils=>json_arr( zcl_vsp_utils=>json_join( lt_items ) ) }| )
-    ) ) ) ).
+
+  METHOD run_job.
+    DATA: lv_jobcount TYPE tbtcm-jobcount,
+          lv_jobname  TYPE tbtcm-jobname,
+          ls_ticket   TYPE ty_ticket,
+          ls_res      TYPE ty_job_result,
+          lt_buffer   TYPE tt_tpbuffer,
+          lt_stdout   TYPE tt_tpstdout,
+          lt_addout   TYPE tt_tpstdout,
+          ls_indx     TYPE indx,
+          lv_error    TYPE string,
+          lv_sid      TYPE string,
+          lv_number   TYPE string,
+          lv_trkorr   TYPE trkorr,
+          lv_cmd      TYPE stpa-cmdstring,
+          lv_rc       TYPE stpa-retcode,
+          lv_msg      TYPE stpa-message,
+          lv_system   TYPE stpa-sysname.
+
+    " This system, and only ever this system (STPA-SYSNAME is CHAR10).
+    lv_system = sy-sysid.
+
+    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'
+      IMPORTING
+        jobcount        = lv_jobcount
+        jobname         = lv_jobname
+      EXCEPTIONS
+        no_runtime_info = 1
+        OTHERS          = 2.
+    IF sy-subrc <> 0 OR lv_jobname <> c_job_name.
+      RETURN.
+    ENDIF.
+    DATA(lv_key) = job_key( lv_jobcount ).
+
+    " The session commits the ticket when its message step ends, which may be
+    " a moment after the job started.
+    DO 30 TIMES.
+      IMPORT ticket = ls_ticket FROM DATABASE indx(zt) TO ls_indx ID lv_key.
+      IF sy-subrc = 0.
+        EXIT.
+      ENDIF.
+      WAIT UP TO 2 SECONDS.
+    ENDDO.
+    IF ls_ticket IS INITIAL.
+      RETURN.
+    ENDIF.
+    DELETE FROM DATABASE indx(zt) ID lv_key.
+    COMMIT WORK.
+
+    ls_res = VALUE #( action = ls_ticket-action request = ls_ticket-request system = CONV #( sy-sysid ) ).
+    read_buffer( IMPORTING et_buffer = lt_buffer et_stdout = lt_stdout ev_cmd = ls_res-tp_cmd
+                           ev_rc = ls_res-tp_rc ev_msg = ls_res-tp_msg ev_error = lv_error ).
+
+    IF lv_error IS NOT INITIAL.
+      ls_res-code = `BUFFER_READ_FAILED`.
+      ls_res-message = |The import buffer of { sy-sysid } could not be read: { lv_error }|.
+    ELSEIF ls_ticket-action = `ADD`.
+      ls_res-buffer_known = abap_true.
+      IF request_parts( EXPORTING iv_request = ls_ticket-request IMPORTING ev_sid = lv_sid ev_number = lv_number ) = abap_false.
+        ls_res-code = `INVALID_REQUEST`.
+        ls_res-message = |Request '{ ls_ticket-request }' is not <SID>K<6 digits>|.
+      ELSE.
+        lv_trkorr = ls_ticket-request.
+        IF line_exists( lt_buffer[ trkorr = lv_trkorr ] ).
+          " Never twice: a request already in the queue is left alone.
+          ls_res-in_buffer = abap_true.
+          ls_res-code = `ALREADY_IN_BUFFER`.
+          ls_res-message = |{ lv_trkorr } is already in the import buffer of { sy-sysid }; it was not added again.|.
+        ELSE.
+          " The one tp command this class sends. The command is a literal,
+          " the system is this one, and no option, client or flag is passed.
+          CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'
+            EXPORTING
+              iv_tp_command      = 'ADDTOBUFFER'
+              iv_system_name     = lv_system
+              iv_request         = lv_trkorr
+            IMPORTING
+              ev_tp_cmd_strg     = lv_cmd
+              ev_tp_ret_code     = lv_rc
+              ev_tp_message      = lv_msg
+            TABLES
+              tt_stdout          = lt_addout
+            EXCEPTIONS
+              invalid_command    = 1
+              permission_denied  = 2
+              tp_call_failed     = 3
+              tp_interface_error = 4
+              tp_reported_error  = 5
+              OTHERS             = 6.
+          DATA(lv_subrc) = sy-subrc.
+          DATA(lv_sysmsg) = COND string( WHEN lv_subrc <> 0 THEN last_message( ) ).
+          ls_res-tp_cmd = lv_cmd.
+          ls_res-tp_rc = lv_rc.
+          ls_res-tp_msg = lv_msg.
+          lt_stdout = lt_addout.
+          IF lv_subrc <> 0.
+            ls_res-code = SWITCH string( lv_subrc
+              WHEN 2 THEN `PERMISSION_DENIED`
+              WHEN 3 THEN `TP_CALL_FAILED`
+              WHEN 5 THEN `TP_REPORTED_ERROR`
+              ELSE `ADD_FAILED` ).
+            ls_res-message = |ADDTOBUFFER { lv_trkorr } { sy-sysid } failed ({ ls_res-code }, tp rc { lv_rc }): { lv_sysmsg } { lv_msg }|.
+            IF lv_subrc = 2.
+              ls_res-message = ls_res-message && ` -- adding to the buffer needs S_CTS_ADMI with CTS_ADMFCT TADD (or IMPT).`.
+            ENDIF.
+          ENDIF.
+          " Read back: on success it shows the line, on failure it says
+          " whether the files may be taken back.
+          CLEAR lt_buffer.
+          read_buffer( IMPORTING et_buffer = lt_buffer ev_error = lv_error ).
+          ls_res-buffer_known = xsdbool( lv_error IS INITIAL ).
+          ls_res-in_buffer = xsdbool( line_exists( lt_buffer[ trkorr = lv_trkorr ] ) ).
+          DELETE lt_buffer WHERE trkorr <> lv_trkorr.
+        ENDIF.
+      ENDIF.
+    ELSEIF ls_ticket-action <> `SHOW`.
+      ls_res-code = `INVALID_PARAM`.
+      ls_res-message = |Unknown job action '{ ls_ticket-action }'|.
+    ENDIF.
+
+    EXPORT result = ls_res buffer = lt_buffer stdout = lt_stdout TO DATABASE indx(zu) FROM ls_indx ID lv_key.
+    COMMIT WORK.
   ENDMETHOD.
 
 
@@ -959,6 +1259,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ev_error = SWITCH #( lv_subrc
         WHEN 4 THEN |no authorization (S_CTS_ADMI CTS_ADMFCT EPS1, or S_DATASET for the transport directory) { last_message( ) }|
         WHEN 7 THEN `the file already exists`
+        WHEN 6 THEN |the file could not be opened for writing in DIR_TRANS ({ lv_dir }): does the directory exist, writable by the SAP system's OS user? { last_message( ) }|
         ELSE |EPS_OPEN_OUTPUT_FILE failed (exception { lv_subrc }) { last_message( ) }| ).
       RETURN.
     ENDIF.

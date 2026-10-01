@@ -28,6 +28,12 @@ var transportServiceFunctions = map[string]bool{
 	"EPS_OPEN_INPUT_FILE":     true,
 	"TMS_TP_MAINTAIN_BUFFER":  true,
 	"TMS_TP_SHOW_BUFFER":      true,
+	// The tp step runs as a background job: an APC session may not make the
+	// synchronous RFC that starts tp.
+	"JOB_OPEN":             true,
+	"JOB_SUBMIT":           true,
+	"JOB_CLOSE":            true,
+	"GET_JOB_RUNTIME_INFO": true,
 }
 
 // tpCommands are tp commands (LSTPACON) and TMS buffer commands. Only
@@ -148,6 +154,16 @@ func checkTransportService(src string) []string {
 						bad = append(bad, "TMS_TP_SHOW_BUFFER: "+p+" must not be passed")
 					}
 				}
+			case "JOB_SUBMIT":
+				// The job runs this service's own step and nothing else.
+				if m := bindingRe("REPORT").FindStringSubmatch(up); m == nil || m[1] != "'ZVSP_TRANSPORT_BUFFER'" {
+					bad = append(bad, "JOB_SUBMIT: report must be the literal 'ZVSP_TRANSPORT_BUFFER'")
+				}
+				for _, p := range []string{"COMMANDNAME", "EXTPGM_NAME", "EXTPGM_PARAM", "VARIANT"} {
+					if regexp.MustCompile(`\b` + p + `\s*=`).MatchString(up) {
+						bad = append(bad, "JOB_SUBMIT: "+p+" must not be passed")
+					}
+				}
 			case "EPS_OPEN_OUTPUT_FILE", "EPS_DELETE_FILE":
 				// The directory is the logical one from dir_of, never a path.
 				if m := bindingRe("DIR_NAME").FindStringSubmatch(exporting); m == nil || m[1] != "LV_DIR" {
@@ -233,6 +249,36 @@ func transportServiceSource(t *testing.T) string {
 	return string(b)
 }
 
+// checkTransportJobProgram returns every rule the job program breaks: it is a
+// shim that calls run_job and does nothing else.
+func checkTransportJobProgram(src string) []string {
+	var bad []string
+	for _, st := range abapStatements(src) {
+		switch strings.ToUpper(st) {
+		case "", "REPORT ZVSP_TRANSPORT_BUFFER", "START-OF-SELECTION", "ZCL_VSP_TRANSPORT_SERVICE=>RUN_JOB( )":
+		default:
+			bad = append(bad, "statement in ZVSP_TRANSPORT_BUFFER beyond calling run_job: "+st)
+		}
+	}
+	return bad
+}
+
+func TestTransportJobProgramIsAShim(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "src", "zvsp_transport_buffer.prog.abap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range checkTransportJobProgram(string(b)) {
+		t.Error(e)
+	}
+	if len(checkTransportJobProgram(string(b)+"\nPARAMETERS p_req TYPE trkorr.\n")) == 0 {
+		t.Error("the guard accepted a parameter in the job program")
+	}
+	if len(checkTransportJobProgram(strings.Replace(string(b), "run_job( ).", "run_job( ).\n  SUBMIT zother AND RETURN.", 1))) == 0 {
+		t.Error("the guard accepted a SUBMIT in the job program")
+	}
+}
+
 func TestTransportServiceOnlyAddsToBuffer(t *testing.T) {
 	src := transportServiceSource(t)
 	for _, b := range checkTransportService(src) {
@@ -257,10 +303,12 @@ func TestTransportServiceGuardBites(t *testing.T) {
 	mutations := map[string]struct{ old, new string }{
 		"another tp command":      {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = 'IMPORT'`},
 		"command from a variable": {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = lv_cmd`},
-		"another system":          {"iv_system_name     = lv_system\n        iv_request", "iv_system_name     = lv_sid\n        iv_request"},
-		"lv_system not sy-sysid":  {"    lv_system = sy-sysid.\n\n    DATA(lv_request)", "    lv_system = lv_sid.\n\n    DATA(lv_request)"},
-		"lv_system changed later": {"    lv_trkorr = lv_request.\n", "    lv_trkorr = lv_request.\n    CONCATENATE lv_sid space INTO lv_system.\n"},
-		"tp options":              {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n        iv_tp_options      = lv_msg\n"},
+		"another system":          {"iv_system_name     = lv_system\n              iv_request", "iv_system_name     = lv_sid\n              iv_request"},
+		"lv_system not sy-sysid":  {"    lv_system = sy-sysid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'", "    lv_system = lv_sid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'"},
+		"lv_system changed later": {"        lv_trkorr = ls_ticket-request.\n", "        lv_trkorr = ls_ticket-request.\n        CONCATENATE lv_sid space INTO lv_system.\n"},
+		"tp options":              {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_tp_options      = lv_msg\n"},
+		"job runs another report": {"report            = 'ZVSP_TRANSPORT_BUFFER'", "report            = 'RSBDCSUB'"},
+		"job runs a command":      {"report            = 'ZVSP_TRANSPORT_BUFFER'\n", "report            = 'ZVSP_TRANSPORT_BUFFER'\n        commandname       = 'ZCMD'\n"},
 		"a second tp FM":          {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'", "    CALL FUNCTION 'TRINT_TP_INTERFACE'"},
 		"dynamic call":            {"CALL FUNCTION 'EPS_DELETE_FILE'", "CALL FUNCTION lv_fm"},
 		"overwrite":               {"overwrite_mode         = space", "overwrite_mode         = 'F'"},

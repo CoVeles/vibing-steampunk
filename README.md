@@ -497,7 +497,10 @@ the ABAP source enforces. Refused under `--read-only` and
 `--transport-read-only`; needs `--enable-transports`; `--allowed-transports`
 applies to the request. On the system it needs ZADT_VSP (redeploy:
 `vsp install zadt-vsp`) and `S_CTS_ADMI` with `EPS1` (files) and `TADD`
-(buffer). If the buffer add fails while the request is certainly not in the
+(buffer). tp is started over synchronous RFC, which a ZADT_VSP (APC) session
+may not do, so the buffer step -- the add, and the read behind
+`transport_buffer` -- runs as background job `ZVSP_TRANSPORT_BUFFER` under
+the caller's user (`S_BTCH_JOB` to release it); vsp waits for its result. If the buffer add fails while the request is certainly not in the
 buffer, the two files this upload wrote are deleted again. Taking a request
 out of the queue again is done in STMS.
 

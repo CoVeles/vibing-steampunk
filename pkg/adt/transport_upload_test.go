@@ -253,7 +253,13 @@ type fakeTransportWS struct {
 	buffer       []map[string]any
 	files        map[string][]byte // download source
 	got          map[string][]byte
+	// pending is the job add_to_buffer or show_buffer started; the first
+	// buffer_result poll for it answers "pending".
+	pending map[string]any
+	polls   int
 }
+
+func init() { transportPollInterval = time.Millisecond }
 
 func newFakeTransportWS() *fakeTransportWS {
 	return &fakeTransportWS{system: "QAS", client: "100", got: map[string][]byte{}}
@@ -296,20 +302,34 @@ func (f *fakeTransportWS) SendDomainRequest(_ context.Context, domain, action st
 		case "abort":
 			return ok(map[string]any{"aborted": true})
 		}
-	case "add_to_buffer":
-		if f.addErr != nil {
-			return &WSResponse{Success: false, Error: f.addErr}, nil
+	case "add_to_buffer", "show_buffer":
+		p["action"] = action
+		f.pending, f.polls = p, 0
+		return ok(map[string]any{"status": "started", "ticket": "4711", "job": "ZVSP_TRANSPORT_BUFFER"})
+	case "buffer_result":
+		if f.pending == nil || p["ticket"] != "4711" {
+			return &WSResponse{Success: false, Error: &WSError{Code: "NO_SUCH_JOB", Message: "none"}}, nil
 		}
-		f.buffer = append(f.buffer, map[string]any{"trkorr": p["request"], "tarcli": ""})
-		return ok(map[string]any{"request": p["request"], "system": f.system, "tp_command": "ADDTOBUFFER " + p["request"].(string) + " " + f.system, "tp_rc": "0000"})
-	case "show_buffer":
+		if f.polls++; f.polls == 1 {
+			return ok(map[string]any{"status": "pending", "job_status": "R"})
+		}
+		job := f.pending
+		f.pending = nil
+		if job["action"] == "add_to_buffer" {
+			if f.addErr != nil {
+				return &WSResponse{Success: false, Error: f.addErr}, nil
+			}
+			f.buffer = append(f.buffer, map[string]any{"trkorr": job["request"], "tarcli": ""})
+			return ok(map[string]any{"status": "done", "request": job["request"], "system": f.system,
+				"tp_command": "ADDTOBUFFER " + job["request"].(string) + " " + f.system, "tp_rc": "0000"})
+		}
 		var entries []map[string]any
 		for _, e := range f.buffer {
-			if r, _ := p["request"].(string); r == "" || e["trkorr"] == r {
+			if r, _ := job["request"].(string); r == "" || e["trkorr"] == r {
 				entries = append(entries, e)
 			}
 		}
-		return ok(map[string]any{"system": f.system, "client": f.client, "total": len(entries), "entries": entries})
+		return ok(map[string]any{"status": "done", "system": f.system, "client": f.client, "total": len(entries), "entries": entries})
 	case "download_files":
 		name := p["file"].(string)
 		data := f.files[name]
@@ -377,7 +397,8 @@ func TestUploadTransportHappyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"upload_files:begin", "upload_files:chunk", "upload_files:chunk", "upload_files:chunk",
-		"upload_files:chunk", "upload_files:commit", "add_to_buffer", "show_buffer"}
+		"upload_files:chunk", "upload_files:commit", "add_to_buffer", "buffer_result", "buffer_result",
+		"show_buffer", "buffer_result", "buffer_result"}
 	if got := ws.actions(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("conversation:\n got %v\nwant %v", got, want)
 	}
@@ -491,4 +512,25 @@ func TestTransportBufferAndDownload(t *testing.T) {
 	if _, err := uploadClient(UnrestrictedSafetyConfig()).DownloadTransportFiles(context.Background(), ws, "XYZK900001"); err == nil {
 		t.Error("download without --enable-transports accepted")
 	}
+}
+
+// A buffer job that never reports is not taken for success or failure.
+func TestTransportJobTimeout(t *testing.T) {
+	saved := transportJobTimeout
+	transportJobTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { transportJobTimeout = saved })
+	ws := stuckJobWS{}
+	_, err := uploadClient(enabled()).TransportBuffer(context.Background(), ws, "")
+	if err == nil || !strings.Contains(err.Error(), "SM37") || !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("got %v", err)
+	}
+}
+
+type stuckJobWS struct{}
+
+func (stuckJobWS) SendDomainRequest(_ context.Context, _, action string, _ map[string]any, _ time.Duration) (*WSResponse, error) {
+	if action == "buffer_result" {
+		return &WSResponse{Success: true, Data: []byte(`{"status":"pending","job_status":"S"}`)}, nil
+	}
+	return &WSResponse{Success: true, Data: []byte(`{"status":"started","ticket":"4711","job":"ZVSP_TRANSPORT_BUFFER"}`)}, nil
 }

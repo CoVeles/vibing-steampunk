@@ -463,7 +463,7 @@ var installCmd = &cobra.Command{
 	Long: `Install software components to a SAP system.
 
 Subcommands:
-  zadt-vsp    Install ZADT_VSP WebSocket handler (9 ABAP objects)
+  zadt-vsp    Install ZADT_VSP WebSocket handler (11 ABAP objects)
   abapgit     Install abapGit standalone or full edition
   list        List available installable components
 
@@ -480,10 +480,11 @@ var installZadtVspCmd = &cobra.Command{
 	Short: "Install ZADT_VSP WebSocket handler",
 	Long: `Install the ZADT_VSP WebSocket handler to enable advanced features.
 
-Deploys 9 ABAP objects (1 interface, 8 classes) in dependency order:
+Deploys 11 ABAP objects (1 interface, 9 classes, 1 program) in dependency order:
   ZIF_VSP_SERVICE, ZCL_VSP_UTILS, ZCL_VSP_TADIR_MOVE, ZCL_VSP_RFC_SERVICE,
   ZCL_VSP_DEBUG_SERVICE, ZCL_VSP_AMDP_SERVICE, ZCL_VSP_GIT_SERVICE,
-  ZCL_VSP_REPORT_SERVICE, ZCL_VSP_APC_HANDLER
+  ZCL_VSP_REPORT_SERVICE, ZCL_VSP_TRANSPORT_SERVICE, ZVSP_TRANSPORT_BUFFER,
+  ZCL_VSP_APC_HANDLER
 
 Features unlocked after install:
   - WebSocket debugging (TPDAPI)
