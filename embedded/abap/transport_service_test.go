@@ -31,8 +31,13 @@ var transportServiceFunctions = map[string]bool{
 	"TMS_TP_SHOW_BUFFER":         true,
 	// The tp step runs as a background job: an APC session may not make the
 	// synchronous RFC that starts tp.
-	"JOB_OPEN":             true,
-	"JOB_CLOSE":            true,
+	"JOB_OPEN":   true,
+	"JOB_SUBMIT": true,
+	"JOB_CLOSE":  true,
+	// The job step's parameters: a protected variant per job (an APC
+	// session may not SUBMIT), deleted once its job has ended.
+	"RS_CREATE_VARIANT":    true,
+	"RS_VARIANT_DELETE":    true,
 	"GET_JOB_RUNTIME_INFO": true,
 	// The request's lock (lock object E_TRKORR) around check-and-write.
 	"ENQUEUE_E_TRKORR": true,
@@ -209,7 +214,15 @@ func checkTransportService(src string) []string {
 						bad = append(bad, "TMS_TP_SHOW_BUFFER: "+p+" must not be passed")
 					}
 				}
+			case "RS_CREATE_VARIANT", "RS_VARIANT_DELETE":
+				key := map[string]string{"RS_CREATE_VARIANT": "CURR_REPORT", "RS_VARIANT_DELETE": "REPORT"}[name]
+				if m := bindingRe(key).FindStringSubmatch(up); m == nil || m[1] != "'ZVSP_TRANSPORT_BUFFER'" {
+					bad = append(bad, name+": only variants of 'ZVSP_TRANSPORT_BUFFER'")
+				}
 			case "JOB_SUBMIT":
+				if m := bindingRe("VARIANT").FindStringSubmatch(up); m == nil || m[1] != "LV_VARIANT" {
+					bad = append(bad, "JOB_SUBMIT: variant must be lv_variant, the job's own")
+				}
 				// The step runs as the caller, or JOB_SUBMIT's default.
 				for _, m := range bindingRe("AUTHCKNAM").FindAllStringSubmatch(up, -1) {
 					if m[1] != "SY-UNAME" {
@@ -220,7 +233,7 @@ func checkTransportService(src string) []string {
 				if m := bindingRe("REPORT").FindStringSubmatch(up); m == nil || m[1] != "'ZVSP_TRANSPORT_BUFFER'" {
 					bad = append(bad, "JOB_SUBMIT: report must be the literal 'ZVSP_TRANSPORT_BUFFER'")
 				}
-				for _, p := range []string{"COMMANDNAME", "EXTPGM_NAME", "EXTPGM_PARAM", "VARIANT"} {
+				for _, p := range []string{"COMMANDNAME", "EXTPGM_NAME", "EXTPGM_PARAM"} {
 					if regexp.MustCompile(`\b` + p + `\s*=`).MatchString(up) {
 						bad = append(bad, "JOB_SUBMIT: "+p+" must not be passed")
 					}
@@ -251,18 +264,14 @@ func checkTransportService(src string) []string {
 				bad = append(bad, "lv_system used other than declared, set from sy-sysid, or passed as iv_system_name: "+st)
 			}
 		}
-		// The one SUBMIT: the job step, this service's own report, as the
-		// caller, scheduled -- never run here.
+		// No SUBMIT: an APC session may not execute one, and the job step is
+		// scheduled through JOB_SUBMIT.
 		if strings.HasPrefix(up, "SUBMIT ") || strings.Contains(up, " SUBMIT ") {
-			ok := strings.HasPrefix(up, "SUBMIT ('ZVSP_TRANSPORT_BUFFER') ") && strings.Contains(up, " VIA JOB ") && strings.HasSuffix(up, " AND RETURN")
-			for _, kw := range []string{" USER ", " USING SELECTION-SET", " WITH SELECTION-TABLE", " TO SAP-SPOOL", " EXPORTING LIST", " VIA SELECTION-SCREEN"} {
-				if strings.Contains(up, kw) {
-					ok = false
-				}
-			}
-			if !ok {
-				bad = append(bad, "SUBMIT other than the job step SUBMIT ('ZVSP_TRANSPORT_BUFFER') ... VIA JOB ... AND RETURN: "+st)
-			}
+			bad = append(bad, "SUBMIT in the transport service: "+st)
+		}
+		// The variant that carries the step's parameters is protected.
+		if strings.HasPrefix(up, "LS_VARID = VALUE #(") && !strings.Contains(up, "PROTECTED = 'X'") {
+			bad = append(bad, "the job's variant must be protected: "+st)
 		}
 		// No cluster or table write: nothing is handed over through the
 		// database.
@@ -373,7 +382,7 @@ func checkTransportJobProgram(src string) []string {
 	for _, st := range abapStatements(src) {
 		switch strings.ToUpper(st) {
 		case "", "REPORT ZVSP_TRANSPORT_BUFFER", "START-OF-SELECTION",
-			"PARAMETERS: P_REQ TYPE TRKORR NO-DISPLAY, P_SHAC TYPE C LENGTH 64 NO-DISPLAY, P_SHAD TYPE C LENGTH 64 NO-DISPLAY",
+			"PARAMETERS: P_REQ TYPE TRKORR, P_SHAC TYPE C LENGTH 44 LOWER CASE, P_SHAD TYPE C LENGTH 44 LOWER CASE",
 			"ZCL_VSP_TRANSPORT_SERVICE=>RUN_JOB( IV_REQUEST = P_REQ IV_COFILE_SHA = P_SHAC IV_DATA_SHA = P_SHAD )":
 		default:
 			bad = append(bad, "statement in ZVSP_TRANSPORT_BUFFER beyond calling run_job: "+st)
@@ -427,11 +436,13 @@ func TestTransportServiceGuardBites(t *testing.T) {
 		"lv_system changed later":                 {"    lv_trkorr = ls_res-request.\n", "    lv_trkorr = ls_res-request.\n    CONCATENATE lv_sid space INTO lv_system.\n"},
 		"tp options":                              {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_tp_options      = lv_msg\n"},
 		"tp step on another system (DESTINATION)": {"      CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'\n", "      CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER' DESTINATION 'NONE'\n"},
-		"job step as another user":                {"      AND RETURN.\n", "      USER 'DDIC'\n      AND RETURN.\n"},
+		"job step as another user":                {"        authcknam         = sy-uname\n", "        authcknam         = 'DDIC'\n"},
 		"tp parameter outside the allow-list":     {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_prid_text       = lv_msg\n"},
 		"buffer read in a new task":               {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'\n", "    CALL FUNCTION 'TMS_TP_SHOW_BUFFER' STARTING NEW TASK 'T'\n"},
-		"job runs another report":                 {"SUBMIT ('ZVSP_TRANSPORT_BUFFER')", "SUBMIT ('RSBDCSUB')"},
-		"job step run here, not as a job":         {"      VIA JOB lv_jobname NUMBER lv_jobcount\n", ""},
+		"job runs another report":                 {"        report            = 'ZVSP_TRANSPORT_BUFFER'\n", "        report            = 'RSBDCSUB'\n"},
+		"variant not protected":                   {"environmnt = 'B' protected = 'X'", "environmnt = 'B' protected = space"},
+		"a SUBMIT after all":                      {"    ev_jobcount = lv_jobcount.\n", "    ev_jobcount = lv_jobcount.\n    SUBMIT ('ZVSP_TRANSPORT_BUFFER') VIA JOB lv_jobname NUMBER lv_jobcount AND RETURN.\n"},
+		"another report's variant":                {"        curr_report               = 'ZVSP_TRANSPORT_BUFFER'\n", "        curr_report               = 'RSBDCSUB'\n"},
 		"a ticket through the database":           {"    ev_jobcount = lv_jobcount.\n", "    ev_jobcount = lv_jobcount.\n    EXPORT p = lv_req TO DATABASE indx(zt) ID lv_req.\n"},
 		"a second tp FM":                          {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'", "    CALL FUNCTION 'TRINT_TP_INTERFACE'"},
 		"dynamic call":                            {"CALL FUNCTION 'EPS_DELETE_FILE'", "CALL FUNCTION lv_fm"},
@@ -556,7 +567,8 @@ func TestTransportServiceAsyncOutcome(t *testing.T) {
 func TestJobChecksFilesBeforeAdd(t *testing.T) {
 	stmts := abapStatements(transportServiceSource(t))
 	start := strings.ToUpper(strings.Join(methodStatements(stmts, "START_JOB"), "\n"))
-	for _, want := range []string{"WITH P_REQ = LV_REQ", "WITH P_SHAC = LV_SHAC", "WITH P_SHAD = LV_SHAD", "VIA JOB LV_JOBNAME NUMBER LV_JOBCOUNT"} {
+	for _, want := range []string{"SELNAME = 'P_REQ'", "LOW = IV_REQUEST", "SELNAME = 'P_SHAC'", "LOW = SHA_B64( IV_COFILE_SHA )",
+		"SELNAME = 'P_SHAD'", "LOW = SHA_B64( IV_DATA_SHA )", "VARIANT = LV_VARIANT"} {
 		if !strings.Contains(start, want) {
 			t.Errorf("start_job does not bind %q to the job step", want)
 		}
@@ -565,7 +577,7 @@ func TestJobChecksFilesBeforeAdd(t *testing.T) {
 	check, add := -1, -1
 	for i, st := range job {
 		up := strings.ToUpper(st)
-		if check < 0 && strings.Contains(up, "SHA256( LV_CONTENT ) <>") {
+		if check < 0 && strings.Contains(up, "SHA_B64( SHA256( LV_CONTENT ) ) <>") {
 			check = i
 		}
 		if add < 0 && strings.HasPrefix(up, "CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'") {

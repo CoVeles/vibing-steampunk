@@ -280,6 +280,11 @@ CLASS zcl_vsp_transport_service DEFINITION
       IMPORTING iv_data        TYPE xstring
       RETURNING VALUE(rv_hash) TYPE string.
 
+    "! A SHA-256 in hex, as base64 (44 characters).
+    CLASS-METHODS sha_b64
+      IMPORTING iv_hex        TYPE csequence
+      RETURNING VALUE(rv_b64) TYPE string.
+
     CLASS-METHODS last_message
       RETURNING VALUE(rv_text) TYPE string.
 
@@ -728,15 +733,13 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     DATA: lv_jobname  TYPE tbtcjob-jobname,
           lv_jobcount TYPE tbtcjob-jobcount,
           lv_released TYPE btch0000-char1,
-          lv_req      TYPE trkorr,
-          lv_shac     TYPE c LENGTH 64,
-          lv_shad     TYPE c LENGTH 64.
+          lv_variant  TYPE rsvar-variant,
+          ls_varid    TYPE varid,
+          lt_contents TYPE STANDARD TABLE OF rsparams WITH DEFAULT KEY,
+          lt_text     TYPE STANDARD TABLE OF varit WITH DEFAULT KEY.
 
     CLEAR: ev_jobcount, ev_error.
     lv_jobname = c_job_name.
-    lv_req = iv_request.
-    lv_shac = iv_cofile_sha.
-    lv_shad = iv_data_sha.
     CALL FUNCTION 'JOB_OPEN'
       EXPORTING
         jobname          = lv_jobname
@@ -752,17 +755,82 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    " What the job is to do is bound to its step here, as selection
-    " parameters: the request, and the SHA-256 of the two files as written.
-    " The step runs as the caller.
-    SUBMIT ('ZVSP_TRANSPORT_BUFFER')
-      WITH p_req  = lv_req
-      WITH p_shac = lv_shac
-      WITH p_shad = lv_shad
-      VIA JOB lv_jobname NUMBER lv_jobcount
-      AND RETURN.
+    " What the job is to do is bound to its step: a protected variant (only
+    " its creator may change it) of ZVSP_TRANSPORT_BUFFER, named after the
+    " job, holding the request and the SHA-256 of the two files as written
+    " (base64: a variant value is at most 45 characters). The next upload
+    " deletes it once the job has ended.
+    " SUBMIT ... VIA JOB would bind them directly, but an APC session may not
+    " execute SUBMIT.
+    " Housekeeping first: the variants of earlier jobs that have ended (a
+    " running job cannot delete its own).
+    SELECT variant FROM varid INTO TABLE @DATA(lt_old)
+      WHERE report = 'ZVSP_TRANSPORT_BUFFER' AND variant LIKE 'VSP%'.
+    LOOP AT lt_old INTO DATA(ls_old).
+      DATA(lv_oldcount) = CONV tbtcjob-jobcount( ls_old-variant+3 ).
+      SELECT SINGLE status FROM tbtco INTO @DATA(lv_oldstatus)
+        WHERE jobname = @lv_jobname AND jobcount = @lv_oldcount.
+      IF sy-subrc <> 0 OR lv_oldstatus = 'F' OR lv_oldstatus = 'A'.
+        CALL FUNCTION 'RS_VARIANT_DELETE'
+          EXPORTING
+            report                = 'ZVSP_TRANSPORT_BUFFER'
+            variant               = ls_old-variant
+            flag_confirmscreen    = 'X'
+            suppress_message      = 'X'
+            suppress_input_dialog = 'X'
+          EXCEPTIONS
+            OTHERS                = 1.
+      ENDIF.
+    ENDLOOP.
+
+    lv_variant = |VSP{ lv_jobcount }|.
+    ls_varid = VALUE #( report = 'ZVSP_TRANSPORT_BUFFER' variant = lv_variant environmnt = 'B' protected = 'X' ).
+    lt_contents = VALUE #(
+      ( selname = 'P_REQ'  kind = 'P' sign = 'I' option = 'EQ' low = iv_request )
+      ( selname = 'P_SHAC' kind = 'P' sign = 'I' option = 'EQ' low = sha_b64( iv_cofile_sha ) )
+      ( selname = 'P_SHAD' kind = 'P' sign = 'I' option = 'EQ' low = sha_b64( iv_data_sha ) ) ).
+    lt_text = VALUE #( ( langu = sy-langu report = 'ZVSP_TRANSPORT_BUFFER' variant = lv_variant vtext = |vsp upload { iv_request }| ) ).
+    CALL FUNCTION 'RS_CREATE_VARIANT'
+      EXPORTING
+        curr_report               = 'ZVSP_TRANSPORT_BUFFER'
+        curr_variant              = lv_variant
+        vari_desc                 = ls_varid
+      TABLES
+        vari_contents             = lt_contents
+        vari_text                 = lt_text
+      EXCEPTIONS
+        illegal_report_or_variant = 1
+        illegal_variantname       = 2
+        not_authorized            = 3
+        not_executed              = 4
+        report_not_existent       = 5
+        report_not_supplied       = 6
+        variant_exists            = 7
+        variant_locked            = 8
+        OTHERS                    = 9.
     IF sy-subrc <> 0.
-      ev_error = |SUBMIT ZVSP_TRANSPORT_BUFFER VIA JOB failed (sy-subrc { sy-subrc }) { last_message( ) }|.
+      ev_error = |RS_CREATE_VARIANT { lv_variant } failed (exception { sy-subrc }) { last_message( ) }|.
+      RETURN.
+    ENDIF.
+
+    CALL FUNCTION 'JOB_SUBMIT'
+      EXPORTING
+        authcknam         = sy-uname
+        jobcount          = lv_jobcount
+        jobname           = lv_jobname
+        report            = 'ZVSP_TRANSPORT_BUFFER'
+        variant           = lv_variant
+      EXCEPTIONS
+        bad_priparams     = 1
+        bad_xpgflags      = 2
+        invalid_jobdata   = 3
+        jobname_missing   = 4
+        job_notex         = 5
+        job_submit_failed = 6
+        lock_failed       = 7
+        OTHERS            = 8.
+    IF sy-subrc <> 0.
+      ev_error = |JOB_SUBMIT failed (exception { sy-subrc }) { last_message( ) }|.
       RETURN.
     ENDIF.
 
@@ -890,11 +958,12 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     ENDIF.
 
     ls_res = VALUE #( request = to_upper( iv_request ) system = CONV #( sy-sysid ) job = CONV #( lv_jobcount ) ).
-    DATA(lv_shac) = to_upper( condense( CONV string( iv_cofile_sha ) ) ).
-    DATA(lv_shad) = to_upper( condense( CONV string( iv_data_sha ) ) ).
-    FIND PCRE '^[0-9A-F]{64}\z' IN lv_shac.
+    " The SHA-256 of the two files as the upload wrote them, in base64.
+    DATA(lv_shac) = condense( CONV string( iv_cofile_sha ) ).
+    DATA(lv_shad) = condense( CONV string( iv_data_sha ) ).
+    FIND PCRE '^[A-Za-z0-9+/]{43}=\z' IN lv_shac.
     DATA(lv_sha_ok) = xsdbool( sy-subrc = 0 ).
-    FIND PCRE '^[0-9A-F]{64}\z' IN lv_shad.
+    FIND PCRE '^[A-Za-z0-9+/]{43}=\z' IN lv_shad.
     lv_sha_ok = xsdbool( lv_sha_ok = abap_true AND sy-subrc = 0 ).
     IF request_parts( EXPORTING iv_request = ls_res-request IMPORTING ev_sid = lv_sid ev_number = lv_number ) = abap_false
        OR lv_sha_ok = abap_false.
@@ -912,7 +981,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     LOOP AT lt_files INTO DATA(lv_kind).
       DATA(lv_name) = COND string( WHEN lv_kind = `cofile` THEN |K{ lv_number }.{ lv_sid }| ELSE |R{ lv_number }.{ lv_sid }| ).
       read_dir_file( EXPORTING iv_kind = lv_kind iv_name = lv_name IMPORTING ev_content = lv_content ev_error = lv_error ).
-      IF lv_error IS INITIAL AND sha256( lv_content ) <> COND string( WHEN lv_kind = `cofile` THEN lv_shac ELSE lv_shad ).
+      IF lv_error IS INITIAL AND sha_b64( sha256( lv_content ) ) <> COND string( WHEN lv_kind = `cofile` THEN lv_shac ELSE lv_shad ).
         lv_error = |{ lv_name } is not the file the upload wrote (SHA-256 differs)|.
       ENDIF.
       IF lv_error IS NOT INITIAL.
@@ -995,8 +1064,10 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         " Certainly not in the buffer: the upload's files go again, so that
         " the same pair can be uploaded once more.
         ls_res-outcome = `not_added`.
-        DATA(lv_del1) = delete_file( iv_kind = `cofile` iv_name = |K{ lv_number }.{ lv_sid }| iv_sha = lv_shac ).
-        DATA(lv_del2) = delete_file( iv_kind = `data` iv_name = |R{ lv_number }.{ lv_sid }| iv_sha = lv_shad ).
+        DATA(lv_del1) = delete_file( iv_kind = `cofile` iv_name = |K{ lv_number }.{ lv_sid }|
+                                     iv_sha = CONV string( cl_http_utility=>decode_x_base64( lv_shac ) ) ).
+        DATA(lv_del2) = delete_file( iv_kind = `data` iv_name = |R{ lv_number }.{ lv_sid }|
+                                     iv_sha = CONV string( cl_http_utility=>decode_x_base64( lv_shad ) ) ).
         ls_res-rolled_back = xsdbool( lv_del1 IS INITIAL AND lv_del2 IS INITIAL ).
         IF ls_res-rolled_back = abap_false.
           ls_res-message = |{ ls_res-message } Files not taken back: { lv_del1 } { lv_del2 }|.
@@ -1798,6 +1869,17 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         rv_hash = to_upper( lv_hash ).
       CATCH cx_abap_message_digest.
         CLEAR rv_hash.
+    ENDTRY.
+  ENDMETHOD.
+
+
+  METHOD sha_b64.
+    DATA lv_raw TYPE xstring.
+    TRY.
+        lv_raw = to_upper( iv_hex ).
+        rv_b64 = cl_http_utility=>encode_x_base64( lv_raw ).
+      CATCH cx_root.
+        CLEAR rv_b64.
     ENDTRY.
   ENDMETHOD.
 
