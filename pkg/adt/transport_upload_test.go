@@ -23,6 +23,26 @@ const sampleCofile = "#$PROJECT = \n" +
 	"XYZ.100 E 0004 20260101120000 dev.example.local xyzadm\n" +
 	"XYZ.100 R 0000 20260101120001 dev.example.local xyzadm\n"
 
+// realCofile is a cofile SAP wrote on release (7.58), with the system, user
+// and host replaced: XYZ exported to QAS. Its header runs past the nine
+// object counts, and it has '#' lines after the header.
+const realCofile = "TESTUSER     K QAS        1   1   2   0   0   0   0   0   0   2  758   .  0   0   0   0   0 001\n" +
+	"#U\n" +
+	"#/1/                          A   G   -   C   R   7   T   -   Z RELE EX.  _   _   _   _   _ CLI\n" +
+	"XYZ f 0000 20261001165403 dev.example.local       xyzadm\n" +
+	"XYZ e 0000 20261001165406 dev.example.local       xyzadm\n" +
+	"QAS < 0000 20261001165410 dev.example.local       xyzadm\n" +
+	"XYZ E 0000 20261001165410 dev.example.local       xyzadm\n"
+
+func TestValidateCofileAcceptsWhatSAPWrites(t *testing.T) {
+	if err := ValidateCofile([]byte(realCofile), "XYZ"); err != nil {
+		t.Fatalf("a cofile SAP wrote is refused: %v", err)
+	}
+	if err := ValidateCofile([]byte(realCofile), "ABC"); err == nil {
+		t.Error("the same cofile accepted for another source system")
+	}
+}
+
 func sampleData() []byte { return []byte("\x00\x01binary R3trans payload\xff\xfe") }
 
 func TestTransportRequestFromFileNames(t *testing.T) {
@@ -302,7 +322,17 @@ func (f *fakeTransportWS) SendDomainRequest(_ context.Context, domain, action st
 		case "abort":
 			return ok(map[string]any{"aborted": true})
 		}
-	case "add_to_buffer", "show_buffer":
+	case "show_buffer":
+		// A read of the buffer file: one message, one answer, no job.
+		var entries []map[string]any
+		for _, e := range f.buffer {
+			if r, _ := p["request"].(string); r == "" || e["trkorr"] == r {
+				entries = append(entries, e)
+			}
+		}
+		return ok(map[string]any{"status": "done", "system": f.system, "client": f.client, "source": "DIR_TRANS/buffer/" + f.system,
+			"file_exists": true, "total": len(entries), "entries": entries})
+	case "add_to_buffer":
 		p["action"] = action
 		f.pending, f.polls = p, 0
 		return ok(map[string]any{"status": "started", "ticket": "4711", "job": "ZVSP_TRANSPORT_BUFFER"})
@@ -323,13 +353,7 @@ func (f *fakeTransportWS) SendDomainRequest(_ context.Context, domain, action st
 			return ok(map[string]any{"status": "done", "request": job["request"], "system": f.system,
 				"tp_command": "ADDTOBUFFER " + job["request"].(string) + " " + f.system, "tp_rc": "0000"})
 		}
-		var entries []map[string]any
-		for _, e := range f.buffer {
-			if r, _ := job["request"].(string); r == "" || e["trkorr"] == r {
-				entries = append(entries, e)
-			}
-		}
-		return ok(map[string]any{"status": "done", "system": f.system, "client": f.client, "total": len(entries), "entries": entries})
+		return &WSResponse{Success: false, Error: &WSError{Code: "INVALID_PARAM", Message: "job action"}}, nil
 	case "download_files":
 		name := p["file"].(string)
 		data := f.files[name]
@@ -398,7 +422,7 @@ func TestUploadTransportHappyPath(t *testing.T) {
 	}
 	want := []string{"upload_files:begin", "upload_files:chunk", "upload_files:chunk", "upload_files:chunk",
 		"upload_files:chunk", "upload_files:commit", "add_to_buffer", "buffer_result", "buffer_result",
-		"show_buffer", "buffer_result", "buffer_result"}
+		"show_buffer"}
 	if got := ws.actions(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("conversation:\n got %v\nwant %v", got, want)
 	}
@@ -501,6 +525,10 @@ func TestTransportBufferAndDownload(t *testing.T) {
 	if _, ok := buf.Contains("XYZK900001"); !ok {
 		t.Error("Contains")
 	}
+	// The view is a plain read: one show_buffer message, no job, no polling.
+	if got := strings.Join(ws.actions(), ","); got != "show_buffer" {
+		t.Errorf("a buffer view sent %s", got)
+	}
 
 	data := bytes.Repeat([]byte{7}, transportDownloadChunk+10)
 	ws.files = map[string][]byte{"cofile": []byte(sampleCofile), "data": data}
@@ -520,7 +548,7 @@ func TestTransportJobTimeout(t *testing.T) {
 	transportJobTimeout = 20 * time.Millisecond
 	t.Cleanup(func() { transportJobTimeout = saved })
 	ws := stuckJobWS{}
-	_, err := uploadClient(enabled()).TransportBuffer(context.Background(), ws, "")
+	err := transportJob(context.Background(), ws, "add_to_buffer", map[string]any{"request": "XYZK900001"}, &struct{}{})
 	if err == nil || !strings.Contains(err.Error(), "SM37") || !strings.Contains(err.Error(), "unknown") {
 		t.Errorf("got %v", err)
 	}

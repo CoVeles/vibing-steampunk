@@ -172,7 +172,13 @@ func validateCofileHeader(f []string) error {
 	if !cofileStepRe.MatchString(f[3]) {
 		return fmt.Errorf("step %q is not one of 0, 1, 2, 3", f[3])
 	}
-	for _, n := range f[4:] {
+	// Nine object counts follow the step, which is what STRF_READ_COFILE
+	// reads; a real header goes on (release, flags, client) and that is not
+	// checked.
+	for i, n := range f[4:] {
+		if i == 9 {
+			break
+		}
 		if !digitsRe.MatchString(n) {
 			return fmt.Errorf("object count %q is not a number", n)
 		}
@@ -344,15 +350,21 @@ type TransportBufferEntry struct {
 	ReturnCode string `json:"returnCode,omitempty"`
 	Step       string `json:"step,omitempty"`
 	ImpFlag    string `json:"impflg,omitempty"`
+	// Raw is the buffer file's line for the request.
+	Raw string `json:"raw,omitempty"`
 }
 
 // TransportBufferResult is a read of the connected system's import buffer.
 type TransportBufferResult struct {
-	System  string                 `json:"system"`
-	Client  string                 `json:"client"`
-	Request string                 `json:"request,omitempty"`
-	Total   int                    `json:"total"`
-	Entries []TransportBufferEntry `json:"entries"`
+	System string `json:"system"`
+	Client string `json:"client"`
+	// Source is the file read, DIR_TRANS/buffer/<SID>; FileExists is false
+	// when there is none (nothing was ever queued for the system).
+	Source     string                 `json:"source,omitempty"`
+	FileExists bool                   `json:"fileExists"`
+	Request    string                 `json:"request,omitempty"`
+	Total      int                    `json:"total"`
+	Entries    []TransportBufferEntry `json:"entries"`
 	// Truncated says there were more entries than were returned.
 	Truncated bool               `json:"truncated,omitempty"`
 	TP        *TransportTPResult `json:"tp,omitempty"`
@@ -395,9 +407,9 @@ func transportCall(ctx context.Context, ws TransportService, action string, para
 }
 
 // The tp step does not run in the ZADT_VSP session: tp is started over
-// synchronous RFC, which an ABAP Push Channel may not do. add_to_buffer and
-// show_buffer schedule background job ZVSP_TRANSPORT_BUFFER and answer with a
-// ticket; buffer_result answers "pending" until the job has stored its result.
+// synchronous RFC, which an ABAP Push Channel may not do. add_to_buffer
+// schedules background job ZVSP_TRANSPORT_BUFFER and answers with a ticket;
+// buffer_result answers "pending" until the job has stored its result.
 var (
 	transportPollInterval = 2 * time.Second
 	transportJobTimeout   = 5 * time.Minute
@@ -481,11 +493,13 @@ type transportAddAnswer struct {
 }
 
 type transportBufferAnswer struct {
-	System    string `json:"system"`
-	Client    string `json:"client"`
-	Total     int    `json:"total"`
-	Truncated bool   `json:"truncated"`
-	Entries   []struct {
+	System     string `json:"system"`
+	Client     string `json:"client"`
+	Total      int    `json:"total"`
+	Truncated  bool   `json:"truncated"`
+	Source     string `json:"source"`
+	FileExists bool   `json:"file_exists"`
+	Entries    []struct {
 		Request    string `json:"trkorr"`
 		Client     string `json:"tarcli"`
 		SourceCli  string `json:"srccli"`
@@ -495,6 +509,7 @@ type transportBufferAnswer struct {
 		ReturnCode string `json:"retcode"`
 		Step       string `json:"step"`
 		ImpFlag    string `json:"impflg"`
+		Raw        string `json:"raw"`
 	} `json:"entries"`
 	Command    string   `json:"tp_command"`
 	ReturnCode string   `json:"tp_rc"`
@@ -625,9 +640,10 @@ func (c *Client) UploadTransport(ctx context.Context, ws TransportService, files
 	return res, nil
 }
 
-// TransportBuffer reads the connected system's import buffer, through
-// TMS_TP_SHOW_BUFFER. With a request, only that request's entries are
-// returned. It changes nothing.
+// TransportBuffer reads the connected system's import buffer: ZADT_VSP reads
+// the buffer file DIR_TRANS/buffer/<SID> through SAP's EPS read checks -- no
+// tp, no job, no database write. With a request, only that request's entries
+// are returned. It changes nothing.
 func (c *Client) TransportBuffer(ctx context.Context, ws TransportService, request string) (*TransportBufferResult, error) {
 	request = strings.ToUpper(strings.TrimSpace(request))
 	if err := c.CheckTransportBufferRead(request, "TransportBuffer"); err != nil {
@@ -638,17 +654,18 @@ func (c *Client) TransportBuffer(ctx context.Context, ws TransportService, reque
 		params["request"] = request
 	}
 	var a transportBufferAnswer
-	if err := transportJob(ctx, ws, "show_buffer", params, &a); err != nil {
+	if err := transportCall(ctx, ws, "show_buffer", params, time.Minute, &a); err != nil {
 		return nil, err
 	}
 	out := &TransportBufferResult{System: a.System, Client: a.Client, Request: request, Total: a.Total, Truncated: a.Truncated,
-		Entries: make([]TransportBufferEntry, 0, len(a.Entries)),
-		TP:      &TransportTPResult{Command: a.Command, ReturnCode: a.ReturnCode, Message: a.Message, Stdout: a.Stdout}}
+		Source: a.Source, FileExists: a.FileExists,
+		Entries: make([]TransportBufferEntry, 0, len(a.Entries))}
 	for _, e := range a.Entries {
 		out.Entries = append(out.Entries, TransportBufferEntry{
 			Request: strings.TrimSpace(e.Request), Client: strings.TrimSpace(e.Client), SourceCli: strings.TrimSpace(e.SourceCli),
 			Function: strings.TrimSpace(e.Function), Owner: strings.TrimSpace(e.Owner), UModes: strings.TrimSpace(e.UModes),
 			ReturnCode: strings.TrimSpace(e.ReturnCode), Step: strings.TrimSpace(e.Step), ImpFlag: strings.TrimSpace(e.ImpFlag),
+			Raw: strings.TrimSpace(e.Raw),
 		})
 	}
 	return out, nil

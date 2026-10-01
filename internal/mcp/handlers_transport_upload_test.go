@@ -40,7 +40,10 @@ func (f *uploadFakeWS) SendDomainRequest(_ context.Context, domain, action strin
 	switch action {
 	case "upload_files:begin":
 		data = map[string]any{"assembly_id": "A1", "request": "XYZK900001", "system": "QAS", "client": f.client}
-	case "add_to_buffer", "show_buffer":
+	case "show_buffer":
+		data = map[string]any{"status": "done", "system": "QAS", "client": f.client, "file_exists": true, "total": 1,
+			"entries": []any{map[string]any{"trkorr": "XYZK900001", "raw": "XYZK900001 K758 TESTUSER"}}}
+	case "add_to_buffer":
 		f.job = action
 		data = map[string]any{"status": "started", "ticket": "4711", "job": "ZVSP_TRANSPORT_BUFFER"}
 	case "buffer_result":
@@ -189,7 +192,7 @@ func TestUploadTransportHappyPath(t *testing.T) {
 		t.Fatalf("refused: %s", uploadResultText(res))
 	}
 	want := "transport.upload_files:begin,transport.upload_files:chunk,transport.upload_files:chunk," +
-		"transport.upload_files:commit,transport.add_to_buffer,transport.buffer_result,transport.show_buffer,transport.buffer_result"
+		"transport.upload_files:commit,transport.add_to_buffer,transport.buffer_result,transport.show_buffer"
 	if got := strings.Join(ws.calls(), ","); got != want {
 		t.Errorf("conversation:\n got %s\nwant %s", got, want)
 	}
@@ -232,7 +235,8 @@ func TestTransportBufferView(t *testing.T) {
 	if err != nil || res.IsError || !strings.Contains(uploadResultText(res), "XYZK900001") {
 		t.Fatalf("got %v %s", err, uploadResultText(res))
 	}
-	if got := strings.Join(ws.calls(), ","); got != "transport.show_buffer,transport.buffer_result" {
+	// One read message: no job, no ticket, no polling.
+	if got := strings.Join(ws.calls(), ","); got != "transport.show_buffer" {
 		t.Errorf("a buffer view sent %s", got)
 	}
 	s, ws = uploadServer(t, func(c *Config) { c.EnableTransports = false })

@@ -13,10 +13,11 @@
 "!   failure deletes only what this call wrote;
 "! - tp is given one command, the literal ADDTOBUFFER, for sy-sysid, through
 "!   TMS_TP_MAINTAIN_BUFFER, and only for the request this session uploaded;
-"!   the buffer is read through TMS_TP_SHOW_BUFFER;
+"!   the job reads the buffer through TMS_TP_SHOW_BUFFER before it adds;
+"! - show_buffer reads the buffer file DIR_TRANS/buffer/&lt;SID&gt; and nothing more;
 "! - there is no dynamic CALL FUNCTION.
 "! tp is started over synchronous RFC, which an ABAP Push Channel may not do
-"! (APC_ILLEGAL_STATEMENT), so the buffer step runs as a background job,
+"! (APC_ILLEGAL_STATEMENT), so the add runs as a background job,
 "! ZVSP_TRANSPORT_BUFFER, which calls run_job. The session hands the job its
 "! work through INDX under the job's own number and polls for the result
 "! with buffer_result; the job does nothing without such a ticket.
@@ -157,10 +158,6 @@ CLASS zcl_vsp_transport_service DEFINITION
     CLASS-METHODS job_key
       IMPORTING iv_jobcount   TYPE csequence
       RETURNING VALUE(rv_key) TYPE indx-srtfd.
-
-    CLASS-METHODS buffer_entries_json
-      IMPORTING it_buffer      TYPE tt_tpbuffer
-      RETURNING VALUE(rv_json) TYPE string.
 
     "! The logical directory of a kind of file: $TR_COFI or $TR_DATA.
     CLASS-METHODS dir_of
@@ -569,10 +566,24 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
 
 
   METHOD handle_show_buffer.
-    DATA: lv_sid      TYPE string,
-          lv_number   TYPE string,
-          lv_error    TYPE string,
-          lv_jobcount TYPE string.
+    " The import buffer is a file, DIR_TRANS/buffer/<SID>. It is read here,
+    " through SAP's EPS read checks, and nothing else is done: no tp, no
+    " job, no database write.
+    DATA: lv_sid        TYPE string,
+          lv_number     TYPE string,
+          lv_name       TYPE eps2filnam,
+          lv_buffer_dir TYPE epsf-epsdirnam,
+          lv_long_dir   TYPE eps2path,
+          lv_path       TYPE eps2path,
+          lv_size       TYPE eps2filsiz,
+          lv_pos        TYPE epsfilsiz,
+          lv_content    TYPE xstring,
+          lv_text       TYPE string,
+          lv_dataset    TYPE string,
+          lt_lines      TYPE string_table,
+          lt_tok        TYPE string_table,
+          lt_items      TYPE string_table,
+          lv_total      TYPE i.
 
     DATA(lv_request) = to_upper( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'request' ) ).
     IF lv_request IS NOT INITIAL AND
@@ -581,25 +592,104 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
                          iv_message = |Request '{ lv_request }' is not <SID>K<6 digits>| ).
       RETURN.
     ENDIF.
-    IF ms_pending-ticket IS NOT INITIAL.
-      rs_response = err( iv_id = is_message-id iv_code = 'BUSY'
-                         iv_message = |Buffer job { ms_pending-ticket } of this session has not been collected yet (buffer_result)| ).
+
+    lv_name = sy-sysid.
+    lv_buffer_dir = '$TR_BUFF'.
+    CALL FUNCTION 'EPS_OPEN_INPUT_FILE'
+      EXPORTING
+        iv_long_file_name      = lv_name
+        dir_name               = lv_buffer_dir
+        pos                    = lv_pos
+      IMPORTING
+        ev_long_dir_name       = lv_long_dir
+        ev_long_file_path      = lv_path
+        ev_file_size_long      = lv_size
+      EXCEPTIONS
+        invalid_eps_subdir     = 1
+        sapgparam_failed       = 2
+        build_directory_failed = 3
+        no_authorization       = 4
+        build_path_failed      = 5
+        open_failed            = 6
+        read_directory_failed  = 7
+        read_attributes_failed = 8
+        OTHERS                 = 9.
+    DATA(lv_subrc) = sy-subrc.
+    IF lv_subrc = 0.
+      CALL FUNCTION 'EPS_CLOSE_FILE'
+        EXPORTING
+          iv_long_file_name = lv_name
+          iv_long_dir_name  = lv_long_dir
+        EXCEPTIONS
+          OTHERS            = 1.
+    ELSEIF lv_subrc <> 7 AND lv_subrc <> 8.
+      rs_response = err( iv_id = is_message-id
+                         iv_code = COND #( WHEN lv_subrc = 4 THEN `NO_AUTHORIZATION` ELSE `BUFFER_READ_FAILED` )
+                         iv_message = |The import buffer file { lv_name } in DIR_TRANS ($TR_BUFF) could not be read (exception { lv_subrc }) { last_message( ) }| ).
       RETURN.
+    ENDIF.
+    " No buffer file: nothing was ever queued for this system.
+
+    IF lv_subrc = 0.
+      IF lv_size > c_max_total.
+        rs_response = err( iv_id = is_message-id iv_code = 'TOO_LARGE'
+                           iv_message = |The import buffer file is { lv_size } bytes, over the { c_max_total }-byte limit| ).
+        RETURN.
+      ENDIF.
+      lv_dataset = lv_path.
+      TRY.
+          OPEN DATASET lv_dataset FOR INPUT IN BINARY MODE.
+          IF sy-subrc = 0.
+            READ DATASET lv_dataset INTO lv_content.
+            CLOSE DATASET lv_dataset.
+          ENDIF.
+          lv_text = cl_abap_codepage=>convert_from( source = lv_content codepage = `UTF-8` ).
+        CATCH cx_root INTO DATA(lx_read).
+          CLOSE DATASET lv_dataset.
+          rs_response = err( iv_id = is_message-id iv_code = 'BUFFER_READ_FAILED'
+                             iv_message = |The import buffer file { lv_name }: { lx_read->get_text( ) }| ).
+          RETURN.
+      ENDTRY.
     ENDIF.
 
-    start_job( EXPORTING iv_action = `SHOW` iv_request = lv_request
-               IMPORTING ev_jobcount = lv_jobcount ev_error = lv_error ).
-    IF lv_error IS NOT INITIAL.
-      rs_response = err( iv_id = is_message-id iv_code = 'JOB_FAILED'
-                         iv_message = |The buffer job could not be started: { lv_error }| ).
-      RETURN.
-    ENDIF.
-    ms_pending = VALUE #( ticket = lv_jobcount action = `SHOW` request = lv_request ).
+    " One request per line: [/<n>/]<TRKORR> <type><release> <owner> ... ;
+    " lines starting with '#' are comments.
+    SPLIT lv_text AT cl_abap_char_utilities=>newline INTO TABLE lt_lines.
+    LOOP AT lt_lines INTO DATA(lv_line).
+      REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>cr_lf(1) IN lv_line WITH ``.
+      DATA(lv_raw) = condense( lv_line ).
+      IF lv_raw IS INITIAL OR lv_raw(1) = '#'.
+        CONTINUE.
+      ENDIF.
+      SPLIT lv_raw AT space INTO TABLE lt_tok.
+      DATA(lv_req) = lt_tok[ 1 ].
+      REPLACE PCRE '^/[^/]*/' IN lv_req WITH ``.
+      IF lv_request IS NOT INITIAL AND lv_req <> lv_request.
+        CONTINUE.
+      ENDIF.
+      lv_total = lv_total + 1.
+      IF lv_total > c_max_buffer_entries.
+        CONTINUE.
+      ENDIF.
+      DATA(lv_type) = COND string( WHEN lines( lt_tok ) >= 2 AND strlen( lt_tok[ 2 ] ) >= 1 THEN substring( val = lt_tok[ 2 ] len = 1 ) ).
+      DATA(lv_owner) = COND string( WHEN lines( lt_tok ) >= 3 THEN lt_tok[ 3 ] ).
+      APPEND zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
+        ( zcl_vsp_utils=>json_str( iv_key = 'trkorr' iv_value = lv_req ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'trfunction' iv_value = lv_type ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'owner' iv_value = lv_owner ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'raw' iv_value = lv_raw ) )
+      ) ) ) TO lt_items.
+    ENDLOOP.
 
     rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
-      ( zcl_vsp_utils=>json_str( iv_key = 'status' iv_value = `started` ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'ticket' iv_value = lv_jobcount ) )
-      ( zcl_vsp_utils=>json_str( iv_key = 'job' iv_value = CONV #( c_job_name ) ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'status' iv_value = `done` ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'system' iv_value = CONV #( sy-sysid ) ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'client' iv_value = CONV #( sy-mandt ) ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'source' iv_value = |DIR_TRANS/buffer/{ sy-sysid }| ) )
+      ( zcl_vsp_utils=>json_bool( iv_key = 'file_exists' iv_value = xsdbool( lv_subrc = 0 ) ) )
+      ( zcl_vsp_utils=>json_int( iv_key = 'total' iv_value = lv_total ) )
+      ( zcl_vsp_utils=>json_bool( iv_key = 'truncated' iv_value = xsdbool( lv_total > c_max_buffer_entries ) ) )
+      ( |"entries":{ zcl_vsp_utils=>json_arr( zcl_vsp_utils=>json_join( lt_items ) ) }| )
     ) ) ) ).
   ENDMETHOD.
 
@@ -643,29 +733,6 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     DELETE FROM DATABASE indx(zu) ID lv_key.
     DATA(ls_pend) = ms_pending.
     CLEAR ms_pending.
-
-    IF ls_pend-action = `SHOW`.
-      IF ls_res-code IS NOT INITIAL.
-        rs_response = err( iv_id = is_message-id iv_code = ls_res-code iv_message = ls_res-message ).
-        RETURN.
-      ENDIF.
-      IF ls_pend-request IS NOT INITIAL.
-        DELETE lt_buffer WHERE trkorr <> ls_pend-request.
-      ENDIF.
-      DATA(lv_total) = lines( lt_buffer ).
-      rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
-        ( zcl_vsp_utils=>json_str( iv_key = 'status' iv_value = `done` ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'system' iv_value = ls_res-system ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'client' iv_value = CONV #( sy-mandt ) ) )
-        ( zcl_vsp_utils=>json_int( iv_key = 'total' iv_value = lv_total ) )
-        ( zcl_vsp_utils=>json_bool( iv_key = 'truncated' iv_value = xsdbool( lv_total > c_max_buffer_entries ) ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'tp_command' iv_value = ls_res-tp_cmd ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'tp_rc' iv_value = ls_res-tp_rc ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'tp_message' iv_value = ls_res-tp_msg ) )
-        ( |"entries":{ buffer_entries_json( lt_buffer ) }| )
-      ) ) ) ).
-      RETURN.
-    ENDIF.
 
     " ADD
     IF ls_res-code IS INITIAL.
@@ -787,25 +854,6 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
   ENDMETHOD.
 
 
-  METHOD buffer_entries_json.
-    DATA lt_items TYPE string_table.
-    LOOP AT it_buffer INTO DATA(ls_buf) TO c_max_buffer_entries.
-      APPEND zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
-        ( zcl_vsp_utils=>json_str( iv_key = 'trkorr' iv_value = CONV #( ls_buf-trkorr ) ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'tarcli' iv_value = CONV #( ls_buf-tarcli ) ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'srccli' iv_value = CONV #( ls_buf-srccli ) ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'trfunction' iv_value = CONV #( ls_buf-trfunction ) ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'owner' iv_value = CONV #( ls_buf-owner ) ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'umodes' iv_value = CONV #( ls_buf-umodes ) ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'retcode' iv_value = CONV #( ls_buf-retcode ) ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'step' iv_value = CONV #( ls_buf-step ) ) )
-        ( zcl_vsp_utils=>json_str( iv_key = 'impflg' iv_value = CONV #( ls_buf-impflg ) ) )
-      ) ) ) TO lt_items.
-    ENDLOOP.
-    rv_json = zcl_vsp_utils=>json_arr( zcl_vsp_utils=>json_join( lt_items ) ).
-  ENDMETHOD.
-
-
   METHOD run_job.
     DATA: lv_jobcount TYPE tbtcm-jobcount,
           lv_jobname  TYPE tbtcm-jobname,
@@ -920,7 +968,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
           DELETE lt_buffer WHERE trkorr <> lv_trkorr.
         ENDIF.
       ENDIF.
-    ELSEIF ls_ticket-action <> `SHOW`.
+    ELSE.
       ls_res-code = `INVALID_PARAM`.
       ls_res-message = |Unknown job action '{ ls_ticket-action }'|.
     ENDIF.
@@ -1134,7 +1182,9 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
           rv_error = |line { lv_lineno } (the header): step '{ lt_tok[ 4 ] }' is not one of 0, 1, 2, 3|.
           RETURN.
         ENDIF.
-        LOOP AT lt_tok INTO DATA(lv_count) FROM 5.
+        " Nine object counts follow the step (what STRF_READ_COFILE reads);
+        " what comes after them (release, flags, client) is not checked.
+        LOOP AT lt_tok INTO DATA(lv_count) FROM 5 TO 13.
           FIND PCRE '^[0-9]+\z' IN lv_count.
           IF sy-subrc <> 0.
             rv_error = |line { lv_lineno } (the header): object count '{ lv_count }' is not a number|.
