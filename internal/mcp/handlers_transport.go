@@ -250,7 +250,7 @@ func (s *Server) handleExecuteABAP(ctx context.Context, request mcp.CallToolRequ
 // executionTime, message, cleanedUp, failure), plus result_text, the returned
 // value in full and unwrapped. `vsp execute --json` prints the same.
 func executeABAPJSON(result *adt.ExecuteABAPResult) string {
-	out, err := json.MarshalIndent(result.Lean(), "", "  ")
+	out, err := adt.IndentJSON(result.Lean())
 	if err != nil {
 		return fmt.Sprintf(`{"success": false, "message": %q}`, "could not encode the result: "+err.Error())
 	}

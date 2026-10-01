@@ -678,7 +678,7 @@ func runExecute(cmd *cobra.Command, args []string) error {
 	// the MCP tool's object instead, for a caller that needs to tell one value
 	// with a line break in it from two.
 	if asJSON, _ := cmd.Flags().GetBool("json"); asJSON {
-		out, jerr := json.MarshalIndent(result.Lean(), "", "  ")
+		out, jerr := adt.IndentJSON(result.Lean())
 		if jerr != nil {
 			return fmt.Errorf("could not encode the result: %w", jerr)
 		}

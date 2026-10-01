@@ -57,3 +57,11 @@ func TestPrintUnitTestReportNothingRanFails(t *testing.T) {
 		t.Fatalf("a run where nothing ran exited zero:\n%s", buf.String())
 	}
 }
+
+func TestPrintUnitTestReportJSONKeepsAngleBrackets(t *testing.T) {
+	var buf bytes.Buffer
+	_ = printUnitTestReport(&buf, cliUnitRun(), true, true)
+	if !strings.Contains(buf.String(), "Exception Error <CX_SY_ZERODIVIDE>") {
+		t.Fatalf("SAP's title was escaped:\n%s", buf.String())
+	}
+}

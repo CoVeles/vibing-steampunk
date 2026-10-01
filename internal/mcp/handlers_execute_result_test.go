@@ -98,3 +98,18 @@ func TestExecuteABAPAnswersAnArrayForSeveralValues(t *testing.T) {
 		t.Fatalf("result_text %v, output %v; want [one two] for both", got.ResultText, got.Output)
 	}
 }
+
+// A returned value comes back exactly as the code produced it, angle brackets
+// and ampersands included.
+func TestExecuteABAPKeepsTheValueVerbatim(t *testing.T) {
+	sap := executeSAP(t, execRunResult(sapAssertion("&lt;b&gt;bold&lt;/b&gt; &amp; more")))
+	s := NewServer(&Config{BaseURL: sap.URL, Username: "TESTUSER", Client: "001", Mode: "expert"})
+
+	res, err := s.handleExecuteABAP(t.Context(), newRequest(map[string]any{"code": "lv_result = 'x'."}))
+	if err != nil {
+		t.Fatalf("handleExecuteABAP: %v", err)
+	}
+	if !strings.Contains(resultText(res), `"result_text": "<b>bold</b> & more"`) {
+		t.Fatalf("the value was not passed on verbatim:\n%s", resultText(res))
+	}
+}

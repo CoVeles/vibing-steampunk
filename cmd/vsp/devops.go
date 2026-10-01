@@ -1744,7 +1744,7 @@ func printUnitTestReport(w io.Writer, result *adt.UnitTestResult, onlyFailures, 
 	counts := report.Counts
 
 	if asJSON {
-		out, err := json.MarshalIndent(report, "", "  ")
+		out, err := adt.IndentJSON(report)
 		if err != nil {
 			return fmt.Errorf("could not encode the result: %w", err)
 		}

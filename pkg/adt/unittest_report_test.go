@@ -145,3 +145,14 @@ func TestUnitTestReportNothingRanIsNotOK(t *testing.T) {
 		}
 	}
 }
+
+// SAP's titles are full of angle brackets; the JSON keeps them as they are.
+func TestIndentJSONKeepsAngleBrackets(t *testing.T) {
+	out, err := IndentJSON(map[string]string{"title": "Exception Error <CX_SY_ZERODIVIDE> & more"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "Exception Error <CX_SY_ZERODIVIDE> & more") {
+		t.Fatalf("escaped: %s", out)
+	}
+}

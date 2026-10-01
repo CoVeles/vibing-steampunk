@@ -199,6 +199,6 @@ func (s *Server) handleRunUnitTests(ctx context.Context, request mcp.CallToolReq
 
 	// ok and counts on top of the classes this tool always answered; with
 	// only_failures, the failed methods alone, in the lean shape.
-	output, _ := json.MarshalIndent(adt.NewUnitTestReport(result, onlyFailures), "", "  ")
+	output, _ := adt.IndentJSON(adt.NewUnitTestReport(result, onlyFailures))
 	return mcp.NewToolResultText(string(output)), nil
 }
