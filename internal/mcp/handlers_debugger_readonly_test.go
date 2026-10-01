@@ -46,3 +46,21 @@ func TestCallRFC_RefusedUnderReadOnly(t *testing.T) {
 	debugRouteRefused(t, "CALL_RFC", params)
 	debugRouteReachesSAP(t, "CALL_RFC", params)
 }
+
+func TestMoveObject_RefusedUnderReadOnly(t *testing.T) {
+	params := map[string]any{"object_type": "CLAS", "object_name": "ZCL_DEMO", "new_package": "$ZDEMO"}
+	debugRouteRefused(t, "MOVE", params)
+	debugRouteReachesSAP(t, "MOVE", params)
+
+	// The same handler behind SAP(action="edit", target="MOVE").
+	s, hits := reportTestServer(t, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, handled, err := s.routeCRUDAction(ctx, "edit", "MOVE", "", params)
+	if !handled || err != nil || !res.IsError || !strings.Contains(toolResultText(t, res), "blocked by safety configuration") {
+		t.Fatalf("edit MOVE: handled=%v err=%v res=%v", handled, err, res)
+	}
+	if hits() != 0 {
+		t.Error("a refused edit MOVE still reached SAP")
+	}
+}
