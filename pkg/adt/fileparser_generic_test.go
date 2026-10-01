@@ -156,12 +156,16 @@ func TestExportedFileNamesParseBackAsTheSameObject(t *testing.T) {
 		{ObjectTypeClass, "ZCL_DEMO", "", "CLASS zcl_demo DEFINITION PUBLIC.\nENDCLASS.\n", "zcl_demo.clas.abap", ""},
 		{ObjectTypeInterface, "ZIF_DEMO", "", "INTERFACE zif_demo PUBLIC.\nENDINTERFACE.\n", "zif_demo.intf.abap", ""},
 		{ObjectTypeFunctionGroup, "ZDEMO_FG", "", "FUNCTION-POOL zdemo_fg.\n", "zdemo_fg.fugr.abap", ""},
-		{ObjectTypeFunctionMod, "Z_DEMO_CALL", "ZDEMO_FG", "FUNCTION z_demo_call.\nENDFUNCTION.\n", "zdemo_fg.fugr.z_demo_call.func.abap", "ZDEMO_FG"},
+		{ObjectTypeFunctionMod, "Z_DEMO_CALL", "ZDEMO_FG", "FUNCTION z_demo_call.\nENDFUNCTION.\n", "zdemo_fg.fugr.z_demo_call.abap", "ZDEMO_FG"},
+		{ObjectTypeFunctionMod, "/AIF/FUNC", "/AIF/UTIL", "FUNCTION /aif/func.\nENDFUNCTION.\n", "#aif#util.fugr.#aif#func.abap", "/AIF/UTIL"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.wantFile, func(t *testing.T) {
 			dir := t.TempDir()
-			path := ExportFilePath(tc.objType, tc.name, tc.parent, dir)
+			path, err := ExportFilePath(tc.objType, tc.name, tc.parent, dir)
+			if err != nil {
+				t.Fatalf("export path: %v", err)
+			}
 			if filepath.Base(path) != tc.wantFile {
 				t.Fatalf("exported as %s, want %s", filepath.Base(path), tc.wantFile)
 			}
@@ -180,8 +184,8 @@ func TestExportedFileNamesParseBackAsTheSameObject(t *testing.T) {
 	}
 }
 
-// An explicit file path is honoured; for an include that includes the plain
-// .abap suffix it used to be written with.
+// An explicit file path is honoured; for an include that includes the bare
+// {name}.abap it used to be written as.
 func TestExportFilePathKeepsAnExplicitFile(t *testing.T) {
 	for _, tc := range []struct {
 		objType CreatableObjectType
@@ -190,9 +194,175 @@ func TestExportFilePathKeepsAnExplicitFile(t *testing.T) {
 		{ObjectTypeInclude, "/x/zdemo_top.incl.abap"},
 		{ObjectTypeInclude, "/x/zdemo_top.abap"},
 		{ObjectTypeProgram, "/x/zdemo.prog.abap"},
+		{ObjectTypeProgram, "/x/ZDEMO.PROG.ABAP"},
+		{ObjectTypeFunctionMod, "/x/zfg.fugr.z_fm.abap"},
+		{ObjectTypeFunctionMod, "/x/z_fm.func.abap"},
 	} {
-		if got := ExportFilePath(tc.objType, "ZDEMO", "", tc.out); got != tc.out {
-			t.Errorf("%s: got %s, want the path as given", tc.out, got)
+		got, err := ExportFilePath(tc.objType, "ZDEMO", "", tc.out)
+		if err != nil || got != tc.out {
+			t.Errorf("%s: got %s (%v), want the path as given", tc.out, got, err)
 		}
+	}
+}
+
+// An include written to zx.prog.abap would read back as a program, and
+// deploying it would then create or overwrite program ZX.
+func TestAnIncludeIsNotExportedUnderAnotherTypesName(t *testing.T) {
+	for _, out := range []string{"/x/zx.prog.abap", "/x/zx.clas.abap", "/x/zfg.fugr.zx.abap"} {
+		if got, err := ExportFilePath(ObjectTypeInclude, "ZX", "", out); err == nil {
+			t.Errorf("%s: exported to %s, want a refusal", out, got)
+		}
+	}
+}
+
+// fugrMember used to slice past its own bounds on {group}.fugr.abap in any
+// case but lower ("slice bounds out of range [9:8]"): a panic, the same
+// process-ending class of failure as issue #237.
+func TestFugrMemberDoesNotPanicOnMixedCase(t *testing.T) {
+	for _, name := range []string{"ZFG.FUGR.ABAP", "zfg.Fugr.abap", "zfg.fugr.ABAP", "zfg.fugr.abap", ".fugr.abap", "x.fugr..abap"} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("fugrMember(%q) panicked: %v", name, r)
+				}
+			}()
+			if _, _, ok := fugrMember(name); ok {
+				t.Errorf("fugrMember(%q) found a member where there is none", name)
+			}
+		}()
+	}
+	if g, m, ok := fugrMember("ZFG.FUGR.Z_FM.ABAP"); !ok || g != "ZFG" || m != "Z_FM" {
+		t.Errorf("upper-case member file: got %q %q %v", g, m, ok)
+	}
+}
+
+// Suffixes are case-blind everywhere, so an upper-case file name is the same
+// file: the group file reads as the group (and does not panic on the way).
+func TestUpperCaseSuffixesAreReadLikeLowerCase(t *testing.T) {
+	cases := []struct {
+		file, content string
+		wantType      CreatableObjectType
+		wantName      string
+	}{
+		{"ZFG.FUGR.ABAP", "FUNCTION-POOL zfg.\n", ObjectTypeFunctionGroup, "ZFG"},
+		{"zfg.Fugr.abap", "FUNCTION-POOL zfg.\n", ObjectTypeFunctionGroup, "ZFG"},
+		{"ZCL_UP.CLAS.ABAP", "CLASS zcl_up DEFINITION PUBLIC.\nENDCLASS.\n", ObjectTypeClass, "ZCL_UP"},
+		{"ZUP_TOP.INCL.ABAP", "DATA x TYPE i.\n", ObjectTypeInclude, "ZUP_TOP"},
+		{"ZUP.ABAP", "REPORT zup.\n", ObjectTypeProgram, "ZUP"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.file, func(t *testing.T) {
+			info, err := parseWithin(t, writeFixture(t, tc.file, tc.content))
+			if err != nil {
+				t.Fatalf("parsing: %v", err)
+			}
+			if info.ObjectType != tc.wantType || info.ObjectName != tc.wantName {
+				t.Errorf("got %s %s, want %s %s", info.ObjectType, info.ObjectName, tc.wantType, tc.wantName)
+			}
+		})
+	}
+}
+
+// A TOP include opens with its main program's statement. Read by content
+// alone, each of these became the main program or group, and DeployFromFile
+// then updated the real object with the include's source. Only a file named
+// for the object its statement opens may be typed from content.
+func TestAnIncludeOpeningWithItsMainProgramIsRefused(t *testing.T) {
+	cases := []struct{ file, content, names string }{
+		{"mzfootop.abap", "PROGRAM sapmzfoo MESSAGE-ID zz.\nDATA x TYPE i.\n", "SAPMZFOO"},
+		{"zrep_top.abap", "REPORT zrep.\nDATA x TYPE i.\n", "ZREP"},
+		{"lzfgtop.abap", "FUNCTION-POOL zfg MESSAGE-ID zz.\nDATA x TYPE i.\n", "ZFG"},
+		{"zother.abap", "FUNCTION z_fm.\nENDFUNCTION.\n", "Z_FM"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.file, func(t *testing.T) {
+			info, err := parseWithin(t, writeFixture(t, tc.file, tc.content))
+			if err == nil {
+				t.Fatalf("read as %s %s, want a refusal", info.ObjectType, info.ObjectName)
+			}
+			if !strings.Contains(err.Error(), tc.names) || !strings.Contains(err.Error(), ".incl.abap") {
+				t.Errorf("the refusal should name %s and the .incl.abap way out, got: %v", tc.names, err)
+			}
+		})
+	}
+}
+
+// The abapGit module file must hold the module its name says.
+func TestAnAbapGitModuleFileHoldingAnotherModuleIsRefused(t *testing.T) {
+	path := writeFixture(t, "zfg.fugr.z_one.abap", "FUNCTION z_two.\nENDFUNCTION.\n")
+	if info, err := parseWithin(t, path); err == nil {
+		t.Fatalf("read as %s %s, want a refusal", info.ObjectType, info.ObjectName)
+	}
+}
+
+// Only CLASS <n> DEFINITION PUBLIC and INTERFACE <n> PUBLIC declare a global
+// object. A PUBLIC elsewhere in the statement (CREATE PUBLIC), or a forward
+// declaration, does not, even when the name matches the file.
+func TestOnlyAGlobalDeclarationTypesAClassOrInterface(t *testing.T) {
+	cases := []struct{ file, content string }{
+		{"lcl_app.abap", "CLASS lcl_app DEFINITION CREATE PUBLIC.\nENDCLASS.\n"},
+		{"lcl_app2.abap", "CLASS lcl_app2 DEFINITION FINAL\n  CREATE PUBLIC.\nENDCLASS.\n"},
+		{"zcl_x.abap", "CLASS zcl_x DEFINITION DEFERRED PUBLIC.\n"},
+		{"zcl_y.abap", "CLASS zcl_y DEFINITION PUBLIC LOAD.\n"},
+		{"zif_x.abap", "INTERFACE zif_x DEFERRED PUBLIC.\n"},
+		{"zif_y.abap", "INTERFACE zif_y LOAD.\n"},
+		{"lif_z.abap", "INTERFACE lif_z.\nENDINTERFACE.\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.file, func(t *testing.T) {
+			info, err := parseWithin(t, writeFixture(t, tc.file, tc.content))
+			if err == nil {
+				t.Fatalf("read as %s %s, want a refusal", info.ObjectType, info.ObjectName)
+			}
+			if !strings.Contains(err.Error(), ".incl.abap") {
+				t.Errorf("the refusal should say how to name the file, got: %v", err)
+			}
+		})
+	}
+}
+
+// CLASS: lcl_a DEFINITION DEFERRED, lcl_b ... declares local classes in a
+// chain. It is neither the global class nor safe to guess at.
+func TestAChainedClassStatementIsRefused(t *testing.T) {
+	for name, content := range map[string]string{
+		"zchain.abap":  "CLASS: zchain DEFINITION DEFERRED, lcl_b DEFINITION DEFERRED.\n",
+		"zchain2.abap": "CLASS : zchain2 DEFINITION DEFERRED.\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseWithin(t, writeFixture(t, name, content))
+			if err == nil || !strings.Contains(err.Error(), "chained") {
+				t.Fatalf("expected a refusal naming the chained statement, got %v", err)
+			}
+		})
+	}
+}
+
+// Windows editors put a byte order mark before the first statement. It is
+// not part of REPORT, and the file is still the program.
+func TestAByteOrderMarkDoesNotHideTheFirstStatement(t *testing.T) {
+	info, err := parseWithin(t, writeFixture(t, "zbom.abap", "\uFEFFREPORT zbom.\nWRITE 'x'.\n"))
+	if err != nil {
+		t.Fatalf("parsing: %v", err)
+	}
+	if info.ObjectType != ObjectTypeProgram || info.ObjectName != "ZBOM" {
+		t.Errorf("got %s %s, want PROG/P ZBOM", info.ObjectType, info.ObjectName)
+	}
+}
+
+// The line scan reads one line at a time; a class statement split before
+// DEFINITION escaped it, and the file was refused for having no name.
+func TestAClassStatementSplitAcrossLinesStillNamesTheClass(t *testing.T) {
+	path := writeFixture(t, "zcl_split.clas.abap", "CLASS zcl_split\n  DEFINITION\n  PUBLIC.\nENDCLASS.\nCLASS zcl_split IMPLEMENTATION.\nENDCLASS.\n")
+	info, err := parseWithin(t, path)
+	if err != nil {
+		t.Fatalf("parsing: %v", err)
+	}
+	if info.ObjectName != "ZCL_SPLIT" {
+		t.Errorf("got %q, want ZCL_SPLIT", info.ObjectName)
+	}
+
+	_, err = parseWithin(t, writeFixture(t, "zcl_none.clas.abap", "* nothing here\n"))
+	if err == nil || !strings.Contains(err.Error(), "CLASS <name> DEFINITION") {
+		t.Errorf("the error should name the statement it looked for, got %v", err)
 	}
 }
