@@ -34,6 +34,9 @@ var transportServiceFunctions = map[string]bool{
 	"JOB_OPEN":             true,
 	"JOB_CLOSE":            true,
 	"GET_JOB_RUNTIME_INFO": true,
+	// The request's lock (lock object E_TRKORR) around check-and-write.
+	"ENQUEUE_E_TRKORR": true,
+	"DEQUEUE_E_TRKORR": true,
 	// add_status reads the job's log (read-only).
 	"BP_JOBLOG_READ": true,
 }
@@ -571,5 +574,52 @@ func TestJobChecksFilesBeforeAdd(t *testing.T) {
 	}
 	if check < 0 || add < 0 || check > add {
 		t.Errorf("run_job must compare the files' SHA-256 before ADDTOBUFFER (check at %d, add at %d)", check, add)
+	}
+}
+
+// indexOf returns the index of the first statement containing sub, or -1.
+func indexOf(stmts []string, sub string) int {
+	for i, st := range stmts {
+		if strings.Contains(strings.ToUpper(st), sub) {
+			return i
+		}
+	}
+	return -1
+}
+
+// Check-and-write and check-and-add hold the request's lock; deletes take
+// back only files that still have the SHA-256 this upload wrote, and report
+// a failed delete (review round 2, item 6; codex #2).
+func TestTransportServiceLocksAndCheckedDeletes(t *testing.T) {
+	stmts := abapStatements(transportServiceSource(t))
+	commit := methodStatements(stmts, "UPLOAD_COMMIT")
+	lock, write, unlock := indexOf(commit, "LOCK_REQUEST( LS_UP-REQUEST )"), indexOf(commit, "WRITE_PAIR("), indexOf(commit, "UNLOCK_REQUEST( LS_UP-REQUEST )")
+	if lock < 0 || write < lock || unlock < write {
+		t.Errorf("upload_commit: lock %d, write_pair %d, unlock %d -- the writes must be inside the lock", lock, write, unlock)
+	}
+	pair := methodStatements(stmts, "WRITE_PAIR")
+	if c, w := indexOf(pair, "FILE_EXISTS("), indexOf(pair, "WRITE_FILE("); c < 0 || w < c {
+		t.Errorf("write_pair must check absence before writing (check %d, write %d)", c, w)
+	}
+
+	job := methodStatements(stmts, "RUN_JOB")
+	jl, jr, ja, ju := indexOf(job, "LOCK_REQUEST( IV_REQUEST = LV_TRKORR"), indexOf(job, "READ_BUFFER("), indexOf(job, "CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'"), indexOf(job, "UNLOCK_REQUEST( LV_TRKORR )")
+	if jl < 0 || jr < jl || ja < jr || ju < ja {
+		t.Errorf("run_job: lock %d, buffer read %d, add %d, unlock %d -- check and add must be inside the lock", jl, jr, ja, ju)
+	}
+
+	del := strings.ToUpper(strings.Join(methodStatements(stmts, "DELETE_FILE"), "\n"))
+	if !strings.Contains(del, "IF SHA256( LV_CONTENT ) <> TO_UPPER( IV_SHA )") {
+		t.Error("delete_file does not compare the SHA-256 before deleting")
+	}
+	if !regexp.MustCompile(`CALL FUNCTION 'EPS_DELETE_FILE'[^\n]*\nIF SY-SUBRC <> 0\nRV_ERROR =`).MatchString(del) {
+		t.Error("delete_file does not check EPS_DELETE_FILE's result")
+	}
+	for _, m := range []string{"ROLLBACK_WRITTEN", "RUN_JOB"} {
+		for _, st := range methodStatements(stmts, m) {
+			if up := strings.ToUpper(st); strings.Contains(up, "DELETE_FILE(") && !strings.Contains(up, "IV_SHA =") {
+				t.Errorf("%s deletes without the SHA-256 it wrote: %s", m, st)
+			}
+		}
 	}
 }

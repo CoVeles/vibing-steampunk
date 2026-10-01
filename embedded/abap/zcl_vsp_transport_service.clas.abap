@@ -233,9 +233,33 @@ CLASS zcl_vsp_transport_service DEFINITION
                 ev_path    TYPE string
                 ev_error   TYPE string.
 
+    "! Deletes a file this service wrote. With iv_sha, only when the file
+    "! still has that SHA-256 (it is the one written). Returns why not, or
+    "! initial when the file is gone.
     CLASS-METHODS delete_file
-      IMPORTING iv_kind TYPE string
-                iv_name TYPE string.
+      IMPORTING iv_kind         TYPE string
+                iv_name         TYPE string
+                iv_sha          TYPE string OPTIONAL
+      RETURNING VALUE(rv_error) TYPE string.
+
+    "! Locks the request (lock object E_TRKORR) for this session or job, so
+    "! that two uploads or adds of one request cannot interleave.
+    CLASS-METHODS lock_request
+      IMPORTING iv_request      TYPE csequence
+                iv_wait         TYPE abap_bool DEFAULT abap_false
+      RETURNING VALUE(rv_error) TYPE string.
+
+    CLASS-METHODS unlock_request
+      IMPORTING iv_request TYPE csequence.
+
+    "! The no-overwrite check and the two writes of a commit, under the
+    "! request's lock. ev_code initial: both files are written.
+    CLASS-METHODS write_pair
+      IMPORTING is_up          TYPE ty_assembly
+      EXPORTING ev_code        TYPE string
+                ev_message     TYPE string
+                ev_cofile_path TYPE string
+                ev_data_path   TYPE string.
 
     "! This system's import buffer, read-only.
     CLASS-METHODS read_buffer
@@ -485,8 +509,6 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
 
   METHOD upload_commit.
     DATA: lv_error       TYPE string,
-          lv_data_open   TYPE abap_bool,
-          lv_cofile_open TYPE abap_bool,
           lv_data_path   TYPE string,
           lv_cofile_path TYPE string.
 
@@ -517,45 +539,19 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    " Checked again: begin may have been a while ago.
-    DATA(lt_kinds) = VALUE string_table( ( `data` ) ( `cofile` ) ).
-    LOOP AT lt_kinds INTO DATA(lv_kind).
-      DATA(lv_name) = COND string( WHEN lv_kind = `cofile` THEN ls_up-cofile_name ELSE ls_up-data_name ).
-      DATA(lv_exists) = file_exists( EXPORTING iv_kind = lv_kind iv_name = lv_name IMPORTING ev_error = lv_error ).
-      IF lv_error IS NOT INITIAL.
-        rs_response = err( iv_id = is_message-id iv_code = 'DIR_TRANS_ERROR' iv_message = lv_error ).
-        RETURN.
-      ENDIF.
-      IF lv_exists = abap_true.
-        rs_response = err( iv_id = is_message-id iv_code = 'FILE_EXISTS'
-                           iv_message = |{ lv_name } already exists in DIR_TRANS; it is never overwritten. Nothing was written.| ).
-        RETURN.
-      ENDIF.
-    ENDLOOP.
-
-    " The data file first, so that tp never finds a cofile without its data.
-    write_file( EXPORTING iv_kind = `data` iv_name = ls_up-data_name iv_content = ls_up-data
-                IMPORTING ev_opened = lv_data_open ev_path = lv_data_path ev_error = lv_error ).
+    " The no-overwrite check and the writes hold the request's lock, so no
+    " other upload of it can create a file in between.
+    lv_error = lock_request( ls_up-request ).
     IF lv_error IS NOT INITIAL.
-      IF lv_data_open = abap_true.
-        delete_file( iv_kind = `data` iv_name = ls_up-data_name ).
-      ENDIF.
-      rs_response = err( iv_id = is_message-id iv_code = 'WRITE_FAILED'
-                         iv_message = |{ ls_up-data_name }: { lv_error }. | &&
-                                      COND string( WHEN lv_data_open = abap_true THEN `What this call wrote was deleted again.`
-                                                   ELSE `Nothing was written.` ) ).
+      rs_response = err( iv_id = is_message-id iv_code = 'LOCKED' iv_message = |{ lv_error }. Nothing was written.| ).
       RETURN.
     ENDIF.
-
-    write_file( EXPORTING iv_kind = `cofile` iv_name = ls_up-cofile_name iv_content = ls_up-cofile
-                IMPORTING ev_opened = lv_cofile_open ev_path = lv_cofile_path ev_error = lv_error ).
-    IF lv_error IS NOT INITIAL.
-      IF lv_cofile_open = abap_true.
-        delete_file( iv_kind = `cofile` iv_name = ls_up-cofile_name ).
-      ENDIF.
-      delete_file( iv_kind = `data` iv_name = ls_up-data_name ).
-      rs_response = err( iv_id = is_message-id iv_code = 'WRITE_FAILED'
-                         iv_message = |{ ls_up-cofile_name }: { lv_error }. What this call wrote was deleted again.| ).
+    write_pair( EXPORTING is_up = ls_up
+                IMPORTING ev_code = DATA(lv_code) ev_message = DATA(lv_msg)
+                          ev_cofile_path = lv_cofile_path ev_data_path = lv_data_path ).
+    unlock_request( ls_up-request ).
+    IF lv_code IS NOT INITIAL.
+      rs_response = err( iv_id = is_message-id iv_code = lv_code iv_message = lv_msg ).
       RETURN.
     ENDIF.
 
@@ -569,6 +565,58 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ( zcl_vsp_utils=>json_int( iv_key = 'cofile_size' iv_value = ls_up-cofile_size ) )
       ( zcl_vsp_utils=>json_int( iv_key = 'data_size' iv_value = ls_up-data_size ) )
     ) ) ) ).
+  ENDMETHOD.
+
+
+  METHOD write_pair.
+    DATA: lv_error       TYPE string,
+          lv_data_open   TYPE abap_bool,
+          lv_cofile_open TYPE abap_bool.
+
+    CLEAR: ev_code, ev_message, ev_cofile_path, ev_data_path.
+    " Checked again, under the lock: begin may have been a while ago.
+    DATA(lt_kinds) = VALUE string_table( ( `data` ) ( `cofile` ) ).
+    LOOP AT lt_kinds INTO DATA(lv_kind).
+      DATA(lv_name) = COND string( WHEN lv_kind = `cofile` THEN is_up-cofile_name ELSE is_up-data_name ).
+      DATA(lv_exists) = file_exists( EXPORTING iv_kind = lv_kind iv_name = lv_name IMPORTING ev_error = lv_error ).
+      IF lv_error IS NOT INITIAL.
+        ev_code = `DIR_TRANS_ERROR`.
+        ev_message = |{ lv_error }. Nothing was written.|.
+        RETURN.
+      ENDIF.
+      IF lv_exists = abap_true.
+        ev_code = `FILE_EXISTS`.
+        ev_message = |{ lv_name } already exists in DIR_TRANS; it is never overwritten. Nothing was written.|.
+        RETURN.
+      ENDIF.
+    ENDLOOP.
+
+    " The data file first, so that tp never finds a cofile without its data.
+    " A file opened here did not exist a moment ago under the same lock, so
+    " it is this call's own and may be removed again.
+    write_file( EXPORTING iv_kind = `data` iv_name = is_up-data_name iv_content = is_up-data
+                IMPORTING ev_opened = lv_data_open ev_path = ev_data_path ev_error = lv_error ).
+    IF lv_error IS NOT INITIAL.
+      DATA(lv_cleanup) = COND string( WHEN lv_data_open = abap_true THEN delete_file( iv_kind = `data` iv_name = is_up-data_name ) ).
+      ev_code = `WRITE_FAILED`.
+      ev_message = |{ is_up-data_name }: { lv_error }. | &&
+                   COND string( WHEN lv_data_open = abap_false THEN `Nothing was written.`
+                                WHEN lv_cleanup IS INITIAL THEN `What this call wrote was deleted again.`
+                                ELSE |What this call wrote could not be deleted: { lv_cleanup }| ).
+      RETURN.
+    ENDIF.
+
+    write_file( EXPORTING iv_kind = `cofile` iv_name = is_up-cofile_name iv_content = is_up-cofile
+                IMPORTING ev_opened = lv_cofile_open ev_path = ev_cofile_path ev_error = lv_error ).
+    IF lv_error IS NOT INITIAL.
+      lv_cleanup = COND string( WHEN lv_cofile_open = abap_true THEN delete_file( iv_kind = `cofile` iv_name = is_up-cofile_name ) ).
+      DATA(lv_cleanup2) = delete_file( iv_kind = `data` iv_name = is_up-data_name iv_sha = is_up-data_sha ).
+      ev_code = `WRITE_FAILED`.
+      ev_message = |{ is_up-cofile_name }: { lv_error }. | &&
+                   COND string( WHEN lv_cleanup IS INITIAL AND lv_cleanup2 IS INITIAL THEN `What this call wrote was deleted again.`
+                                ELSE |Cleanup incomplete: { lv_cleanup } { lv_cleanup2 }| ).
+      RETURN.
+    ENDIF.
   ENDMETHOD.
 
 
@@ -876,6 +924,17 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ENDIF.
     ENDLOOP.
 
+    " The buffer check and the add hold the request's lock: no second add of
+    " it can come in between (tp would re-initialise an existing entry).
+    lv_error = lock_request( iv_request = lv_trkorr iv_wait = abap_true ).
+    IF lv_error IS NOT INITIAL.
+      ls_res-outcome = `not_added`.
+      ls_res-code = `LOCKED`.
+      ls_res-message = |{ lv_error }; ADDTOBUFFER was not called.|.
+      job_log( ls_res ).
+      RETURN.
+    ENDIF.
+
     read_buffer( IMPORTING et_buffer = lt_buffer ev_error = lv_error ).
     IF lv_error IS NOT INITIAL.
       ls_res-outcome = `unknown`.
@@ -936,13 +995,17 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         " Certainly not in the buffer: the upload's files go again, so that
         " the same pair can be uploaded once more.
         ls_res-outcome = `not_added`.
-        delete_file( iv_kind = `cofile` iv_name = |K{ lv_number }.{ lv_sid }| ).
-        delete_file( iv_kind = `data` iv_name = |R{ lv_number }.{ lv_sid }| ).
-        ls_res-rolled_back = abap_true.
+        DATA(lv_del1) = delete_file( iv_kind = `cofile` iv_name = |K{ lv_number }.{ lv_sid }| iv_sha = lv_shac ).
+        DATA(lv_del2) = delete_file( iv_kind = `data` iv_name = |R{ lv_number }.{ lv_sid }| iv_sha = lv_shad ).
+        ls_res-rolled_back = xsdbool( lv_del1 IS INITIAL AND lv_del2 IS INITIAL ).
+        IF ls_res-rolled_back = abap_false.
+          ls_res-message = |{ ls_res-message } Files not taken back: { lv_del1 } { lv_del2 }|.
+        ENDIF.
       ELSE.
         ls_res-outcome = `unknown`.
       ENDIF.
     ENDIF.
+    unlock_request( lv_trkorr ).
     job_log( ls_res ).
   ENDMETHOD.
 
@@ -1049,8 +1112,12 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     IF ms_written-request IS INITIAL.
       RETURN.
     ENDIF.
-    delete_file( iv_kind = `cofile` iv_name = ms_written-cofile_name ).
-    delete_file( iv_kind = `data` iv_name = ms_written-data_name ).
+    " Only the files as this upload wrote them; one changed since is kept.
+    IF lock_request( ms_written-request ) IS INITIAL.
+      delete_file( iv_kind = `cofile` iv_name = ms_written-cofile_name iv_sha = ms_written-cofile_sha ).
+      delete_file( iv_kind = `data` iv_name = ms_written-data_name iv_sha = ms_written-data_sha ).
+      unlock_request( ms_written-request ).
+    ENDIF.
     CLEAR ms_written.
   ENDMETHOD.
 
@@ -1615,17 +1682,68 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
 
 
   METHOD delete_file.
-    DATA: lv_dir  TYPE epsf-epsdirnam,
-          lv_name TYPE eps2filnam.
+    DATA: lv_dir     TYPE epsf-epsdirnam,
+          lv_name    TYPE eps2filnam,
+          lv_content TYPE xstring.
 
+    IF iv_sha IS NOT INITIAL.
+      read_dir_file( EXPORTING iv_kind = iv_kind iv_name = iv_name IMPORTING ev_content = lv_content ev_error = rv_error ).
+      IF rv_error IS NOT INITIAL.
+        rv_error = |{ iv_name } kept: { rv_error }|.
+        RETURN.
+      ENDIF.
+      IF sha256( lv_content ) <> to_upper( iv_sha ).
+        rv_error = |{ iv_name } kept: it is not the file this upload wrote (SHA-256 differs)|.
+        RETURN.
+      ENDIF.
+    ENDIF.
     lv_dir = dir_of( iv_kind ).
     lv_name = iv_name.
     CALL FUNCTION 'EPS_DELETE_FILE'
       EXPORTING
-        iv_long_file_name = lv_name
-        dir_name          = lv_dir
+        iv_long_file_name  = lv_name
+        dir_name           = lv_dir
       EXCEPTIONS
-        OTHERS            = 1.
+        invalid_eps_subdir = 1
+        sapgparam_failed   = 2
+        build_directory_failed = 3
+        no_authorization   = 4
+        build_path_failed  = 5
+        delete_failed      = 6
+        OTHERS             = 7.
+    IF sy-subrc <> 0.
+      rv_error = |{ iv_name } could not be deleted (exception { sy-subrc }) { last_message( ) }|.
+    ENDIF.
+  ENDMETHOD.
+
+
+  METHOD lock_request.
+    DATA lv_trkorr TYPE e070-trkorr.
+    lv_trkorr = iv_request.
+    CALL FUNCTION 'ENQUEUE_E_TRKORR'
+      EXPORTING
+        trkorr         = lv_trkorr
+        _scope         = '1'
+        _wait          = iv_wait
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+    IF sy-subrc = 1.
+      rv_error = |{ lv_trkorr } is locked by { sy-msgv1 } (lock object E_TRKORR); nothing was done|.
+    ELSEIF sy-subrc <> 0.
+      rv_error = |{ lv_trkorr } could not be locked (exception { sy-subrc }) { last_message( ) }; nothing was done|.
+    ENDIF.
+  ENDMETHOD.
+
+
+  METHOD unlock_request.
+    DATA lv_trkorr TYPE e070-trkorr.
+    lv_trkorr = iv_request.
+    CALL FUNCTION 'DEQUEUE_E_TRKORR'
+      EXPORTING
+        trkorr = lv_trkorr
+        _scope = '1'.
   ENDMETHOD.
 
 
