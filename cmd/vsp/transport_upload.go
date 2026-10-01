@@ -158,18 +158,26 @@ var transportDownloadCmd = &cobra.Command{
 	Short: "Copy a released request's cofile and data file out of DIR_TRANS (read-only; needs ZADT_VSP)",
 	Long: `Read K<nr>.<SID> from DIR_TRANS/cofiles and R<nr>.<SID> from DIR_TRANS/data
 of the connected system and write them into a local directory. Nothing on the
-system changes. Existing local files are not overwritten. Requires
---enable-transports.
+system changes. Existing local files are not overwritten. A data file can
+carry table contents, so this is treated as a sensitive read: it requires
+--enable-transports and is refused under --read-only.
 
   SAP_ENABLE_TRANSPORTS=true vsp -s devsys transport download TR-EXAMPLE -o ./out`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dir, _ := cmd.Flags().GetString("output")
+		params, err := resolveSystemParams(cmd)
+		if err != nil {
+			return err
+		}
+		if cliReadOnly(params) {
+			return fmt.Errorf("operation 'DownloadTransportFiles' is blocked: read-only mode enabled (read_only in .vsp.json, or SAP_READ_ONLY); a data file can carry table contents")
+		}
 		client, err := createADTClientFor(cmd)
 		if err != nil {
 			return err
 		}
-		if err := client.CheckTransportBufferRead(args[0], "DownloadTransportFiles"); err != nil {
+		if err := client.CheckTransportDownload(args[0]); err != nil {
 			return err
 		}
 		cofileName, dataName, err := adt.TransportFileNamesForRequest(args[0])

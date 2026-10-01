@@ -113,3 +113,30 @@ func TestTransportUploadCLI_OpenGatesReachTheSystem(t *testing.T) {
 		t.Error("never contacted the system")
 	}
 }
+
+func TestTransportDownloadCLI_RefusedUnderReadOnly(t *testing.T) {
+	for name, c := range map[string]struct {
+		extra string
+		env   map[string]string
+	}{
+		"read_only system": {`,"read_only":true,"enable_transports":true`, nil},
+		"SAP_READ_ONLY":    {`,"enable_transports":true`, map[string]string{"SAP_READ_ONLY": "true"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			hits, _, _ := uploadCLIEnv(t, c.extra)
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			if err := transportDownloadCmd.Flags().Set("output", t.TempDir()); err != nil {
+				t.Fatal(err)
+			}
+			err := transportDownloadCmd.RunE(transportDownloadCmd, []string{"XYZK900001"})
+			if err == nil || !strings.Contains(err.Error(), "read-only") {
+				t.Fatalf("got %v", err)
+			}
+			if n := hits(); n != 0 {
+				t.Errorf("contacted the system %d time(s)", n)
+			}
+		})
+	}
+}

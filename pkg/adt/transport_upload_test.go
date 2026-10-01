@@ -562,3 +562,17 @@ func (stuckJobWS) SendDomainRequest(_ context.Context, _, action string, _ map[s
 	}
 	return &WSResponse{Success: true, Data: []byte(`{"status":"started","ticket":"4711","job":"ZVSP_TRANSPORT_BUFFER"}`)}, nil
 }
+
+// A download is a sensitive read: refused under read-only, even with
+// transports enabled, before anything is sent.
+func TestDownloadTransportFilesRefusedUnderReadOnly(t *testing.T) {
+	s := enabled()
+	s.ReadOnly = true
+	ws := newFakeTransportWS()
+	if _, err := uploadClient(s).DownloadTransportFiles(context.Background(), ws, "XYZK900001"); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Errorf("got %v", err)
+	}
+	if len(ws.actions()) != 0 {
+		t.Errorf("sent %v", ws.actions())
+	}
+}

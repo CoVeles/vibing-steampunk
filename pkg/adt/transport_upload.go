@@ -297,6 +297,19 @@ func (c *Client) CheckTransportBufferRead(request, op string) error {
 	return nil
 }
 
+// CheckTransportDownload runs the checks a download of a request's files
+// needs. A data file can carry table contents, so this is a sensitive read:
+// refused under read-only, and only with transports enabled; the whitelist
+// applies. It does no I/O.
+func (c *Client) CheckTransportDownload(request string) error {
+	const op = "DownloadTransportFiles"
+	request = strings.ToUpper(strings.TrimSpace(request))
+	if c.config.Safety.ReadOnly {
+		return fmt.Errorf("operation '%s' is blocked: read-only mode enabled (a data file can carry table contents)", op)
+	}
+	return c.CheckTransportBufferRead(request, op)
+}
+
 // --- the ZADT_VSP transport domain -----------------------------------------
 
 // TransportService is the part of ZADT_VSP's WebSocket client the transport
@@ -682,7 +695,7 @@ type transportDownloadAnswer struct {
 // of the connected system. It changes nothing.
 func (c *Client) DownloadTransportFiles(ctx context.Context, ws TransportService, request string) (*TransportFiles, error) {
 	request = strings.ToUpper(strings.TrimSpace(request))
-	if err := c.CheckTransportBufferRead(request, "DownloadTransportFiles"); err != nil {
+	if err := c.CheckTransportDownload(request); err != nil {
 		return nil, err
 	}
 	cofileName, dataName, err := TransportFileNamesForRequest(request)
