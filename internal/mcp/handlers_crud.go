@@ -639,6 +639,12 @@ func (s *Server) handleMoveObject(ctx context.Context, request mcp.CallToolReque
 	if err := s.adtClient.Safety().CheckOperation(adt.OpUpdate, "MoveObject"); err != nil {
 		return newToolResultError(err.Error()), nil
 	}
+	// The target package is known without a request, so --allowed-packages
+	// is checked against it here too. The object's current package would
+	// need a lookup and is not checked yet.
+	if err := s.adtClient.Safety().CheckPackage(newPackage); err != nil {
+		return newToolResultError(err.Error()), nil
+	}
 
 	// Ensure WebSocket client is connected
 	if err := s.ensureDebugWSClient(ctx); err != nil {
