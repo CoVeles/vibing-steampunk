@@ -469,6 +469,7 @@ var readOnlyClasses = map[string]surfaceClass{
 	"SAP create APPEND": clsMutate, "SAP create CLAS_TEST_INCLUDE": clsMutate, "SAP create PROGRAM": clsMutate,
 	"SAP create CLASS_WITH_TESTS": clsMutate, "SAP create UI5_APP": clsMutate,
 	"SAP delete OBJECT": clsMutate, "SAP delete (no target)": clsMutate,
+	"SAP delete PROG by name": clsMutate, "SAP delete FUNC by name": clsMutate,
 	"SAP delete UI5_FILE": clsMutate, "SAP delete UI5_APP": clsMutate,
 
 	// --- SAP(): test ---
@@ -1065,6 +1066,8 @@ func actionCases() []actionCase {
 		// delete
 		{Name: "SAP delete OBJECT", Action: "delete", Target: "OBJECT", Like: "DeleteObject"},
 		{Name: "SAP delete (no target)", Action: "delete", Like: "DeleteObject"},
+		{Name: "SAP delete PROG by name", Action: "delete", Target: "PROG ZDEMO_REPORT", Exact: true},
+		{Name: "SAP delete FUNC by name", Action: "delete", Target: "FUNC Z_DEMO_FM", Exact: true},
 		{Name: "SAP delete UI5_FILE", Action: "delete", Target: "UI5_FILE", Like: "UI5DeleteFile"},
 		{Name: "SAP delete UI5_APP", Action: "delete", Target: "UI5_APP", Like: "UI5DeleteApp"},
 

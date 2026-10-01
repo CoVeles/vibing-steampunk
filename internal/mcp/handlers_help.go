@@ -132,7 +132,24 @@ High-level create (with source):
 	case "delete":
 		return mcp.NewToolResultText(`SAP(action="delete") - Delete objects
 
-  SAP(action="delete", target="OBJECT", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test", "lock_handle": "..."})`)
+By type and name -- locks, deletes and unlocks in this one call:
+  SAP(action="delete", target="PROG ZDEMO_REPORT")
+  SAP(action="delete", target="CLAS ZCL_DEMO", params={"transport": "A4HK900001"})
+  SAP(action="delete", target="FUNC Z_DEMO_FM", params={"parent": "ZDEMO_FG"})   (the group is looked up when not given)
+  Types: ` + deleteNameTypesLine + `
+
+By ADT URL:
+  SAP(action="delete", target="OBJECT", params={"object_url": "/sap/bc/adt/oo/classes/zcl_demo"})
+
+Do not lock first: without lock_handle the call takes its own lock and releases
+it after the DELETE. A handle carried over from an earlier edit target="LOCK"
+is still accepted, but the session it belongs to may be gone by then (#169).
+--read-only refuses every delete; --allowed-packages must allow the object's
+package; a transportable object needs "transport" and --allow-transportable-edits.
+
+UI5 (BSP) repository:
+  SAP(action="delete", target="UI5_FILE", params={"app_name": "ZDEMO_APP", "file_path": "/webapp/demo.js"})
+  SAP(action="delete", target="UI5_APP", params={"app_name": "ZDEMO_APP"})`)
 
 	case "search":
 		return mcp.NewToolResultText(`SAP(action="search") - Search for objects
@@ -792,7 +809,8 @@ func getUnhandledErrorMessage(action, objectType, objectName string) string {
 		sb.WriteString("save_to_file, deploy_from_file, rename\n")
 		sb.WriteString("Use SAP(action=\"help\", target=\"system\") for examples.")
 	case "delete":
-		sb.WriteString("Supported delete targets: OBJECT, UI5_FILE, UI5_APP\n")
+		sb.WriteString("Supported delete targets: <TYPE> <NAME> (" + deleteNameTypesLine + "), OBJECT with params.object_url, UI5_FILE, UI5_APP\n")
+		sb.WriteString("Example: SAP(action=\"delete\", target=\"PROG ZDEMO_REPORT\") -- no lock_handle needed\n")
 		sb.WriteString("Use SAP(action=\"help\", target=\"delete\") for examples.")
 	case "debug":
 		sb.WriteString("Supported debug targets: SET_BREAKPOINT, GET_BREAKPOINTS, DELETE_BREAKPOINT, LISTEN, ATTACH, DETACH, STEP, GET_STACK, GET_VARIABLES, CALL_RFC, MOVE, RUN_REPORT, GET_VARIANTS, GET_TEXT_ELEMENTS, SET_TEXT_ELEMENTS, AMDP_ADT_*, AMDP_*\n")

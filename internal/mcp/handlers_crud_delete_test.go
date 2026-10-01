@@ -150,3 +150,135 @@ func TestHandleDeleteObject_ForeignPackageRefusedBeforeLock(t *testing.T) {
 		}
 	}
 }
+
+// --- delete <TYPE> <NAME> in hyperfocused mode (issue #240) ---
+
+func universalDelete(t *testing.T, s *Server, target string, params map[string]any) (string, bool) {
+	t.Helper()
+	args := map[string]any{"action": "delete", "target": target}
+	if params != nil {
+		args["params"] = params
+	}
+	res, err := s.handleUniversalTool(context.Background(), newRequest(args))
+	if err != nil {
+		t.Fatalf("handleUniversalTool: %v", err)
+	}
+	return resultText(res), res.IsError
+}
+
+// TestUniversalDeleteByTypeAndName pins #240: SAP(action="delete",
+// target="PROG X") is routed, gates before it locks, locks, deletes and
+// releases the lock after the DELETE -- without a lock_handle from the caller.
+func TestUniversalDeleteByTypeAndName(t *testing.T) {
+	server, trace := newDeleteTestServer(t, "$TMP")
+
+	text, isErr := universalDelete(t, server, "PROG ZDEMO_DEL", nil)
+	calls := trace()
+	if isErr {
+		dumpDeleteCalls(t, calls)
+		t.Fatalf("delete PROG ZDEMO_DEL failed: %s", text)
+	}
+
+	lockAt, delAt, unlockAt, searchAt := -1, -1, -1, -1
+	for i, c := range calls {
+		switch {
+		case c.method == http.MethodPost && c.action == "LOCK":
+			lockAt = i
+		case c.method == http.MethodPost && c.action == "UNLOCK":
+			unlockAt = i
+		case c.method == http.MethodDelete:
+			delAt = i
+			if want := "/sap/bc/adt/programs/programs/zdemo_del"; c.path != want {
+				t.Errorf("DELETE went to %s, want %s", c.path, want)
+			}
+		case strings.Contains(c.path, "informationsystem/search"):
+			if lockAt < 0 {
+				searchAt = i
+			}
+		}
+	}
+	if searchAt < 0 || lockAt < 0 || searchAt > lockAt {
+		t.Errorf("package lookup at %d, LOCK at %d; want the allowed-packages check above the lock", searchAt, lockAt)
+	}
+	if delAt < lockAt {
+		t.Errorf("DELETE at %d, LOCK at %d; want LOCK then DELETE", delAt, lockAt)
+	}
+	if unlockAt < delAt {
+		t.Errorf("UNLOCK at %d, DELETE at %d; want the lock released after the DELETE, or its ENQUEUE stays in SM12", unlockAt, delAt)
+	}
+	if t.Failed() {
+		dumpDeleteCalls(t, calls)
+	}
+}
+
+// TestUniversalDeleteByNameRespectsAllowedPackages: an object outside
+// --allowed-packages is refused before it is locked.
+func TestUniversalDeleteByNameRespectsAllowedPackages(t *testing.T) {
+	server, trace := newDeleteTestServer(t, "ZSOMEONE_ELSE")
+
+	text, isErr := universalDelete(t, server, "PROG ZDEMO_DEL", nil)
+	if !isErr {
+		t.Fatalf("a delete outside the allowlist succeeded: %s", text)
+	}
+	for i, c := range trace() {
+		if c.action == "LOCK" || c.method == http.MethodDelete {
+			t.Errorf("an object outside the allowlist was touched: [%d] %s", i, c)
+		}
+	}
+}
+
+// TestUniversalDeleteByNameRefusedReadOnly: --read-only refuses it before
+// anything is locked or deleted.
+func TestUniversalDeleteByNameRefusedReadOnly(t *testing.T) {
+	fake, trace := newDeleteTestServer(t, "$TMP")
+	server := NewServer(&Config{
+		BaseURL: fake.config.BaseURL, Username: "u", Password: "p", Client: "001", Language: "EN",
+		AllowedPackages: []string{"$TMP"}, ReadOnly: true,
+	})
+
+	text, isErr := universalDelete(t, server, "CLAS ZCL_DEMO_DEL", nil)
+	low := strings.ToLower(text)
+	if !isErr || !(strings.Contains(low, "read-only") || strings.Contains(low, "safety configuration")) {
+		t.Errorf("delete under --read-only: want a refusal naming read-only or the safety configuration, got: %s", text)
+	}
+	for i, c := range trace() {
+		if c.action == "LOCK" || c.method == http.MethodDelete {
+			t.Errorf("--read-only let a delete through: [%d] %s", i, c)
+		}
+	}
+}
+
+// TestUniversalDeleteUnknownTypeSaysWhatWorks: a type with no delete here is
+// not routed, and the answer lists the targets that are.
+func TestUniversalDeleteUnknownTypeSaysWhatWorks(t *testing.T) {
+	server, _ := newDeleteTestServer(t, "$TMP")
+	text, isErr := universalDelete(t, server, "NOPE ZDEMO", nil)
+	if !isErr || !strings.Contains(text, "<TYPE> <NAME>") || !strings.Contains(text, "PROG") {
+		t.Errorf("unknown delete type: want the supported targets listed, got: %s", text)
+	}
+}
+
+func TestDeleteURLByName(t *testing.T) {
+	for _, tc := range []struct{ typ, name, parent, want string }{
+		{"PROG", "ZDEMO", "", "/sap/bc/adt/programs/programs/zdemo"},
+		{"CLAS", "ZCL_DEMO", "", "/sap/bc/adt/oo/classes/zcl_demo"},
+		{"INCL", "ZDEMO_TOP", "", "/sap/bc/adt/programs/includes/ZDEMO_TOP"},
+		{"FUNC", "Z_DEMO_FM", "ZDEMO_FG", "/sap/bc/adt/functions/groups/ZDEMO_FG/fmodules/Z_DEMO_FM"},
+		{"STRUCT", "ZDEMO_S", "", "/sap/bc/adt/ddic/structures/zdemo_s"},
+		{"DEVC", "$ZDEMO", "", "/sap/bc/adt/packages/$ZDEMO"},
+	} {
+		got, ok := deleteURLByName(tc.typ, tc.name, tc.parent)
+		if !ok || got != tc.want {
+			t.Errorf("deleteURLByName(%s, %s, %s) = %q, %v; want %q", tc.typ, tc.name, tc.parent, got, ok, tc.want)
+		}
+	}
+	for _, typ := range deleteNameTypes {
+		parent := ""
+		if typ == "FUNC" {
+			parent = "ZDEMO_FG"
+		}
+		if got, ok := deleteURLByName(typ, "ZDEMO", parent); !ok || !strings.HasPrefix(got, "/sap/bc/adt/") {
+			t.Errorf("%s is listed as deletable by name but has no URL: %q", typ, got)
+		}
+	}
+}
