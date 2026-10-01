@@ -469,14 +469,31 @@ CLASS ltc_executor IMPLEMENTATION.
               lv_vsp_text = '<initial reference>'.
             ENDIF.
           WHEN OTHERS.
+            " A data reference hands back what it points to. A reference to
+            " a reference is followed in a bounded loop, so a chain that
+            " points back at itself cannot recurse without end.
             lr_vsp_data = value.
+            DO 16 TIMES.
+              IF lr_vsp_data IS NOT BOUND.
+                EXIT.
+              ENDIF.
+              ASSIGN lr_vsp_data->* TO <lv_vsp_any>.
+              DATA(lo_vsp_inner) = cl_abap_typedescr=>describe_by_data( <lv_vsp_any> ).
+              IF lo_vsp_inner->kind <> cl_abap_typedescr=>kind_ref.
+                return_value( <lv_vsp_any> ).
+                RETURN.
+              ENDIF.
+              DATA(lv_vsp_inner_kind) = CAST cl_abap_refdescr( lo_vsp_inner )->get_referenced_type( )->kind.
+              IF lv_vsp_inner_kind = cl_abap_typedescr=>kind_class OR lv_vsp_inner_kind = cl_abap_typedescr=>kind_intf.
+                return_value( <lv_vsp_any> ).
+                RETURN.
+              ENDIF.
+              lr_vsp_data = <lv_vsp_any>.
+            ENDDO.
             IF lr_vsp_data IS NOT BOUND.
               lv_vsp_text = '<initial reference>'.
             ELSE.
-              " A data reference hands back what it points to.
-              ASSIGN lr_vsp_data->* TO <lv_vsp_any>.
-              return_value( <lv_vsp_any> ).
-              RETURN.
+              lv_vsp_text = '<reference chain too deep or cyclic>'.
             ENDIF.
         ENDCASE.
       WHEN OTHERS.

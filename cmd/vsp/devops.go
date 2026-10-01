@@ -106,7 +106,8 @@ A method fails on a failed assertion or an exception (or any critical/fatal
 alert); a warning, such as a class not run for its risk level, does not fail
 it. Alerts filed on the class itself (CLASS_SETUP, CLASS_TEARDOWN) are listed
 under the class. The exit code is non-zero when anything failed, or when test
-classes were found but no test method ran.`,
+classes were found but no test method ran, or when ABAP Unit did not run some
+test class (for example one refused for its risk level) even though others ran.`,
 	// A failing test is an answer, not a mistake in the command line, and a
 	// usage screen after the failures only buries them.
 	SilenceUsage: true,
