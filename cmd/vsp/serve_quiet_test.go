@@ -72,6 +72,8 @@ func TestResolveCallTimeout(t *testing.T) {
 		{"", "500ms"},
 		{"", "0.5"},
 		{"", "NaN"},
+		{"", "+Inf"},
+		{"", "Inf"},
 		{"-1", ""},
 	}
 	for _, c := range bad {

@@ -225,6 +225,72 @@ func TestPackageInventoryTruncatedOnlyBeyondTheLimit(t *testing.T) {
 	}
 }
 
+// Deleted TADIR entries are not live objects, and the ADT fallback never lists
+// them, so the SQL path filters them out too.
+func TestPackageInventorySkipsDeletedTADIREntries(t *testing.T) {
+	f := &inventorySAP{}
+	if _, err := newInventoryClient(t, f).PackageInventory(context.Background(), "$ZDEMO"); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range f.queries {
+		if strings.Contains(q, "from tadir") {
+			if !strings.Contains(q, "delflag <> 'x'") {
+				t.Fatalf("TADIR query keeps deleted entries: %s", q)
+			}
+			return
+		}
+	}
+	t.Fatal("no TADIR query sent")
+}
+
+func TestPackageInventorySubpackagesTruncatedOnlyBeyondTheLimit(t *testing.T) {
+	saved := inventoryMaxSubpackages
+	t.Cleanup(func() { inventoryMaxSubpackages = saved })
+
+	inventoryMaxSubpackages = 1 // the fixture's TDEVC holds exactly 1
+	inv, err := newInventoryClient(t, &inventorySAP{}).PackageInventory(context.Background(), "$ZDEMO")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.SubpackagesTruncated || len(inv.Subpackages) != 1 {
+		t.Fatalf("exactly the limit: truncated=%v, %d subpackages", inv.SubpackagesTruncated, len(inv.Subpackages))
+	}
+
+	inventoryMaxSubpackages = 0
+	inv, err = newInventoryClient(t, &inventorySAP{}).PackageInventory(context.Background(), "$ZDEMO")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inv.SubpackagesTruncated || len(inv.Subpackages) != 0 {
+		t.Fatalf("beyond the limit: truncated=%v, %d subpackages", inv.SubpackagesTruncated, len(inv.Subpackages))
+	}
+}
+
+// ZABAPGIT cannot be filtered by package in SQL. When the read is cut off, a
+// repository found is still reported, but "none found" is not a definite
+// empty list: the package's repository may be among the rows not read.
+func TestPackageInventoryAbapGitScanCutOff(t *testing.T) {
+	saved := inventoryMaxRepos
+	t.Cleanup(func() { inventoryMaxRepos = saved })
+	inventoryMaxRepos = 1 // the fixture holds 2: $ZDEMO's first, then $ZOTHER's
+
+	inv, err := newInventoryClient(t, &inventorySAP{}).PackageInventory(context.Background(), "$ZDEMO")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inv.AbapGitRepos) != 1 || !strings.Contains(strings.Join(inv.Notes, "\n"), "only the first 1 were scanned") {
+		t.Fatalf("found within the cut: repos=%v notes=%v", inv.AbapGitRepos, inv.Notes)
+	}
+
+	inv, err = newInventoryClient(t, &inventorySAP{}).PackageInventory(context.Background(), "$ZOTHER")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.AbapGitRepos != nil {
+		t.Fatalf("not found in a cut-off scan must be unknown (nil), got %v", inv.AbapGitRepos)
+	}
+}
+
 // A data source that fails is worked around; a context that ends is not a
 // failing data source. Whichever SELECT the cancellation or deadline lands
 // in, the inventory returns the context's error, not a partial inventory.

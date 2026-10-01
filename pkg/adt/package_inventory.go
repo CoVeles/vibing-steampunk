@@ -47,6 +47,9 @@ type PackageInventory struct {
 	Objects          []InventoryObject     `json:"objects"`
 	ObjectsTruncated bool                  `json:"objects_truncated,omitempty"`
 	Subpackages      []InventorySubpackage `json:"subpackages"`
+	// SubpackagesTruncated is set when there are more direct subpackages
+	// than are listed.
+	SubpackagesTruncated bool `json:"subpackages_truncated,omitempty"`
 	// AbapGitRepos is nil when it could not be checked (see Skipped/Notes),
 	// and empty when it was and none is registered for the package.
 	AbapGitRepos []AbapGitRepo `json:"abapgit_repos"`
@@ -58,6 +61,13 @@ type PackageInventory struct {
 // inventoryMaxObjects bounds the TADIR read. A variable so tests can make it
 // small.
 var inventoryMaxObjects = 5000
+
+// inventoryMaxSubpackages and inventoryMaxRepos bound the TDEVC and ZABAPGIT
+// reads; variables so tests can make them small.
+var (
+	inventoryMaxSubpackages = 1000
+	inventoryMaxRepos       = 1000
+)
 
 // packageNamePattern is the shape of a package name. The name goes into an
 // SQL literal, so anything else is refused rather than escaped.
@@ -95,7 +105,7 @@ func (c *Client) PackageInventory(ctx context.Context, packageName string) (*Pac
 	objectsFromADT, subsFromADT := false, false
 
 	rows, err := c.RunQuery(ctx, fmt.Sprintf(
-		"SELECT object, obj_name, author, created_on FROM tadir WHERE pgmid = 'R3TR' AND devclass = '%s'", pkg),
+		"SELECT object, obj_name, author, created_on FROM tadir WHERE pgmid = 'R3TR' AND devclass = '%s' AND delflag <> 'X'", pkg),
 		// One more than is listed, so a package with exactly the limit is
 		// not reported as truncated.
 		inventoryMaxObjects+1)
@@ -126,7 +136,9 @@ func (c *Client) PackageInventory(ctx context.Context, packageName string) (*Pac
 	}
 
 	rows, err = c.RunQuery(ctx, fmt.Sprintf(
-		"SELECT devclass, as4user, created_on FROM tdevc WHERE parentcl = '%s'", pkg), 1000)
+		"SELECT devclass, as4user, created_on FROM tdevc WHERE parentcl = '%s'", pkg),
+		// One more than is listed, to tell a full list from a cut one.
+		inventoryMaxSubpackages+1)
 	if err != nil {
 		if cerr := inventoryCancelled(ctx, err); cerr != nil {
 			return nil, cerr
@@ -134,7 +146,13 @@ func (c *Client) PackageInventory(ctx context.Context, packageName string) (*Pac
 		inv.Notes = append(inv.Notes, fmt.Sprintf("TDEVC could not be read (%v); subpackages are from the ADT package contents", err))
 		subsFromADT = true
 	} else {
-		for _, r := range rows.Rows {
+		listed := rows.Rows
+		if len(listed) > inventoryMaxSubpackages {
+			listed = listed[:inventoryMaxSubpackages]
+			inv.SubpackagesTruncated = true
+			inv.Notes = append(inv.Notes, fmt.Sprintf("only the first %d direct subpackages are listed", inventoryMaxSubpackages))
+		}
+		for _, r := range listed {
 			inv.Subpackages = append(inv.Subpackages, InventorySubpackage{
 				Name:        rowString(r, "DEVCLASS"),
 				Responsible: rowString(r, "AS4USER"),
@@ -232,7 +250,9 @@ func (c *Client) inventoryAbapGit(ctx context.Context, inv *PackageInventory) er
 		inv.Notes = append(inv.Notes, "abapGit: not installed (no table ZABAPGIT)")
 		return nil
 	}
-	rows, err = c.RunQuery(ctx, "SELECT value, data_str FROM zabapgit WHERE type = 'REPO'", 1000)
+	// The package is inside the XML in DATA_STR, so it cannot be filtered on
+	// in SQL: every repository is read, and a cut-off read is said to be one.
+	rows, err = c.RunQuery(ctx, "SELECT value, data_str FROM zabapgit WHERE type = 'REPO'", inventoryMaxRepos+1)
 	if err != nil {
 		if cerr := inventoryCancelled(ctx, err); cerr != nil {
 			return cerr
@@ -240,11 +260,23 @@ func (c *Client) inventoryAbapGit(ctx context.Context, inv *PackageInventory) er
 		inv.Notes = append(inv.Notes, fmt.Sprintf("abapGit: table ZABAPGIT could not be read (%v)", err))
 		return nil
 	}
+	scanned := rows.Rows
+	cut := len(scanned) > inventoryMaxRepos
+	if cut {
+		scanned = scanned[:inventoryMaxRepos]
+	}
 	inv.AbapGitRepos = []AbapGitRepo{}
-	for _, r := range rows.Rows {
+	for _, r := range scanned {
 		repo, ok := parseAbapGitRepo(rowString(r, "VALUE"), rowString(r, "DATA_STR"))
 		if ok && strings.EqualFold(repo.Package, inv.Package) {
 			inv.AbapGitRepos = append(inv.AbapGitRepos, repo)
+		}
+	}
+	if cut {
+		inv.Notes = append(inv.Notes, fmt.Sprintf("abapGit: the system has more than %d repositories and only the first %d were scanned, so a repository for this package may be missing", inventoryMaxRepos, inventoryMaxRepos))
+		if len(inv.AbapGitRepos) == 0 {
+			// Not found in part of the table is not "none registered".
+			inv.AbapGitRepos = nil
 		}
 	}
 	return nil

@@ -621,7 +621,7 @@ func resolveCallTimeout(cmd *cobra.Command) (time.Duration, error) {
 	} else if v := strings.TrimSpace(viper.GetString("CALL_TIMEOUT")); v != "" {
 		source = fmt.Sprintf("SAP_CALL_TIMEOUT=%q", v)
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			if math.IsNaN(f) || f < 0 {
+			if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
 				return 0, fmt.Errorf("%s: must be a number of seconds, at least 1 (0 for none)", source)
 			}
 			if f > mcp.MaxCallTimeout.Seconds() {
