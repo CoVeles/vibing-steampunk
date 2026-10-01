@@ -19,7 +19,7 @@ const htmlErrorPage = `<!DOCTYPE html><html><head><title>500 Internal Server Err
 
 const lockOK = `<?xml version="1.0" encoding="UTF-8"?>
 <asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA>
-<LOCK_HANDLE>HANDLE-1</LOCK_HANDLE><CORRNR>A4HK900001</CORRNR><CORRUSER>DEVELOPER</CORRUSER>
+<LOCK_HANDLE>HANDLE-1</LOCK_HANDLE><CORRNR>TR-EXAMPLE</CORRNR><CORRUSER>TESTUSER</CORRUSER>
 <CORRTEXT>demo &amp; test</CORRTEXT><IS_LOCAL>X</IS_LOCAL><IS_LINK_UP></IS_LINK_UP>
 <MODIFICATION_SUPPORT>Modification</MODIFICATION_SUPPORT>
 </DATA></asx:values></asx:abap>`
