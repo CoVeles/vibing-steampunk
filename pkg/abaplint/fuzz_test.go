@@ -110,6 +110,7 @@ func FuzzStatementParser(f *testing.F) {
 			}
 			in[tokenKey{tok.Row, tok.Col, tok.Str}] = true
 		}
+		trailing := trailingChainPrefix(tokens)
 		out := map[tokenKey]bool{}
 		for i, s := range stmts {
 			if s.Type == "" {
@@ -125,22 +126,52 @@ func FuzzStatementParser(f *testing.F) {
 				out[k] = true
 			}
 		}
-		// The one drop abaplint itself makes: a chain prefix with nothing
-		// after it at the end of the source ("DATA:" as the last statement)
-		// is never emitted. The port keeps that, so it is allowed here, and
-		// only there: the last token the parser saw must be that colon.
-		lastIsColon := false
-		for _, tok := range tokens {
-			if tok.Type != TokenComment {
-				lastIsColon = tok.Str == ":"
-			}
-		}
 		for k := range in {
-			if !out[k] && !lastIsColon {
+			if !out[k] && !trailing[k] {
 				t.Fatalf("token %+v was dropped", k)
 			}
 		}
 	})
+}
+
+// trailingChainPrefix returns the one set of tokens the parser may drop, the
+// way abaplint's own StatementParser does: a chain prefix with nothing after
+// it at the end of the source ("DATA:" as the last statement) is never
+// emitted. Those are the tokens after the last "." up to the first colon
+// after it, and only when nothing but colons follows that colon.
+func trailingChainPrefix(tokens []Token) map[tokenKey]bool {
+	var code []Token
+	for _, tok := range tokens {
+		if tok.Type != TokenComment {
+			code = append(code, tok)
+		}
+	}
+	start := 0
+	for i, tok := range code {
+		if tok.Str == "." {
+			start = i + 1
+		}
+	}
+	colon := -1
+	for i := start; i < len(code); i++ {
+		if code[i].Str == ":" {
+			colon = i
+			break
+		}
+	}
+	if colon < 0 {
+		return nil
+	}
+	for _, tok := range code[colon:] {
+		if tok.Str != ":" {
+			return nil
+		}
+	}
+	prefix := map[tokenKey]bool{}
+	for _, tok := range code[start:colon] {
+		prefix[tokenKey{tok.Row, tok.Col, tok.Str}] = true
+	}
+	return prefix
 }
 
 // FuzzLinter runs every rule over arbitrary source: a lint pass over a file
