@@ -11,7 +11,7 @@ import (
 	"github.com/oisee/vibing-steampunk/pkg/adt"
 )
 
-// routeDevToolsAction routes "test" (unit tests), "analyze" (syntax check), "edit" (activate), and "analyze" (execute_abap).
+// routeDevToolsAction routes "test" (unit tests), "analyze" (syntax check), "edit" (activate), and "analyze" (execute_abap, check_abap).
 func (s *Server) routeDevToolsAction(ctx context.Context, action, objectType, objectName string, params map[string]any) (*mcp.CallToolResult, bool, error) {
 	if action == "test" {
 		analysisType := getStringParam(params, "type")
@@ -39,6 +39,8 @@ func (s *Server) routeDevToolsAction(ctx context.Context, action, objectType, ob
 			return s.callHandler(ctx, s.handleSyntaxCheck, params)
 		case "execute_abap":
 			return s.callHandler(ctx, s.handleExecuteABAP, params)
+		case "check_abap":
+			return s.callHandler(ctx, s.handleCheckABAP, params)
 		}
 	}
 
@@ -75,6 +77,24 @@ func (s *Server) handleSyntaxCheck(ctx context.Context, request mcp.CallToolRequ
 	}
 
 	output, _ := json.MarshalIndent(results, "", "  ")
+	return mcp.NewToolResultText(string(output)), nil
+}
+
+// handleCheckABAP type-checks a snippet without running it: SAP's syntax
+// check of the snippet wrapped as execute_abap wraps it. It creates and
+// deletes a temporary program in $TMP, so --read-only refuses it.
+func (s *Server) handleCheckABAP(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	code, _ := request.GetArguments()["code"].(string)
+	if code == "" {
+		return newToolResultError("code is required"), nil
+	}
+
+	result, err := s.adtClient.CheckABAP(ctx, code)
+	if err != nil {
+		return newToolResultError(fmt.Sprintf("check_abap failed: %v", err)), nil
+	}
+
+	output, _ := json.MarshalIndent(result, "", "  ")
 	return mcp.NewToolResultText(string(output)), nil
 }
 
