@@ -33,6 +33,11 @@ CLASS zcl_vsp_git_service DEFINITION
     CONSTANTS c_max_zip TYPE i VALUE 20971520.
     "! One decoded chunk, in bytes.
     CONSTANTS c_max_chunk TYPE i VALUE 1048576.
+    "! The zip's entries, and their declared uncompressed size in bytes
+    "! (200 MB): checked from the zip's directory before anything is
+    "! decompressed. vsp checks the same limits before it sends the zip.
+    CONSTANTS c_max_entries TYPE i VALUE 50000.
+    CONSTANTS c_max_unzipped TYPE int8 VALUE 209715200.
     "! The background job (and its program) that runs the import.
     CONSTANTS c_job_name TYPE tbtcjob-jobname VALUE 'ZVSP_GIT_IMPORT'.
     "! AMC application and channel the job publishes its outcome on; the
@@ -164,7 +169,9 @@ CLASS zcl_vsp_git_service DEFINITION
       RETURNING VALUE(rs_response) TYPE zif_vsp_service=>ty_response.
 
     "! Deletes the abapGit repository registered for exactly this package:
-    "! its row, not its objects.
+    "! its row, not its objects -- and only an offline repository of a
+    "! package that is empty (no object but its own entry, no subpackage).
+    "! An online repository (URL, branch, settings) is never unregistered.
     METHODS handle_delete_repo
       IMPORTING is_message         TYPE zif_vsp_service=>ty_message
       RETURNING VALUE(rs_response) TYPE zif_vsp_service=>ty_response.
@@ -184,8 +191,11 @@ CLASS zcl_vsp_git_service DEFINITION
 
     "! Applies the import's policy to abapGit's checks: sets the decisions
     "! and the transport, or says why the import is refused (ev_code).
+    "! iv_new_repo: the repository was created by this import (the package
+    "! had none).
     CLASS-METHODS evaluate_checks
       IMPORTING is_params    TYPE ty_import_params
+                iv_new_repo  TYPE abap_bool
       EXPORTING ev_code      TYPE string
                 ev_message   TYPE string
                 et_decisions TYPE tt_decision
@@ -235,8 +245,20 @@ CLASS zcl_vsp_git_service DEFINITION
                 ev_error    TYPE string.
 
     "! Deletes what ended jobs left: their variants and zips, and results
-    "! older than a week.
+    "! older than a week; and this user's jobs that were scheduled but never
+    "! released, a day on.
     CLASS-METHODS housekeeping.
+
+    "! A job that will not run: the job, its variant and its zip go.
+    CLASS-METHODS drop_job
+      IMPORTING iv_jobcount TYPE csequence.
+
+    "! The zip's directory within c_max_entries and c_max_unzipped, with
+    "! exactly one .abapgit.xml at its root; else a refusal (ev_code).
+    CLASS-METHODS zip_limits
+      IMPORTING iv_zip     TYPE xstring
+      EXPORTING ev_code    TYPE string
+                ev_message TYPE string.
 
     CLASS-METHODS store_result
       IMPORTING iv_jobcount TYPE csequence
@@ -676,9 +698,10 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
 
 
   METHOD import_commit.
-    DATA: lo_zip      TYPE REF TO cl_abap_zip,
-          lv_jobcount TYPE string,
-          lv_error    TYPE string.
+    DATA: lv_jobcount TYPE string,
+          lv_error    TYPE string,
+          lv_code     TYPE string,
+          lv_message  TYPE string.
 
     DATA(lv_id) = zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'assembly_id' ).
     IF ms_upload-id IS INITIAL OR lv_id <> ms_upload-id.
@@ -699,17 +722,10 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
                          iv_message = `The received bytes do not match the SHA-256 declared at begin. Nothing was imported.` ).
       RETURN.
     ENDIF.
-    " A zip, with the repository's .abapgit.xml at its root.
-    CREATE OBJECT lo_zip.
-    lo_zip->load( EXPORTING zip = ls_up-data EXCEPTIONS zip_parse_error = 1 OTHERS = 2 ).
-    IF sy-subrc <> 0.
-      rs_response = err( iv_id = is_message-id iv_code = 'INVALID_ZIP'
-                         iv_message = `The upload is not a zip. Nothing was imported.` ).
-      RETURN.
-    ENDIF.
-    IF NOT line_exists( lo_zip->files[ name = '.abapgit.xml' ] ).
-      rs_response = err( iv_id = is_message-id iv_code = 'INVALID_ZIP'
-                         iv_message = `The zip has no .abapgit.xml at its root: it is not an abapGit offline zip. Nothing was imported.` ).
+    " A zip within the limits, with one .abapgit.xml at its root.
+    zip_limits( EXPORTING iv_zip = ls_up-data IMPORTING ev_code = lv_code ev_message = lv_message ).
+    IF lv_code IS NOT INITIAL.
+      rs_response = err( iv_id = is_message-id iv_code = lv_code iv_message = |{ lv_message } Nothing was imported.| ).
       RETURN.
     ENDIF.
 
@@ -803,8 +819,7 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
         OTHERS                    = 9.
     IF sy-subrc <> 0.
       ev_error = |RS_CREATE_VARIANT { lv_variant } failed (exception { sy-subrc }) { last_message( ) }|.
-      DELETE FROM DATABASE indx(zv) ID lv_key.
-      COMMIT WORK.
+      drop_job( lv_jobcount ).
       RETURN.
     ENDIF.
 
@@ -826,8 +841,7 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
         OTHERS            = 8.
     IF sy-subrc <> 0.
       ev_error = |JOB_SUBMIT failed (exception { sy-subrc }) { last_message( ) }|.
-      DELETE FROM DATABASE indx(zv) ID lv_key.
-      COMMIT WORK.
+      drop_job( lv_jobcount ).
       RETURN.
     ENDIF.
 
@@ -854,15 +868,13 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
         invalid_time_zone    = 9
         OTHERS               = 10.
     IF sy-subrc <> 0.
-      ev_error = |JOB_CLOSE failed (exception { sy-subrc }) { last_message( ) }|.
-      DELETE FROM DATABASE indx(zv) ID lv_key.
-      COMMIT WORK.
+      ev_error = |JOB_CLOSE failed (exception { sy-subrc }) { last_message( ) }; the job, its variant and its zip were deleted again|.
+      drop_job( lv_jobcount ).
       RETURN.
     ENDIF.
     IF lv_released IS INITIAL.
-      ev_error = |job { lv_jobname } { lv_jobcount } was scheduled but not released: releasing it needs S_BTCH_JOB with JOBACTION RELE; delete it in SM37|.
-      DELETE FROM DATABASE indx(zv) ID lv_key.
-      COMMIT WORK.
+      ev_error = |job { lv_jobname } { lv_jobcount } was scheduled but not released (releasing it needs S_BTCH_JOB with JOBACTION RELE); the job, its variant and its zip were deleted again|.
+      drop_job( lv_jobcount ).
       RETURN.
     ENDIF.
     ev_jobcount = lv_jobcount.
@@ -902,6 +914,86 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
     " Results are kept a week for import_status.
     DATA(lv_cutoff) = CONV d( sy-datum - 7 ).
     DELETE FROM indx WHERE relid = 'ZV' AND srtfd LIKE 'VSPGITR%' AND aedat < @lv_cutoff.
+    " This user's jobs that were scheduled and never released (JOB_CLOSE
+    " failed, or no release authorization) and that drop_job could not
+    " remove at the time.
+    DATA(lv_stale) = CONV d( sy-datum - 1 ).
+    SELECT jobcount FROM tbtco INTO TABLE @DATA(lt_stale)
+      WHERE jobname = @lv_jobname AND status = 'P' AND sdluname = @sy-uname AND sdldate < @lv_stale.
+    LOOP AT lt_stale INTO DATA(ls_stale).
+      drop_job( ls_stale-jobcount ).
+    ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD drop_job.
+    DATA: lv_jobname  TYPE tbtcjob-jobname,
+          lv_jobcount TYPE tbtcjob-jobcount,
+          lv_variant  TYPE rsvar-variant,
+          lv_key      TYPE indx-srtfd,
+          lv_report   TYPE syrepid.
+
+    lv_jobname = c_job_name.
+    lv_report = c_job_name.
+    lv_jobcount = iv_jobcount.
+    CALL FUNCTION 'BP_JOB_DELETE'
+      EXPORTING
+        jobcount   = lv_jobcount
+        jobname    = lv_jobname
+        forcedmode = 'X'
+      EXCEPTIONS
+        OTHERS     = 1.
+    lv_variant = |VSP{ lv_jobcount }|.
+    CALL FUNCTION 'RS_VARIANT_DELETE'
+      EXPORTING
+        report                = lv_report
+        variant               = lv_variant
+        flag_confirmscreen    = 'X'
+        suppress_message      = 'X'
+        suppress_input_dialog = 'X'
+      EXCEPTIONS
+        OTHERS                = 1.
+    lv_key = |VSPGITZ{ lv_jobcount }|.
+    DELETE FROM DATABASE indx(zv) ID lv_key.
+    COMMIT WORK.
+  ENDMETHOD.
+
+
+  METHOD zip_limits.
+    DATA: lo_zip   TYPE REF TO cl_abap_zip,
+          lv_total TYPE int8,
+          lv_dots  TYPE i.
+
+    CLEAR: ev_code, ev_message.
+    " The directory only: nothing is decompressed here.
+    CREATE OBJECT lo_zip.
+    lo_zip->load( EXPORTING zip = iv_zip EXCEPTIONS zip_parse_error = 1 OTHERS = 2 ).
+    IF sy-subrc <> 0.
+      ev_code = `INVALID_ZIP`.
+      ev_message = `The upload is not a zip.`.
+      RETURN.
+    ENDIF.
+    IF lines( lo_zip->files ) > c_max_entries.
+      ev_code = `TOO_LARGE`.
+      ev_message = |The zip has { lines( lo_zip->files ) } entries, over the limit of { c_max_entries }.|.
+      RETURN.
+    ENDIF.
+    LOOP AT lo_zip->files INTO DATA(ls_file).
+      lv_total = lv_total + ls_file-size.
+      IF ls_file-name = '.abapgit.xml'.
+        lv_dots = lv_dots + 1.
+      ENDIF.
+    ENDLOOP.
+    IF lv_total > c_max_unzipped.
+      ev_code = `TOO_LARGE`.
+      ev_message = |The zip unpacks to { lv_total } bytes, over the limit of { c_max_unzipped }.|.
+      RETURN.
+    ENDIF.
+    IF lv_dots <> 1.
+      ev_code = `INVALID_ZIP`.
+      ev_message = |The zip has { lv_dots } .abapgit.xml files at its root; an abapGit offline zip has exactly one.|.
+      RETURN.
+    ENDIF.
   ENDMETHOD.
 
 
@@ -988,6 +1080,15 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
     rs_result-transport = is_params-transport.
     DATA(lt_packages) = split_packages( is_params-packages ).
 
+    " The limits again, before abapGit decompresses anything.
+    zip_limits( EXPORTING iv_zip = iv_zip IMPORTING ev_code = lv_code ev_message = lv_message ).
+    IF lv_code IS NOT INITIAL.
+      rs_result-outcome = `refused`.
+      rs_result-code = lv_code.
+      rs_result-message = |{ lv_message } Nothing was imported.|.
+      RETURN.
+    ENDIF.
+
     TRY.
         lv_phase = `load`.
         DATA(lt_files) = zcl_abapgit_zip=>load( iv_zip ).
@@ -1056,6 +1157,7 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
           lv_code = `PACKAGE_NOT_LISTED`.
         ELSE.
           evaluate_checks( EXPORTING is_params    = is_params
+                                     iv_new_repo  = lv_created
                            IMPORTING ev_code      = lv_code
                                      ev_message   = lv_message
                                      et_decisions = rs_result-decisions
@@ -1191,6 +1293,17 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
     LOOP AT cs_checks-overwrite ASSIGNING FIELD-SYMBOL(<ls_over>).
       DATA(ls_decision) = VALUE ty_decision( obj_type = <ls_over>-obj_type obj_name = <ls_over>-obj_name
                                              devclass = <ls_over>-devclass ).
+      " The target package existed without a repository: abapGit lists its
+      " own package entry as changed. That one entry is kept as it is (never
+      " written) and needs no overwrite; nothing else is exempt.
+      IF iv_new_repo = abap_true AND <ls_over>-obj_type = 'DEVC' AND <ls_over>-obj_name = is_params-package
+         AND ( <ls_over>-action = lc_update OR <ls_over>-action = lc_overwrite ).
+        ls_decision-action = `package_kept`.
+        <ls_over>-decision = 'N'.
+        ls_decision-decision = <ls_over>-decision.
+        APPEND ls_decision TO et_decisions.
+        CONTINUE.
+      ENDIF.
       CASE <ls_over>-action.
         WHEN lc_add.
           ls_decision-action = `add`.
@@ -1444,6 +1557,7 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
           lv_json     TYPE string,
           lv_outcome  TYPE string,
           lv_key      TYPE indx-srtfd,
+          ls_indx     TYPE indx,
           lt_log      TYPE STANDARD TABLE OF tbtc5 WITH DEFAULT KEY,
           lt_log_json TYPE string_table.
 
@@ -1464,9 +1578,17 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
       RETURN.
     ENDIF.
 
+    " The result records whose import it was (INDX-USERA, the job's user,
+    " which is the user who started it): once SM37's history of the job is
+    " gone, that is the only proof, and it is checked either way.
     lv_key = |VSPGITR{ lv_job }|.
-    IMPORT result = lv_json FROM DATABASE indx(zv) ID lv_key.
+    IMPORT result = lv_json FROM DATABASE indx(zv) TO ls_indx ID lv_key.
     DATA(lv_has_result) = xsdbool( sy-subrc = 0 AND lv_json IS NOT INITIAL ).
+    IF lv_has_result = abap_true AND ls_indx-usera <> sy-uname.
+      rs_response = err( iv_id = is_message-id iv_code = 'NOT_YOUR_JOB'
+                         iv_message = |The result of job { lv_job } belongs to another user| ).
+      RETURN.
+    ENDIF.
 
     IF lv_has_result = abap_true.
       lv_outcome = `done`.
@@ -1516,13 +1638,28 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
 
 
   METHOD handle_delete_repo.
-    DATA li_repo TYPE REF TO zif_abapgit_repo.
+    DATA: li_repo     TYPE REF TO zif_abapgit_repo,
+          lv_devclass TYPE devclass,
+          lv_obj_name TYPE sobj_name.
 
     DATA(lv_package) = to_upper( condense( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'package' ) ) ).
     DATA(lv_key) = condense( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'key' ) ).
     IF valid_package( lv_package ) = abap_false.
       rs_response = err( iv_id = is_message-id iv_code = 'INVALID_PARAM'
                          iv_message = |package '{ lv_package }' is not a package name| ).
+      RETURN.
+    ENDIF.
+    lv_devclass = lv_package.
+    lv_obj_name = lv_package.
+    AUTHORITY-CHECK OBJECT 'S_DEVELOP'
+      ID 'DEVCLASS' FIELD lv_devclass
+      ID 'OBJTYPE'  FIELD 'DEVC'
+      ID 'OBJNAME'  FIELD lv_obj_name
+      ID 'P_GROUP'  DUMMY
+      ID 'ACTVT'    FIELD '06'.
+    IF sy-subrc <> 0.
+      rs_response = err( iv_id = is_message-id iv_code = 'NOT_AUTHORIZED'
+                         iv_message = |No authorization to delete in package { lv_package } (S_DEVELOP, activity 06); nothing was deleted| ).
       RETURN.
     ENDIF.
     TRY.
@@ -1541,6 +1678,29 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
           RETURN.
         ENDIF.
         li_repo = zcl_abapgit_repo_srv=>get_instance( )->get( ls_repo-key ).
+        " An online repository (its URL, branch and settings) is never
+        " unregistered here: that is for a person to decide, in abapGit.
+        IF li_repo->is_offline( ) = abap_false.
+          rs_response = err( iv_id = is_message-id iv_code = 'REPO_ONLINE'
+                             iv_message = |Repository { ls_repo-key } of { lv_package } is an online repository; vsp never unregisters one (do it in abapGit). Nothing was deleted| ).
+          RETURN.
+        ENDIF.
+        " Only the registration of an emptied package: no object but the
+        " package's own entry, and no subpackage.
+        SELECT SINGLE obj_name FROM tadir INTO @DATA(lv_left)
+          WHERE devclass = @lv_devclass AND delflag = @space
+            AND NOT ( pgmid = 'R3TR' AND object = 'DEVC' AND obj_name = @lv_obj_name ).
+        IF sy-subrc = 0.
+          rs_response = err( iv_id = is_message-id iv_code = 'PACKAGE_NOT_EMPTY'
+                             iv_message = |Package { lv_package } still has objects ({ lv_left } and maybe more); its repository is kept. Nothing was deleted| ).
+          RETURN.
+        ENDIF.
+        SELECT SINGLE devclass FROM tdevc INTO @DATA(lv_child) WHERE parentcl = @lv_devclass.
+        IF sy-subrc = 0.
+          rs_response = err( iv_id = is_message-id iv_code = 'PACKAGE_NOT_EMPTY'
+                             iv_message = |Package { lv_package } has subpackage { lv_child }; its repository is kept. Nothing was deleted| ).
+          RETURN.
+        ENDIF.
         DATA(lv_name) = li_repo->get_name( ).
         zcl_abapgit_repo_srv=>get_instance( )->delete( li_repo ).
         COMMIT WORK.
@@ -1558,14 +1718,27 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
 
 
   METHOD handle_package_objects.
-    DATA: lt_items TYPE string_table,
-          lt_subs  TYPE string_table,
-          lv_repo  TYPE string.
+    DATA: lt_items    TYPE string_table,
+          lt_subs     TYPE string_table,
+          lv_repo     TYPE string,
+          lv_devclass TYPE devclass.
 
     DATA(lv_package) = to_upper( condense( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'package' ) ) ).
     IF valid_package( lv_package ) = abap_false.
       rs_response = err( iv_id = is_message-id iv_code = 'INVALID_PARAM'
                          iv_message = |package '{ lv_package }' is not a package name| ).
+      RETURN.
+    ENDIF.
+    lv_devclass = lv_package.
+    AUTHORITY-CHECK OBJECT 'S_DEVELOP'
+      ID 'DEVCLASS' FIELD lv_devclass
+      ID 'OBJTYPE'  DUMMY
+      ID 'OBJNAME'  DUMMY
+      ID 'P_GROUP'  DUMMY
+      ID 'ACTVT'    FIELD '03'.
+    IF sy-subrc <> 0.
+      rs_response = err( iv_id = is_message-id iv_code = 'NOT_AUTHORIZED'
+                         iv_message = |No authorization to display package { lv_package } (S_DEVELOP, activity 03)| ).
       RETURN.
     ENDIF.
     SELECT SINGLE devclass FROM tdevc INTO @DATA(lv_exists) WHERE devclass = @lv_package.

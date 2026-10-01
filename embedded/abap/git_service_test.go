@@ -30,6 +30,9 @@ var gitServiceFunctions = map[string]bool{
 	"GET_JOB_RUNTIME_INFO": true,
 	// import_status reads the job's log (read-only).
 	"BP_JOBLOG_READ": true,
+	// A job that will not run (JOB_CLOSE failed, or not released) is
+	// deleted again, with its variant and zip; only ZVSP_GIT_IMPORT jobs.
+	"BP_JOB_DELETE": true,
 	// The export's base64 (older code).
 	"SSFC_BASE64_DECODE": true,
 	"SSFC_BASE64_ENCODE": true,
@@ -44,14 +47,66 @@ func gitServiceSource(t *testing.T) string {
 	return string(b)
 }
 
-// dbWriteRe finds statements that write a database table.
+// dbWriteRe finds every statement that may write a table: Open SQL's
+// INSERT, UPDATE, MODIFY and DELETE in any form (with or without FROM, any
+// target, chained), and the internal-table statements that share their
+// keywords. Each one must be in gitAllowedWrites.
 var (
-	dbWriteRe   = regexp.MustCompile(`^(INSERT|UPDATE|MODIFY|DELETE FROM)\b`)
+	dbWriteRe   = regexp.MustCompile(`^(INSERT|UPDATE|MODIFY|DELETE)\b`)
+	toDatabase  = regexp.MustCompile(`\bDATABASE\s+(\S+)`)
 	gitDynCall  = regexp.MustCompile(`CALL METHOD \S*(->|=>)\(`)
 	gitDynFunc  = regexp.MustCompile(`(?i)^CALL FUNCTION \(`)
-	assignRe    = regexp.MustCompile(`^(LV_REPORT)\s*=\s*(.+)$`)
+	assignRe    = regexp.MustCompile(`^(LV_REPORT|LV_JOBNAME)\s*=\s*(.+)$`)
 	jobNameDecl = regexp.MustCompile(`CONSTANTS C_JOB_NAME TYPE TBTCJOB-JOBNAME VALUE '([A-Z0-9_]+)'`)
 )
+
+// gitAllowedWrites are the only INSERT/UPDATE/MODIFY/DELETE statements the
+// service has: its own INDX(ZV) rows, and one internal table.
+var gitAllowedWrites = map[string]bool{
+	"DELETE FROM DATABASE INDX(ZV) ID LV_KEY":                                              true,
+	"DELETE FROM INDX WHERE RELID = 'ZV' AND SRTFD LIKE 'VSPGITR%' AND AEDAT < @LV_CUTOFF": true,
+	"DELETE ADJACENT DUPLICATES FROM RT_PACKAGES":                                          true,
+}
+
+// normStmt upper-cases a statement and folds its whitespace, as
+// abapStatements does.
+func normStmt(s string) string { return strings.ToUpper(strings.Join(strings.Fields(s), " ")) }
+
+// seqAt is the index of the first run of consecutive statements that match
+// want one for one: equal after normStmt, or, for an entry ending in "*",
+// starting with what precedes the "*". -1 if there is none.
+func seqAt(stmts []string, want ...string) int {
+	match := func(st, w string) bool {
+		if p, ok := strings.CutSuffix(w, "*"); ok {
+			return strings.HasPrefix(normStmt(st), normStmt(p))
+		}
+		return normStmt(st) == normStmt(w)
+	}
+	for i := 0; i+len(want) <= len(stmts); i++ {
+		ok := true
+		for j, w := range want {
+			if !match(stmts[i+j], w) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// countExact counts the statements equal to want (normStmt).
+func countExact(stmts []string, want string) int {
+	n := 0
+	for _, st := range stmts {
+		if normStmt(st) == normStmt(want) {
+			n++
+		}
+	}
+	return n
+}
 
 // checkGitService returns every rule src breaks.
 func checkGitService(src string) []string {
@@ -106,6 +161,10 @@ func checkGitService(src string) []string {
 						bad = append(bad, "JOB_SUBMIT: "+p+" must not be passed")
 					}
 				}
+			case "BP_JOB_DELETE":
+				if m := bindingRe("JOBNAME").FindStringSubmatch(up); m == nil || m[1] != "LV_JOBNAME" {
+					bad = append(bad, "BP_JOB_DELETE: only jobs of lv_jobname (c_job_name)")
+				}
 			case "RS_CREATE_VARIANT", "RS_VARIANT_DELETE":
 				key := map[string]string{"RS_CREATE_VARIANT": "CURR_REPORT", "RS_VARIANT_DELETE": "REPORT"}[name]
 				if m := bindingRe(key).FindStringSubmatch(up); m == nil || m[1] != "LV_REPORT" {
@@ -134,28 +193,243 @@ func checkGitService(src string) []string {
 			bad = append(bad, "dynamic method call other than new_offline: "+st)
 		}
 		// Database writes: its own INDX(ZV) area only.
-		if dbWriteRe.MatchString(up) {
-			switch {
-			case strings.HasPrefix(up, "DELETE FROM DATABASE INDX(ZV) ID "):
-			case strings.HasPrefix(up, "DELETE FROM INDX WHERE RELID = 'ZV' AND SRTFD LIKE 'VSPGITR%'"):
-			default:
-				bad = append(bad, "database write outside INDX(ZV): "+st)
+		if dbWriteRe.MatchString(up) && !gitAllowedWrites[up] {
+			bad = append(bad, "database write outside INDX(ZV) (or a table statement not on the list): "+st)
+		}
+		if strings.HasPrefix(up, "EXPORT") && strings.Contains(up, "DATABASE") {
+			ms := toDatabase.FindAllStringSubmatch(up, -1)
+			if len(ms) == 0 {
+				bad = append(bad, "EXPORT TO DATABASE outside INDX(ZV): "+st)
+			}
+			for _, m := range ms {
+				if m[1] != "INDX(ZV)" {
+					bad = append(bad, "EXPORT TO DATABASE outside INDX(ZV): "+st)
+				}
 			}
 		}
-		if strings.HasPrefix(up, "EXPORT ") && strings.Contains(up, " TO DATABASE ") && !strings.Contains(up, " TO DATABASE INDX(ZV) ") {
-			bad = append(bad, "EXPORT TO DATABASE outside INDX(ZV): "+st)
-		}
 		if m := assignRe.FindStringSubmatch(up); m != nil && m[2] != "C_JOB_NAME" {
-			bad = append(bad, "lv_report may only be c_job_name: "+st)
+			bad = append(bad, strings.ToLower(m[1])+" may only be c_job_name: "+st)
 		}
 	}
 	bad = append(bad, checkGitPolicy(stmts)...)
 	return bad
 }
 
+// Statement runs the policy is pinned to. Every condition is matched whole
+// (whitespace folded), with the refusal code it sets and its RETURN: a
+// condition weakened ("IF 1 = 2 AND ..."), a clause dropped, or a refusal
+// removed no longer matches. Messages are matched by their start only.
+var (
+	// evaluate_checks: conflicts and unmet requirements refuse before any
+	// decision is made.
+	gitEvalRefusals = [][]string{
+		{"IF CS_CHECKS-REQUIREMENTS-MET = 'N'", "EV_CODE = `REQUIREMENTS_NOT_MET`", "EV_MESSAGE = *", "RETURN", "ENDIF"},
+		{"IF CS_CHECKS-DEPENDENCIES-MET = 'N'", "EV_CODE = `DEPENDENCIES_NOT_MET`", "EV_MESSAGE = *", "RETURN", "ENDIF"},
+		{"IF CS_CHECKS-WARNING_PACKAGE IS NOT INITIAL", "LOOP AT CS_CHECKS-WARNING_PACKAGE INTO DATA(LS_PKG)", "APPEND *", "ENDLOOP",
+			"EV_CODE = `PACKAGE_CONFLICT`", "EV_MESSAGE = *", "RETURN", "ENDIF"},
+		{"IF CS_CHECKS-DATA_LOSS IS NOT INITIAL", "LOOP AT CS_CHECKS-DATA_LOSS INTO DATA(LS_LOSS)", "APPEND *", "ENDLOOP",
+			"EV_CODE = `DATA_LOSS`", "EV_MESSAGE = *", "RETURN", "ENDIF"},
+		{"IF CS_CHECKS-CUSTOMIZING-REQUIRED = ABAP_TRUE", "EV_CODE = `CUSTOMIZING_NOT_SUPPORTED`", "EV_MESSAGE = *", "RETURN", "ENDIF"},
+	}
+	// The one exemption from overwrite: the target package's own entry,
+	// when the package existed without a repository -- kept ('N'), never
+	// written.
+	gitEvalPackageKept = []string{
+		"IF IV_NEW_REPO = ABAP_TRUE AND <LS_OVER>-OBJ_TYPE = 'DEVC' AND <LS_OVER>-OBJ_NAME = IS_PARAMS-PACKAGE AND ( <LS_OVER>-ACTION = LC_UPDATE OR <LS_OVER>-ACTION = LC_OVERWRITE )",
+		"LS_DECISION-ACTION = `PACKAGE_KEPT`",
+		"<LS_OVER>-DECISION = 'N'",
+		"LS_DECISION-DECISION = <LS_OVER>-DECISION",
+		"APPEND LS_DECISION TO ET_DECISIONS",
+		"CONTINUE",
+		"ENDIF",
+	}
+	gitEvalAfterLoop = []string{
+		"IF LT_REFUSED IS NOT INITIAL", "EV_CODE = `OVERWRITE_REFUSED`", "EV_MESSAGE = *", "RETURN", "ENDIF",
+		"IF CS_CHECKS-TRANSPORT-REQUIRED = ABAP_TRUE", "IF IS_PARAMS-TRANSPORT IS INITIAL", "EV_CODE = `TRANSPORT_REQUIRED`", "EV_MESSAGE = *", "RETURN", "ENDIF",
+		"CS_CHECKS-TRANSPORT-TRANSPORT = IS_PARAMS-TRANSPORT", "ELSE", "CLEAR CS_CHECKS-TRANSPORT-TRANSPORT", "ENDIF",
+	}
+
+	// check_packages, whole: every file below the starting folder maps to a
+	// package the caller listed, no package is created on the way.
+	gitCheckPackages = []string{
+		"DATA(LT_LISTED) = SPLIT_PACKAGES( IS_PARAMS-PACKAGES )",
+		"DATA(LO_DOT) = II_REPO->GET_DOT_ABAPGIT( )",
+		"DATA(LV_START) = LO_DOT->GET_STARTING_FOLDER( )",
+		"DATA(LV_START_LEN) = STRLEN( LV_START )",
+		"DATA(LO_LOGIC) = ZCL_ABAPGIT_FOLDER_LOGIC=>GET_INSTANCE( )",
+		"LOOP AT IT_FILES INTO DATA(LS_FILE)",
+		"IF STRLEN( LS_FILE-PATH ) < LV_START_LEN", "CONTINUE", "ENDIF",
+		"IF SUBSTRING( VAL = LS_FILE-PATH LEN = LV_START_LEN ) <> LV_START", "CONTINUE", "ENDIF",
+		"DATA(LV_PACKAGE) = LO_LOGIC->PATH_TO_PACKAGE( IV_TOP = IS_PARAMS-PACKAGE IO_DOT = LO_DOT IV_PATH = LS_FILE-PATH IV_CREATE_IF_NOT_EXISTS = ABAP_FALSE )",
+		"IF LV_PACKAGE IS NOT INITIAL AND NOT LINE_EXISTS( LT_LISTED[ TABLE_LINE = LV_PACKAGE ] )",
+		"RV_MESSAGE = *", "RETURN", "ENDIF",
+		"ENDLOOP",
+	}
+
+	// zip_limits, whole: the directory's entries and declared size, and one
+	// .abapgit.xml, before anything is decompressed.
+	gitZipLimits = []string{
+		"DATA: LO_ZIP TYPE REF TO CL_ABAP_ZIP, LV_TOTAL TYPE INT8, LV_DOTS TYPE I",
+		"CLEAR: EV_CODE, EV_MESSAGE",
+		"CREATE OBJECT LO_ZIP",
+		"LO_ZIP->LOAD( EXPORTING ZIP = IV_ZIP EXCEPTIONS ZIP_PARSE_ERROR = 1 OTHERS = 2 )",
+		"IF SY-SUBRC <> 0", "EV_CODE = `INVALID_ZIP`", "EV_MESSAGE = *", "RETURN", "ENDIF",
+		"IF LINES( LO_ZIP->FILES ) > C_MAX_ENTRIES", "EV_CODE = `TOO_LARGE`", "EV_MESSAGE = *", "RETURN", "ENDIF",
+		"LOOP AT LO_ZIP->FILES INTO DATA(LS_FILE)",
+		"LV_TOTAL = LV_TOTAL + LS_FILE-SIZE",
+		"IF LS_FILE-NAME = '.ABAPGIT.XML'", "LV_DOTS = LV_DOTS + 1", "ENDIF",
+		"ENDLOOP",
+		"IF LV_TOTAL > C_MAX_UNZIPPED", "EV_CODE = `TOO_LARGE`", "EV_MESSAGE = *", "RETURN", "ENDIF",
+		"IF LV_DOTS <> 1", "EV_CODE = `INVALID_ZIP`", "EV_MESSAGE = *", "RETURN", "ENDIF",
+	}
+
+	// do_import, in this order, each before abapGit deserializes.
+	gitImportLimits = []string{
+		"ZIP_LIMITS( EXPORTING IV_ZIP = IV_ZIP IMPORTING EV_CODE = LV_CODE EV_MESSAGE = LV_MESSAGE )",
+		"IF LV_CODE IS NOT INITIAL", "RS_RESULT-OUTCOME = `REFUSED`", "RS_RESULT-CODE = LV_CODE", "RS_RESULT-MESSAGE = *", "RETURN", "ENDIF",
+	}
+	gitImportLoad       = []string{"DATA(LT_FILES) = ZCL_ABAPGIT_ZIP=>LOAD( IV_ZIP )"}
+	gitImportDotMissing = []string{"IF LV_HAS_DOT = ABAP_FALSE", "RS_RESULT-OUTCOME = `REFUSED`", "RS_RESULT-CODE = `INVALID_ZIP`", "RS_RESULT-MESSAGE = *", "RETURN", "ENDIF"}
+	gitImportPkgMissing = []string{
+		"IF IS_PARAMS-PACKAGE(1) <> '$' AND ZCL_ABAPGIT_FACTORY=>GET_SAP_PACKAGE( IS_PARAMS-PACKAGE )->EXISTS( ) = ABAP_FALSE",
+		"RS_RESULT-OUTCOME = `REFUSED`", "RS_RESULT-CODE = `PACKAGE_MISSING`", "RS_RESULT-MESSAGE = *", "RETURN", "ENDIF",
+	}
+	gitImportRepo = []string{
+		"ZCL_ABAPGIT_REPO_SRV=>GET_INSTANCE( )->GET_REPO_FROM_PACKAGE( EXPORTING IV_PACKAGE = IS_PARAMS-PACKAGE IMPORTING EI_REPO = LI_REPO EV_REASON = LV_REASON )",
+		"IF LI_REPO IS BOUND",
+		"RS_RESULT-REPO_KEY = LI_REPO->GET_KEY( )",
+		"RS_RESULT-REPO_NAME = LI_REPO->GET_NAME( )",
+		"IF LI_REPO->GET_PACKAGE( ) <> IS_PARAMS-PACKAGE", "RS_RESULT-OUTCOME = `REFUSED`", "RS_RESULT-CODE = `REPO_OTHER_PACKAGE`", "RS_RESULT-MESSAGE = *", "RETURN", "ENDIF",
+		"IF IS_PARAMS-OVERWRITE = ABAP_FALSE", "RS_RESULT-OUTCOME = `REFUSED`", "RS_RESULT-CODE = `REPO_EXISTS`", "RS_RESULT-MESSAGE = *", "RETURN", "ENDIF",
+		"IF LI_REPO->IS_OFFLINE( ) = ABAP_FALSE", "RS_RESULT-OUTCOME = `REFUSED`", "RS_RESULT-CODE = `REPO_ONLINE`", "RS_RESULT-MESSAGE = *", "RETURN", "ENDIF",
+		"ELSE",
+		"LI_REPO = NEW_OFFLINE_REPO( IV_NAME = IS_PARAMS-REPO_NAME IV_PACKAGE = IS_PARAMS-PACKAGE )",
+		"LV_CREATED = ABAP_TRUE",
+	}
+	gitImportChecks = []string{
+		"LV_MESSAGE = CHECK_PACKAGES( II_REPO = LI_REPO IT_FILES = LT_FILES IS_PARAMS = IS_PARAMS )",
+		"IF LV_MESSAGE IS NOT INITIAL", "LV_CODE = `PACKAGE_NOT_LISTED`", "ELSE",
+		"EVALUATE_CHECKS( EXPORTING IS_PARAMS = IS_PARAMS IV_NEW_REPO = LV_CREATED IMPORTING EV_CODE = LV_CODE EV_MESSAGE = LV_MESSAGE ET_DECISIONS = RS_RESULT-DECISIONS CHANGING CS_CHECKS = LS_CHECKS )",
+		"ENDIF",
+		"IF LV_CODE IS NOT INITIAL", "RS_RESULT-OUTCOME = `REFUSED`", "RS_RESULT-CODE = LV_CODE", "RS_RESULT-MESSAGE = *",
+		"IF LV_CREATED = ABAP_TRUE", "ZCL_ABAPGIT_REPO_SRV=>GET_INSTANCE( )->DELETE( LI_REPO )", "COMMIT WORK", "RS_RESULT-REPO_CREATED = ABAP_FALSE",
+		"RS_RESULT-MESSAGE = *", "CLEAR RS_RESULT-REPO_KEY", "ENDIF",
+		"RETURN", "ENDIF",
+	}
+	gitImportDeserialize = []string{"LI_REPO->DESERIALIZE( IS_CHECKS = LS_CHECKS II_LOG = LI_LOG )"}
+
+	// import_begin: the target is among the packages the caller checked,
+	// and each of them is a package name.
+	gitBeginPackages = []string{
+		"DATA(LT_PACKAGES) = SPLIT_PACKAGES( LV_PACKAGES )",
+		"IF NOT LINE_EXISTS( LT_PACKAGES[ TABLE_LINE = CONV DEVCLASS( LV_PACKAGE ) ] )",
+		"RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'INVALID_PARAM' IV_MESSAGE = |PACKAGES MUST LIST *", "RETURN", "ENDIF",
+		"LOOP AT LT_PACKAGES INTO DATA(LV_LISTED)",
+		"IF VALID_PACKAGE( CONV #( LV_LISTED ) ) = ABAP_FALSE", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'INVALID_PARAM' *", "RETURN", "ENDIF",
+		"ENDLOOP",
+	}
+	gitBeginParams = []string{
+		"LS_PARAMS = VALUE #( PACKAGE = LV_PACKAGE REPO_NAME = LV_REPO_NAME OVERWRITE = XSDBOOL( LV_OVERWRITE = 'TRUE' ) TRANSPORT = LV_TRANSPORT PACKAGES = LV_PACKAGES )",
+	}
+
+	// import_commit: the size and the SHA-256 declared at begin, then the
+	// zip's limits, before the job is started.
+	gitCommitChecks = []string{
+		"DATA(LS_UP) = MS_UPLOAD", "CLEAR MS_UPLOAD",
+		"IF XSTRLEN( LS_UP-DATA ) <> LS_UP-SIZE", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'INCOMPLETE' *", "RETURN", "ENDIF",
+		"IF SHA256( LS_UP-DATA ) <> LS_UP-SHA", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'CHECKSUM_MISMATCH' *", "RETURN", "ENDIF",
+		"ZIP_LIMITS( EXPORTING IV_ZIP = LS_UP-DATA IMPORTING EV_CODE = LV_CODE EV_MESSAGE = LV_MESSAGE )",
+		"IF LV_CODE IS NOT INITIAL", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = LV_CODE *", "RETURN", "ENDIF",
+		"START_JOB( EXPORTING IV_ZIP = LS_UP-DATA IS_PARAMS = LS_UP-PARAMS IV_PUSH_ID = IV_SESSION_ID IMPORTING EV_JOBCOUNT = LV_JOBCOUNT EV_ERROR = LV_ERROR )",
+	}
+
+	// run_job: nothing outside its own job; its own protected, unchanged
+	// variant; the ticket taken once; zip and parameters as scheduled.
+	gitRunJob = []string{
+		"IF SY-SUBRC <> 0 OR LV_JOBNAME <> C_JOB_NAME", "RETURN", "ENDIF",
+		"LS_RESULT-PACKAGE = TO_UPPER( CONDENSE( CONV STRING( IV_PACKAGE ) ) )",
+		"DATA(LV_OWN_VARIANT) = CONV RSVAR-VARIANT( |VSP{ LV_JOBCOUNT }| )",
+		"SELECT SINGLE PROTECTED, ENAME, AENAME FROM VARID INTO @DATA(LS_VARID) WHERE REPORT = @C_JOB_NAME AND VARIANT = @LV_OWN_VARIANT",
+		"DATA(LV_VARIANT_FOUND) = XSDBOOL( SY-SUBRC = 0 )",
+		"SELECT SINGLE VTEXT FROM VARIT INTO @DATA(LV_VTEXT) WHERE REPORT = @C_JOB_NAME AND VARIANT = @LV_OWN_VARIANT",
+		"IF SY-SUBRC <> 0 OR LV_VTEXT <> 'VSP GIT IMPORT'", "LV_VARIANT_FOUND = ABAP_FALSE", "ENDIF",
+		"IF SY-SLSET <> LV_OWN_VARIANT OR LV_VARIANT_FOUND = ABAP_FALSE OR LS_VARID-PROTECTED <> 'X' OR LS_VARID-ENAME <> SY-UNAME OR ( LS_VARID-AENAME IS NOT INITIAL AND LS_VARID-AENAME <> SY-UNAME )",
+		"LS_RESULT-OUTCOME = `REFUSED`", "LS_RESULT-CODE = `VARIANT_MISMATCH`", "LS_RESULT-MESSAGE = *",
+		"STORE_RESULT( IV_JOBCOUNT = LV_JOBCOUNT IS_RESULT = LS_RESULT )", "JOB_LOG( LS_RESULT )",
+		"PUBLISH( IS_RESULT = LS_RESULT IV_JOBCOUNT = LV_JOBCOUNT IV_PUSH_ID = IV_PUSH_ID )", "RETURN", "ENDIF",
+		"LV_KEY = |VSPGITZ{ LV_JOBCOUNT }|",
+		"IMPORT ZIP = LV_ZIP PARAMS = LS_PARAMS FROM DATABASE INDX(ZV) ID LV_KEY",
+		"DATA(LV_FOUND) = XSDBOOL( SY-SUBRC = 0 )",
+		"DELETE FROM DATABASE INDX(ZV) ID LV_KEY", "COMMIT WORK",
+		"IF LV_FOUND = ABAP_FALSE", "LS_RESULT-OUTCOME = `REFUSED`", "LS_RESULT-CODE = `TICKET_MISSING`", "LS_RESULT-MESSAGE = *",
+		"ELSEIF SHA_B64( SHA256( LV_ZIP ) ) <> CONDENSE( CONV STRING( IV_ZIP_SHA ) ) OR META_SHA( LS_PARAMS ) <> CONDENSE( CONV STRING( IV_META_SHA ) ) OR LS_PARAMS-PACKAGE <> LS_RESULT-PACKAGE",
+		"LS_RESULT-OUTCOME = `REFUSED`", "LS_RESULT-CODE = `TICKET_MISMATCH`", "LS_RESULT-MESSAGE = *",
+		"ELSE", "LS_RESULT = DO_IMPORT( IV_ZIP = LV_ZIP IS_PARAMS = LS_PARAMS )", "ENDIF",
+	}
+
+	// import_status: only the caller's own job, by its job row, and by the
+	// user its result records (the only proof once SM37's row is gone).
+	gitStatusOwner = []string{
+		"LV_JOBNAME = C_JOB_NAME", "LV_JOBCOUNT = LV_JOB",
+		"SELECT SINGLE STATUS, SDLUNAME FROM TBTCO INTO @DATA(LS_JOB) WHERE JOBNAME = @LV_JOBNAME AND JOBCOUNT = @LV_JOBCOUNT",
+		"DATA(LV_FOUND) = XSDBOOL( SY-SUBRC = 0 )",
+		"IF LV_FOUND = ABAP_TRUE AND LS_JOB-SDLUNAME <> SY-UNAME", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'NOT_YOUR_JOB' *", "RETURN", "ENDIF",
+		"LV_KEY = |VSPGITR{ LV_JOB }|",
+		"IMPORT RESULT = LV_JSON FROM DATABASE INDX(ZV) TO LS_INDX ID LV_KEY",
+		"DATA(LV_HAS_RESULT) = XSDBOOL( SY-SUBRC = 0 AND LV_JSON IS NOT INITIAL )",
+		"IF LV_HAS_RESULT = ABAP_TRUE AND LS_INDX-USERA <> SY-UNAME", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'NOT_YOUR_JOB' *", "RETURN", "ENDIF",
+	}
+	gitStoreOwner = []string{"LV_KEY = |VSPGITR{ IV_JOBCOUNT }|", "LS_INDX-AEDAT = SY-DATUM", "LS_INDX-USERA = SY-UNAME"}
+
+	// delete_repo: the repository of exactly this package (and key), only an
+	// offline one, only of an empty package, with S_DEVELOP; then its row.
+	gitDeleteRepo = []string{
+		"LV_DEVCLASS = LV_PACKAGE", "LV_OBJ_NAME = LV_PACKAGE",
+		"AUTHORITY-CHECK OBJECT 'S_DEVELOP' ID 'DEVCLASS' FIELD LV_DEVCLASS ID 'OBJTYPE' FIELD 'DEVC' ID 'OBJNAME' FIELD LV_OBJ_NAME ID 'P_GROUP' DUMMY ID 'ACTVT' FIELD '06'",
+		"IF SY-SUBRC <> 0", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'NOT_AUTHORIZED' *", "RETURN", "ENDIF",
+		"TRY",
+		"DATA(LT_REPOS) = ZCL_ABAPGIT_PERSIST_FACTORY=>GET_REPO( )->LIST( )",
+		"READ TABLE LT_REPOS INTO DATA(LS_REPO) WITH KEY PACKAGE = LV_PACKAGE",
+		"IF SY-SUBRC <> 0", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'REPO_NOT_FOUND' *", "RETURN", "ENDIF",
+		"IF LV_KEY IS NOT INITIAL AND LV_KEY <> LS_REPO-KEY", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'REPO_KEY_MISMATCH' *", "RETURN", "ENDIF",
+		"LI_REPO = ZCL_ABAPGIT_REPO_SRV=>GET_INSTANCE( )->GET( LS_REPO-KEY )",
+		"IF LI_REPO->IS_OFFLINE( ) = ABAP_FALSE", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'REPO_ONLINE' *", "RETURN", "ENDIF",
+		"SELECT SINGLE OBJ_NAME FROM TADIR INTO @DATA(LV_LEFT) WHERE DEVCLASS = @LV_DEVCLASS AND DELFLAG = @SPACE AND NOT ( PGMID = 'R3TR' AND OBJECT = 'DEVC' AND OBJ_NAME = @LV_OBJ_NAME )",
+		"IF SY-SUBRC = 0", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'PACKAGE_NOT_EMPTY' *", "RETURN", "ENDIF",
+		"SELECT SINGLE DEVCLASS FROM TDEVC INTO @DATA(LV_CHILD) WHERE PARENTCL = @LV_DEVCLASS",
+		"IF SY-SUBRC = 0", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'PACKAGE_NOT_EMPTY' *", "RETURN", "ENDIF",
+		"DATA(LV_NAME) = LI_REPO->GET_NAME( )",
+		"ZCL_ABAPGIT_REPO_SRV=>GET_INSTANCE( )->DELETE( LI_REPO )",
+	}
+	gitPackageObjectsAuth = []string{
+		"LV_DEVCLASS = LV_PACKAGE",
+		"AUTHORITY-CHECK OBJECT 'S_DEVELOP' ID 'DEVCLASS' FIELD LV_DEVCLASS ID 'OBJTYPE' DUMMY ID 'OBJNAME' DUMMY ID 'P_GROUP' DUMMY ID 'ACTVT' FIELD '03'",
+		"IF SY-SUBRC <> 0", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'NOT_AUTHORIZED' *", "RETURN", "ENDIF",
+		"SELECT SINGLE DEVCLASS FROM TDEVC INTO @DATA(LV_EXISTS) WHERE DEVCLASS = @LV_PACKAGE",
+	}
+)
+
+// inOrder says every index is found and each comes after the one before.
+func inOrder(idx ...int) bool {
+	for i, x := range idx {
+		if x < 0 || (i > 0 && x <= idx[i-1]) {
+			return false
+		}
+	}
+	return true
+}
+
 // checkGitPolicy pins the import's decisions to the caller's choices.
 func checkGitPolicy(stmts []string) []string {
 	var bad []string
+	need := func(method string, seq []string, what string) int {
+		i := seqAt(methodStatements(stmts, method), seq...)
+		if i < 0 {
+			bad = append(bad, strings.ToLower(method)+": "+what)
+		}
+		return i
+	}
+
 	ev := methodStatements(stmts, "EVALUATE_CHECKS")
 	if len(ev) == 0 {
 		return []string{"evaluate_checks is missing"}
@@ -178,30 +452,28 @@ func checkGitPolicy(stmts []string) []string {
 	if b := joined("WHEN LC_DELETE"); !strings.Contains(b, "<LS_OVER>-DECISION = 'N'") || strings.Contains(b, "<LS_OVER>-DECISION = 'Y'") {
 		bad = append(bad, "a local object the zip does not have must always be kept (decision 'N')")
 	}
-	if b := joined("WHEN LC_UPDATE OR LC_OVERWRITE OR LC_DELETE_ADD"); !regexp.MustCompile(`IF IS_PARAMS-OVERWRITE = ABAP_TRUE\n<LS_OVER>-DECISION = 'Y'\nELSE\n<LS_OVER>-DECISION = 'N'`).MatchString(b) {
+	if b := joined("WHEN LC_UPDATE OR LC_OVERWRITE OR LC_DELETE_ADD"); !regexp.MustCompile(`(^|\n)IF IS_PARAMS-OVERWRITE = ABAP_TRUE\n<LS_OVER>-DECISION = 'Y'\nELSE\n<LS_OVER>-DECISION = 'N'\nAPPEND `).MatchString(b) {
 		bad = append(bad, "an existing object may be changed only with overwrite = true")
 	}
-	for _, w := range []string{"WHEN LC_NO_SUPPORT", "WHEN LC_PACKMOVE", "WHEN LC_DATA_LOSS", "WHEN OTHERS"} {
-		if b := joined(w); !strings.Contains(b, "EV_CODE = ") || !strings.Contains(b, "RETURN") {
-			bad = append(bad, w+" must refuse the import")
+	for w, code := range map[string]string{"WHEN LC_NO_SUPPORT": "UNSUPPORTED_OBJECT", "WHEN LC_PACKMOVE": "PACKAGE_CONFLICT",
+		"WHEN LC_DATA_LOSS": "DATA_LOSS", "WHEN OTHERS": "UNKNOWN_ACTION"} {
+		if b := branch[w]; seqAt(b, "EV_CODE = `"+code+"`", "EV_MESSAGE = *", "RETURN") < 0 || strings.Contains(strings.Join(b, "\n"), "DECISION = 'Y'") {
+			bad = append(bad, w+" must refuse the import ("+code+")")
 		}
 	}
-	// Conflicts and unmet requirements refuse before any decision.
-	up := strings.ToUpper(strings.Join(ev, "\n"))
-	for _, cond := range []string{"IF CS_CHECKS-REQUIREMENTS-MET = 'N'", "IF CS_CHECKS-DEPENDENCIES-MET = 'N'",
-		"IF CS_CHECKS-WARNING_PACKAGE IS NOT INITIAL", "IF CS_CHECKS-DATA_LOSS IS NOT INITIAL", "IF LT_REFUSED IS NOT INITIAL"} {
-		// The branch, up to its RETURN, sets the refusal code.
-		i := strings.Index(up, cond)
-		seg := ""
-		if i >= 0 {
-			seg = up[i:]
-			if j := strings.Index(seg, "\nRETURN"); j >= 0 {
-				seg = seg[:j]
-			}
+	// Conflicts and unmet requirements refuse before any decision; the
+	// overwrite refusals and the transport after the loop.
+	loop := seqAt(ev, "LOOP AT CS_CHECKS-OVERWRITE ASSIGNING FIELD-SYMBOL(<LS_OVER>)")
+	for _, seq := range gitEvalRefusals {
+		if i := seqAt(ev, seq...); i < 0 || loop < 0 || i > loop {
+			bad = append(bad, "evaluate_checks must refuse, before any decision, on: "+seq[0]+" ("+seq[len(seq)-4]+")")
 		}
-		if !strings.Contains(seg, "EV_CODE = ") {
-			bad = append(bad, "evaluate_checks must refuse on: "+cond)
-		}
+	}
+	if i := seqAt(ev, gitEvalPackageKept...); i < 0 || i < loop || i > seqAt(ev, "CASE <LS_OVER>-ACTION") {
+		bad = append(bad, "evaluate_checks: only the target package's own entry, of a package without a repository, is kept without overwrite -- and kept ('N')")
+	}
+	if i := seqAt(ev, gitEvalAfterLoop...); i < 0 || i < loop {
+		bad = append(bad, "evaluate_checks must refuse on objects it may not overwrite, and take only the caller's transport")
 	}
 	// The transport is the caller's, never one found on the system.
 	for _, st := range ev {
@@ -211,43 +483,69 @@ func checkGitPolicy(stmts []string) []string {
 		}
 	}
 
-	// do_import: package check and policy before deserialize, deserialize
-	// only when nothing refused.
+	// check_packages and zip_limits, whole.
+	if cp := methodStatements(stmts, "CHECK_PACKAGES"); len(cp) != len(gitCheckPackages) || seqAt(cp, gitCheckPackages...) != 0 {
+		bad = append(bad, "check_packages must map every file below the starting folder to a listed package, creating none (as pinned)")
+	}
+	if zl := methodStatements(stmts, "ZIP_LIMITS"); len(zl) != len(gitZipLimits) || seqAt(zl, gitZipLimits...) != 0 {
+		bad = append(bad, "zip_limits must refuse a zip over c_max_entries or c_max_unzipped, or without exactly one .abapgit.xml (as pinned)")
+	}
+	up := strings.ToUpper(strings.Join(stmts, "\n"))
+	for _, c := range []string{"CONSTANTS C_MAX_ENTRIES TYPE I VALUE 50000", "CONSTANTS C_MAX_UNZIPPED TYPE INT8 VALUE 209715200"} {
+		if !strings.Contains(up, "\n"+c+"\n") {
+			bad = append(bad, "the zip limits must be "+c)
+		}
+	}
+
+	// do_import: the limits, the zip, the package, the repository, the
+	// package check and the policy -- each refusing -- then deserialize.
 	imp := methodStatements(stmts, "DO_IMPORT")
-	checkPkg := indexOf(imp, "LV_MESSAGE = CHECK_PACKAGES(")
-	eval := indexOf(imp, "EVALUATE_CHECKS(")
-	refuse := indexOf(imp, "IF LV_CODE IS NOT INITIAL")
-	deser := indexOf(imp, "LI_REPO->DESERIALIZE( IS_CHECKS = LS_CHECKS")
-	if checkPkg < 0 || eval < 0 || refuse < 0 || deser < 0 || !(checkPkg < eval && eval < refuse && refuse < deser) {
-		bad = append(bad, "do_import must check the packages and the policy, and return on a refusal, before deserialize")
+	limits := need("DO_IMPORT", gitImportLimits, "the zip's limits must refuse before abapGit loads it")
+	load := need("DO_IMPORT", gitImportLoad, "abapGit loads the zip once")
+	dot := need("DO_IMPORT", gitImportDotMissing, "a zip without .abapgit.xml must be refused (INVALID_ZIP)")
+	pkg := need("DO_IMPORT", gitImportPkgMissing, "a transportable package that does not exist must be refused (PACKAGE_MISSING)")
+	repo := need("DO_IMPORT", gitImportRepo, "an existing repository must be refused unless it is this package's own, offline one and overwrite is set (REPO_OTHER_PACKAGE, REPO_EXISTS, REPO_ONLINE)")
+	checks := need("DO_IMPORT", gitImportChecks, "the package check and the policy must refuse, removing a repository made for the import")
+	deser := need("DO_IMPORT", gitImportDeserialize, "deserialize with the checks evaluated")
+	if !inOrder(limits, load, dot, pkg, repo, checks, deser) {
+		bad = append(bad, "do_import must check the limits, the zip, the package, the repository, the packages and the policy, in that order, before deserialize")
 	}
 	if n := strings.Count(strings.ToUpper(strings.Join(imp, "\n")), "->DESERIALIZE("); n != 1 {
 		bad = append(bad, "do_import must deserialize exactly once")
 	}
-
-	// run_job: own variant, then the SHA-256 of zip and parameters, then
-	// the import.
-	job := methodStatements(stmts, "RUN_JOB")
-	variant := indexOf(job, "IF SY-SLSET <> LV_OWN_VARIANT OR LV_VARIANT_FOUND = ABAP_FALSE OR LS_VARID-PROTECTED <> 'X' OR LS_VARID-ENAME <> SY-UNAME")
-	ticket := indexOf(job, "IMPORT ZIP = LV_ZIP PARAMS = LS_PARAMS FROM DATABASE INDX(ZV)")
-	sha := indexOf(job, "ELSEIF SHA_B64( SHA256( LV_ZIP ) ) <> CONDENSE( CONV STRING( IV_ZIP_SHA ) ) OR META_SHA( LS_PARAMS ) <> CONDENSE( CONV STRING( IV_META_SHA ) ) OR LS_PARAMS-PACKAGE <> LS_RESULT-PACKAGE")
-	run := indexOf(job, "LS_RESULT = DO_IMPORT(")
-	if variant < 0 || ticket < 0 || sha < 0 || run < 0 || !(variant < ticket && ticket < sha && sha < run) {
-		bad = append(bad, "run_job must check its own variant, then the zip's and the parameters' SHA-256, before it imports")
-	}
-	if outside := indexOf(job, "IF SY-SUBRC <> 0 OR LV_JOBNAME <> C_JOB_NAME"); outside < 0 || outside > variant {
-		bad = append(bad, "run_job must do nothing outside its own job")
+	if n := strings.Count(up, "ZCL_ABAPGIT_ZIP=>LOAD("); n != 1 {
+		bad = append(bad, "abapGit loads a zip only in do_import, after zip_limits")
 	}
 
-	// delete_repo deletes the repository of exactly the package named.
+	need("IMPORT_BEGIN", gitBeginPackages, "the target must be among the packages listed, each a package name")
+	need("IMPORT_BEGIN", gitBeginParams, "overwrite only on \"true\"")
+	need("IMPORT_COMMIT", gitCommitChecks, "the size, the SHA-256 and the zip's limits must be checked before the job starts")
+
+	need("RUN_JOB", gitRunJob, "run_job must do nothing outside its own job, check its own unchanged variant, then the zip's and the parameters' SHA-256, before it imports")
+	if n := countExact(methodStatements(stmts, "RUN_JOB"), "LS_RESULT = DO_IMPORT( IV_ZIP = LV_ZIP IS_PARAMS = LS_PARAMS )"); n != 1 || strings.Count(up, "DO_IMPORT(") != 1 {
+		bad = append(bad, "do_import is called once, from run_job")
+	}
+
+	need("HANDLE_IMPORT_STATUS", gitStatusOwner, "import_status must answer only the caller's own job (NOT_YOUR_JOB, by the job row and by the result's user)")
+	need("STORE_RESULT", gitStoreOwner, "the result must record its user")
+
+	// start_job: a job that will not run is deleted again, with its
+	// variant and zip, on every failure after JOB_OPEN.
+	if n := countExact(methodStatements(stmts, "START_JOB"), "DROP_JOB( LV_JOBCOUNT )"); n != 4 {
+		bad = append(bad, "start_job must drop the job after each of RS_CREATE_VARIANT, JOB_SUBMIT and JOB_CLOSE failing, and when it is not released")
+	}
+
+	// delete_repo deletes the repository of exactly the package named, only
+	// an offline one of an empty package.
 	del := methodStatements(stmts, "HANDLE_DELETE_REPO")
-	if indexOf(del, "READ TABLE LT_REPOS INTO DATA(LS_REPO) WITH KEY PACKAGE = LV_PACKAGE") < 0 ||
-		indexOf(del, "IF LV_KEY IS NOT INITIAL AND LV_KEY <> LS_REPO-KEY") < 0 {
-		bad = append(bad, "delete_repo must delete only the repository registered for exactly that package (and key)")
+	need("HANDLE_DELETE_REPO", gitDeleteRepo, "delete_repo must delete only the offline repository registered for exactly that package (and key), of an empty package, with S_DEVELOP")
+	if n := strings.Count(strings.ToUpper(strings.Join(del, "\n")), "->DELETE("); n != 1 {
+		bad = append(bad, "delete_repo must delete one repository, once")
 	}
 	if strings.Contains(strings.ToUpper(strings.Join(del, "\n")), "PURGE(") {
 		bad = append(bad, "delete_repo must not purge (delete objects)")
 	}
+	need("HANDLE_PACKAGE_OBJECTS", gitPackageObjectsAuth, "package_objects must check S_DEVELOP display on the package")
 	return bad
 }
 
@@ -298,6 +596,94 @@ func TestGitServiceGuardBites(t *testing.T) {
 			"    ELSEIF 1 = 2 AND sha_b64( sha256( lv_zip ) ) <> condense( CONV string( iv_zip_sha ) )"},
 		"delete any repository": {"        READ TABLE lt_repos INTO DATA(ls_repo) WITH KEY package = lv_package.\n        IF sy-subrc <> 0.\n          rs_response = err( iv_id = is_message-id iv_code = 'REPO_NOT_FOUND'",
 			"        READ TABLE lt_repos INTO DATA(ls_repo) INDEX 1.\n        IF sy-subrc <> 0.\n          rs_response = err( iv_id = is_message-id iv_code = 'REPO_NOT_FOUND'"},
+		// Review round 2 (PR #301): every Open SQL write form, each refusal
+		// of the import and of delete_repo, removed or weakened.
+		"DELETE ... FROM TABLE, no WHERE": {"    COMMIT WORK.\n  ENDMETHOD.",
+			"    COMMIT WORK.\n    DELETE tadir FROM TABLE @lt_rows.\n  ENDMETHOD."},
+		"DELETE ... WHERE, without FROM": {"    COMMIT WORK.\n  ENDMETHOD.",
+			"    COMMIT WORK.\n    DELETE tadir WHERE devclass = @lv_package.\n  ENDMETHOD."},
+		"chained DELETE": {"    COMMIT WORK.\n  ENDMETHOD.",
+			"    COMMIT WORK.\n    DELETE: FROM tdevc WHERE devclass = @lv_package.\n  ENDMETHOD."},
+		"INSERT another table": {"    COMMIT WORK.\n  ENDMETHOD.",
+			"    COMMIT WORK.\n    INSERT tadir FROM @ls_row.\n  ENDMETHOD."},
+		"MODIFY another table": {"    COMMIT WORK.\n  ENDMETHOD.",
+			"    COMMIT WORK.\n    MODIFY tadir FROM TABLE @lt_rows.\n  ENDMETHOD."},
+		"UPDATE another table": {"    COMMIT WORK.\n  ENDMETHOD.",
+			"    COMMIT WORK.\n    UPDATE tadir SET devclass = @lv_package WHERE obj_name = @lv_name.\n  ENDMETHOD."},
+		"DELETE dynamic table": {"    COMMIT WORK.\n  ENDMETHOD.",
+			"    COMMIT WORK.\n    DELETE FROM (lv_table) WHERE (lv_where).\n  ENDMETHOD."},
+		"DELETE INDX rows of another area": {"DELETE FROM indx WHERE relid = 'ZV' AND srtfd LIKE 'VSPGITR%' AND aedat < @lv_cutoff.",
+			"DELETE FROM indx WHERE relid = 'ZV' AND aedat < @lv_cutoff."},
+		"EXPORT to another cluster table": {"EXPORT result = lv_json TO DATABASE indx(zv)",
+			"EXPORT result = lv_json TO DATABASE zvsp_cluster(zv)"},
+		"check_packages: IF 1 = 2 AND": {"      IF lv_package IS NOT INITIAL AND NOT line_exists",
+			"      IF 1 = 2 AND lv_package IS NOT INITIAL AND NOT line_exists"},
+		"check_packages: every file skipped": {"      IF strlen( ls_file-path ) < lv_start_len.",
+			"      IF strlen( ls_file-path ) < lv_start_len OR 1 = 1."},
+		"check_packages: creates packages": {"        iv_create_if_not_exists = abap_false ).",
+			"        iv_create_if_not_exists = abap_true )."},
+		"check_packages: no refusal": {"maps to package { lv_package }, which is not among the packages checked ({ is_params-packages }).|.\n        RETURN.",
+			"maps to package { lv_package }, which is not among the packages checked ({ is_params-packages }).|.\n        CLEAR rv_message."},
+		"do_import: no REPO_OTHER_PACKAGE": {"          IF li_repo->get_package( ) <> is_params-package.\n            rs_result-outcome = `refused`.\n            rs_result-code = `REPO_OTHER_PACKAGE`.\n            rs_result-message = |{ lv_reason }: the repository of { li_repo->get_package( ) } covers { is_params-package }. Nothing was imported.|.\n            RETURN.\n          ENDIF.\n",
+			""},
+		"do_import: no REPO_EXISTS": {"          IF is_params-overwrite = abap_false.\n            rs_result-outcome = `refused`.\n            rs_result-code = `REPO_EXISTS`.\n            rs_result-message = |{ lv_reason } (repository { rs_result-repo_key }); it is not overwritten without overwrite = true. Nothing was imported.|.\n            RETURN.\n          ENDIF.\n",
+			""},
+		"do_import: no PACKAGE_MISSING": {"        IF is_params-package(1) <> '$' AND zcl_abapgit_factory=>get_sap_package( is_params-package )->exists( ) = abap_false.\n          rs_result-outcome = `refused`.\n          rs_result-code = `PACKAGE_MISSING`.\n          rs_result-message = |Package { is_params-package } does not exist; only a local ($) package is created by the import. Nothing was imported.|.\n          RETURN.\n        ENDIF.\n",
+			""},
+		"do_import: no REPO_ONLINE": {"          IF li_repo->is_offline( ) = abap_false.\n            rs_result-outcome = `refused`.\n            rs_result-code = `REPO_ONLINE`.\n            rs_result-message = |Repository { rs_result-repo_key } of { is_params-package } is an online repository; a zip is imported into an offline one only. Nothing was imported.|.\n            RETURN.\n          ENDIF.\n",
+			""},
+		"do_import: no zip limits": {"    zip_limits( EXPORTING iv_zip = iv_zip IMPORTING ev_code = lv_code ev_message = lv_message ).\n    IF lv_code IS NOT INITIAL.\n      rs_result-outcome = `refused`.\n      rs_result-code = lv_code.\n      rs_result-message = |{ lv_message } Nothing was imported.|.\n      RETURN.\n    ENDIF.\n",
+			""},
+		"evaluate_checks: no customizing refusal": {"    IF cs_checks-customizing-required = abap_true.\n      ev_code = `CUSTOMIZING_NOT_SUPPORTED`.\n      ev_message = `The zip carries table content (customizing); that is not imported here.`.\n      RETURN.\n    ENDIF.\n",
+			""},
+		"evaluate_checks: requirements weakened": {"    IF cs_checks-requirements-met = 'N'.",
+			"    IF cs_checks-requirements-met = 'N' AND 1 = 2."},
+		"evaluate_checks: any DEVC kept": {"      IF iv_new_repo = abap_true AND <ls_over>-obj_type = 'DEVC' AND <ls_over>-obj_name = is_params-package",
+			"      IF iv_new_repo = abap_true AND <ls_over>-obj_type = 'DEVC'"},
+		"evaluate_checks: any object of a new repo exempt": {"      IF iv_new_repo = abap_true AND <ls_over>-obj_type = 'DEVC' AND <ls_over>-obj_name = is_params-package",
+			"      IF iv_new_repo = abap_true"},
+		"evaluate_checks: package entry overwritten": {"        ls_decision-action = `package_kept`.\n        <ls_over>-decision = 'N'.",
+			"        ls_decision-action = `package_kept`.\n        <ls_over>-decision = 'Y'."},
+		"import_begin: target not among packages": {"    IF NOT line_exists( lt_packages[ table_line = CONV devclass( lv_package ) ] ).\n      rs_response = err( iv_id = is_message-id iv_code = 'INVALID_PARAM'\n                         iv_message = |packages must list every package the zip may touch, { lv_package } among them| ).\n      RETURN.\n    ENDIF.\n",
+			""},
+		"import_commit: no SHA-256 check": {"    IF sha256( ls_up-data ) <> ls_up-sha.\n      rs_response = err( iv_id = is_message-id iv_code = 'CHECKSUM_MISMATCH'\n                         iv_message = `The received bytes do not match the SHA-256 declared at begin. Nothing was imported.` ).\n      RETURN.\n    ENDIF.\n",
+			""},
+		"import_commit: no zip limits": {"    zip_limits( EXPORTING iv_zip = ls_up-data IMPORTING ev_code = lv_code ev_message = lv_message ).\n    IF lv_code IS NOT INITIAL.\n      rs_response = err( iv_id = is_message-id iv_code = lv_code iv_message = |{ lv_message } Nothing was imported.| ).\n      RETURN.\n    ENDIF.\n",
+			""},
+		"zip limits: entry cap raised": {"CONSTANTS c_max_entries TYPE i VALUE 50000.",
+			"CONSTANTS c_max_entries TYPE i VALUE 5000000."},
+		"zip limits: size check weakened": {"    IF lv_total > c_max_unzipped.",
+			"    IF lv_total > c_max_unzipped * 100."},
+		"zip limits: several .abapgit.xml": {"    IF lv_dots <> 1.",
+			"    IF lv_dots < 1."},
+		"import_status: no NOT_YOUR_JOB by job row": {"    IF lv_found = abap_true AND ls_job-sdluname <> sy-uname.\n      rs_response = err( iv_id = is_message-id iv_code = 'NOT_YOUR_JOB'\n                         iv_message = |Job { lv_job } was scheduled by another user| ).\n      RETURN.\n    ENDIF.\n",
+			""},
+		"import_status: no NOT_YOUR_JOB by result user": {"    IF lv_has_result = abap_true AND ls_indx-usera <> sy-uname.\n      rs_response = err( iv_id = is_message-id iv_code = 'NOT_YOUR_JOB'\n                         iv_message = |The result of job { lv_job } belongs to another user| ).\n      RETURN.\n    ENDIF.\n",
+			""},
+		"store_result: no user": {"    ls_indx-usera = sy-uname.\n    ls_indx-pgmid = c_job_name.\n    DATA(lv_json)",
+			"    ls_indx-pgmid = c_job_name.\n    DATA(lv_json)"},
+		"run_job: aename clause dropped": {" OR ( ls_varid-aename IS NOT INITIAL AND ls_varid-aename <> sy-uname ).",
+			"."},
+		"run_job: vtext not checked": {"    IF sy-subrc <> 0 OR lv_vtext <> 'vsp git import'.",
+			"    IF sy-subrc <> 0."},
+		"start_job: job kept after JOB_CLOSE failed": {"were deleted again|.\n      drop_job( lv_jobcount ).",
+			"were deleted again|."},
+		"drop_job: another job": {"        jobname    = lv_jobname\n        forcedmode",
+			"        jobname    = 'SAP_REORG_JOBS'\n        forcedmode"},
+		"drop_job: jobname from outside": {"    lv_jobname = c_job_name.\n    lv_report = c_job_name.\n    lv_jobcount = iv_jobcount.",
+			"    lv_jobname = iv_jobcount.\n    lv_report = c_job_name.\n    lv_jobcount = iv_jobcount."},
+		"delete_repo: online repository unregistered": {"        IF li_repo->is_offline( ) = abap_false.\n          rs_response = err( iv_id = is_message-id iv_code = 'REPO_ONLINE'\n                             iv_message = |Repository { ls_repo-key } of { lv_package } is an online repository; vsp never unregisters one (do it in abapGit). Nothing was deleted| ).\n          RETURN.\n        ENDIF.\n",
+			""},
+		"delete_repo: package with objects": {"        IF sy-subrc = 0.\n          rs_response = err( iv_id = is_message-id iv_code = 'PACKAGE_NOT_EMPTY'\n                             iv_message = |Package { lv_package } still has objects ({ lv_left } and maybe more); its repository is kept. Nothing was deleted| ).\n          RETURN.\n        ENDIF.\n",
+			""},
+		"delete_repo: package with subpackages": {"        IF sy-subrc = 0.\n          rs_response = err( iv_id = is_message-id iv_code = 'PACKAGE_NOT_EMPTY'\n                             iv_message = |Package { lv_package } has subpackage { lv_child }; its repository is kept. Nothing was deleted| ).\n          RETURN.\n        ENDIF.\n",
+			""},
+		"delete_repo: no authority check": {"    IF sy-subrc <> 0.\n      rs_response = err( iv_id = is_message-id iv_code = 'NOT_AUTHORIZED'\n                         iv_message = |No authorization to delete in package { lv_package } (S_DEVELOP, activity 06); nothing was deleted| ).\n      RETURN.\n    ENDIF.\n",
+			""},
+		"delete_repo: own entry check widened": {"AND NOT ( pgmid = 'R3TR' AND object = 'DEVC' AND obj_name = @lv_obj_name ).",
+			"AND NOT ( pgmid = 'R3TR' )."},
+		"package_objects: no authority check": {"    IF sy-subrc <> 0.\n      rs_response = err( iv_id = is_message-id iv_code = 'NOT_AUTHORIZED'\n                         iv_message = |No authorization to display package { lv_package } (S_DEVELOP, activity 03)| ).\n      RETURN.\n    ENDIF.\n",
+			""},
 	}
 	for name, m := range mutations {
 		if !strings.Contains(src, m.old) {
