@@ -123,3 +123,13 @@ func TestLockObject_ModifyRefusedUnderReadOnly(t *testing.T) {
 		}
 	})
 }
+
+// Overwriting a variable in a live program is refused under --read-only. This
+// is the helper behind lua setVariable, forceReplay, injectCheckpoint and
+// replayFromStep.
+func TestDebuggerSetVariableValue_RefusedUnderReadOnly(t *testing.T) {
+	assertReadOnlyRefusal(t, func(c *Client) error {
+		_, err := c.DebuggerSetVariableValue(context.Background(), "LV_COUNT", "42")
+		return err
+	})
+}
