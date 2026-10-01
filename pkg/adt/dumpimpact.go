@@ -2,8 +2,10 @@ package adt
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"sort"
 	"strings"
@@ -47,9 +49,10 @@ type ExposedCaller struct {
 	// rather than flattened, because the second half distinguishes a function
 	// module from its group and that distinction is the useful part.
 	Type string `json:"type,omitempty"`
-	// URI is the caller's own ADT path, taken from the container row rather
-	// than rebuilt from the name — a namespaced object or a function module is
-	// not addressable by any rule this side could apply.
+	// URI is the caller's own ADT path, taken from the row SAP sent (the
+	// container, or the row itself for a module or a program) rather than
+	// rebuilt from the name — a namespaced object or a function module is not
+	// addressable by any rule this side could apply.
 	URI       string `json:"uri,omitempty"`
 	Package   string `json:"package,omitempty"`
 	Component string `json:"component,omitempty"` // the method or routine holding the reference
@@ -159,12 +162,11 @@ func (c *Client) DumpImpact(ctx context.Context, dump Dump, opts DumpImpactOptio
 			units[i].Note = note
 			continue
 		}
-		refs, err := c.FindReferences(ctx, units[i].URI, 0, 0)
+		callers, err := c.callersOf(ctx, units[i].URI, units[i].Object)
 		if err != nil {
 			units[i].Err = err.Error()
 			continue
 		}
-		callers := exposedCallers(refs, units[i].Object)
 		units[i].Total = len(callers)
 		for j := range callers {
 			callers[j].Distance = units[i].Distance
@@ -362,11 +364,18 @@ func adtSegment(name string) string {
 // The name the object goes by is taken from its own URI, which is what lets the
 // self-references be dropped.
 func (c *Client) WhereUsed(ctx context.Context, objectURI string) ([]ExposedCaller, error) {
+	return c.callersOf(ctx, objectURI, objectNameFromURI(objectURI))
+}
+
+// callersOf is the one route from a where-used list to callers, shared by
+// WhereUsed and DumpImpact so that graph, explain, the MCP tools and dumps
+// --impact cannot disagree about who calls what.
+func (c *Client) callersOf(ctx context.Context, objectURI, target string) ([]ExposedCaller, error) {
 	refs, err := c.FindReferences(ctx, objectURI, 0, 0)
 	if err != nil {
 		return nil, err
 	}
-	return exposedCallers(refs, objectNameFromURI(objectURI)), nil
+	return c.resolveIncludes(ctx, exposedCallers(refs, target), target), nil
 }
 
 // objectNameFromURI recovers the object's own name from its ADT path. The
@@ -407,7 +416,18 @@ func objectNameFromURI(objectURI string) string {
 // packages come back as containers of their own, with the package interfaces
 // listed under them as direct references. A package naming an object in its
 // interface is visibility, not a call — it cannot reach the broken code and it
-// cannot be paged about — so DEVC containers are not callers.
+// cannot be paged about — so package interfaces are not callers.
+//
+// What is dropped is decided by the row, never by its container. A package is
+// also the container of every object that has no other parent, and that is
+// every standalone program: on a live 8.16 developer edition, 11 of the 59
+// direct references to BAPI_USER_GET_DETAIL were programs and program
+// includes filed under a package, and judging them by their parent dropped all
+// of them (#281). Which object a row stands for is callerOf's question.
+//
+// The answer still has program includes in it. Saying which program an
+// include belongs to takes a request per include, so that is resolveIncludes'
+// job, on the Client, and not this function's.
 func exposedCallers(refs []UsageReference, target string) []ExposedCaller {
 	containers := map[string]UsageReference{}
 	for _, r := range refs {
@@ -416,42 +436,84 @@ func exposedCallers(refs []UsageReference, target string) []ExposedCaller {
 		}
 	}
 
-	// An index rather than a pointer: appending to out reallocates, and a
-	// pointer into the old backing array would silently update nothing.
-	byName := map[string]int{}
 	var out []ExposedCaller
 	for _, r := range refs {
 		if !strings.Contains(r.UsageInformation, "gradeDirect") {
 			continue
 		}
-		owner := containers[r.ParentURI]
-		if isPackaging(owner.Type) || isPackaging(r.Type) {
+		if isPackaging(r.Type) || isPackageAddress(r.URI) {
 			continue
 		}
-		name := strings.TrimSpace(owner.Name)
-		if name == "" {
-			name = strings.TrimSpace(r.Name)
+		caller := callerOf(r, containers[r.ParentURI])
+		caller.IsTest = strings.Contains(strings.ToLower(r.UsageInformation), "test")
+		out = append(out, caller)
+	}
+	return mergeCallers(out, target)
+}
+
+// callerOf decides which object a reference row stands for.
+//
+// Usually that is the container: a row under a class is one of its methods,
+// and the class is the unit that can be paged about. Three kinds of row are
+// their own caller instead:
+//
+//   - a row filed under a package. The package is only where the object lives;
+//     a standalone program or a program include has no other parent.
+//   - a row with no container at all, for the same reason.
+//   - a function module. It sits under its group, but it has its own address
+//     and its own where-used list, and "BAPI_X calls this" is the answer while
+//     "something in function group SU_USER calls this" is a search left to do.
+//     A dump frame names the module too, so this is also what lets a caller on
+//     the dump's own stack be recognised as one.
+func callerOf(r, owner UsageReference) ExposedCaller {
+	if strings.TrimSpace(owner.Name) == "" || isPackaging(owner.Type) || isFunctionModule(r.Type) {
+		pkg := r.PackageName
+		if isPackaging(owner.Type) {
+			pkg = firstNonEmpty(pkg, owner.Name)
 		}
-		if name == "" || equalFoldTrim(name, target) {
-			// A class listing a reference to itself is not exposure.
+		return ExposedCaller{
+			Name:    strings.TrimSpace(r.Name),
+			Type:    strings.TrimSpace(r.Type),
+			URI:     addressOf(r.URI),
+			Package: strings.TrimSpace(firstNonEmpty(pkg, owner.PackageName)),
+		}
+	}
+	return ExposedCaller{
+		Name:      strings.TrimSpace(owner.Name),
+		Type:      strings.TrimSpace(owner.Type),
+		URI:       strings.TrimSpace(owner.URI),
+		Package:   strings.TrimSpace(firstNonEmpty(owner.PackageName, r.PackageName)),
+		Component: strings.TrimSpace(r.Name),
+	}
+}
+
+// mergeCallers folds rows naming one object into one caller and puts the
+// answer in its reading order. It drops the target itself, which is not
+// exposure: a class listing a reference to itself is the class.
+func mergeCallers(in []ExposedCaller, target string) []ExposedCaller {
+	// An index rather than a pointer: appending to out reallocates, and a
+	// pointer into the old backing array would silently update nothing.
+	byName := map[string]int{}
+	var out []ExposedCaller
+	for _, caller := range in {
+		if caller.Name == "" || equalFoldTrim(caller.Name, target) {
 			continue
-		}
-		caller := ExposedCaller{
-			Name:      name,
-			Type:      owner.Type,
-			URI:       strings.TrimSpace(owner.URI),
-			Package:   firstNonEmpty(owner.PackageName, r.PackageName),
-			Component: strings.TrimSpace(r.Name),
-			IsTest:    strings.Contains(strings.ToLower(r.UsageInformation), "test"),
 		}
 		key := trimUpper(caller.Name)
 		if at, seen := byName[key]; seen {
 			// One object can reference the target from several routines; the
 			// object is the unit of exposure, so the extra rows only add to the
 			// component list rather than becoming separate callers.
-			if caller.Component != "" && !strings.Contains(out[at].Component, caller.Component) {
-				out[at].Component += ", " + caller.Component
+			for _, part := range strings.Split(caller.Component, ", ") {
+				if part != "" && !containsPart(out[at].Component, part) {
+					if out[at].Component != "" {
+						out[at].Component += ", "
+					}
+					out[at].Component += part
+				}
 			}
+			// Productive use anywhere makes the object productive exposure.
+			out[at].IsTest = out[at].IsTest && caller.IsTest
 			continue
 		}
 		out = append(out, caller)
@@ -469,6 +531,93 @@ func exposedCallers(refs []UsageReference, target string) []ExposedCaller {
 	return out
 }
 
+func containsPart(list, part string) bool {
+	for _, p := range strings.Split(list, ", ") {
+		if p == part {
+			return true
+		}
+	}
+	return false
+}
+
+// maxIncludeLookups bounds the requests resolveIncludes makes for one answer.
+// Each include costs a round trip, and a where-used list of a hub can name
+// hundreds. Past the bound an include is reported as itself, which is still
+// a true caller, only a less convenient one.
+const maxIncludeLookups = 50
+
+// resolveIncludes replaces each program include in a caller list with the
+// program it belongs to.
+//
+// An include is not a program anybody runs, and a dump stack names the main
+// program, not the include. Reported as itself, RSCUA_USER_COMPARE_INIT would
+// never match the RSCUA_USER_COMPARE frame on a stack, and a reader would be
+// left to find the program by hand. The include's name is kept as the
+// component, since that is where the reference actually sits.
+//
+// An include whose main program cannot be read stays in the list as itself.
+// Dropping it would turn "could not ask" into "does not call", which is the
+// defect this whole list exists to avoid.
+func (c *Client) resolveIncludes(ctx context.Context, callers []ExposedCaller, target string) []ExposedCaller {
+	lookups := 0
+	var out []ExposedCaller
+	for _, caller := range callers {
+		if !isProgramInclude(caller.Type) || caller.URI == "" || lookups >= maxIncludeLookups {
+			out = append(out, caller)
+			continue
+		}
+		lookups++
+		mains, err := c.includeMainPrograms(ctx, caller.URI)
+		if err != nil || len(mains) == 0 {
+			out = append(out, caller)
+			continue
+		}
+		for _, m := range mains {
+			out = append(out, ExposedCaller{
+				Name:      strings.TrimSpace(m.Name),
+				Type:      strings.TrimSpace(m.Type),
+				URI:       strings.TrimSpace(m.URI),
+				Package:   firstNonEmpty(strings.TrimSpace(m.PackageName), caller.Package),
+				Component: firstNonEmpty(caller.Component, caller.Name),
+				IsTest:    caller.IsTest,
+			})
+		}
+	}
+	return mergeCallers(out, target)
+}
+
+// includeMainProgramsAccept is the only content type the mainprograms
+// resource accepts: plain application/xml is answered 406. A refused lookup
+// only leaves the include unresolved, so getting this wrong would never show
+// as an error.
+const includeMainProgramsAccept = "application/vnd.sap.adt.programs.includes.mainprograms+xml"
+
+// includeMainPrograms asks ADT which programs an include is part of. The
+// answer is an adtcore:objectReferences list, checked live on an 8.16
+// developer edition: RSCUA_USER_COMPARE_INIT answers RSCUA_USER_COMPARE
+// (PROG/P), and a function group's include answers the group (FUGR/F).
+func (c *Client) includeMainPrograms(ctx context.Context, includeURI string) ([]SearchResult, error) {
+	resp, err := c.transport.Request(ctx, strings.TrimRight(includeURI, "/")+"/mainprograms", &RequestOptions{
+		Method: http.MethodGet,
+		Accept: includeMainProgramsAccept,
+	})
+	if err != nil {
+		return nil, err
+	}
+	xmlStr := strings.ReplaceAll(string(resp.Body), "adtcore:", "")
+	var refs SearchResults
+	if err := xml.Unmarshal([]byte(xmlStr), &refs); err != nil {
+		return nil, fmt.Errorf("parsing the main programs of %s: %w", includeURI, err)
+	}
+	var out []SearchResult
+	for _, r := range refs.Results {
+		if strings.TrimSpace(r.Name) != "" {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
 // rankExposure flattens the per-unit answers into one ranked list and splits
 // off the callers that are on the dump's own stack.
 //
@@ -480,6 +629,13 @@ func rankExposure(units []ImpactUnit, dump Dump, stack []DumpFrame) (exposed, on
 	onStack := map[string]bool{}
 	for _, name := range StackPrograms(stack) {
 		if u, ok := unitForFrame(DumpFrame{Program: name}); ok {
+			onStack[trimUpper(u.Object)] = true
+		}
+	}
+	// A FUNCTION frame also names its module, and a module is a caller in its
+	// own right, so the module counts as on the stack beside its group.
+	for _, frame := range stack {
+		if u, ok := unitForFrame(frame); ok {
 			onStack[trimUpper(u.Object)] = true
 		}
 	}
@@ -519,6 +675,31 @@ func rankExposure(units []ImpactUnit, dump Dump, stack []DumpFrame) (exposed, on
 func isPackaging(adtType string) bool {
 	t := strings.ToUpper(strings.TrimSpace(adtType))
 	return strings.HasPrefix(t, "DEVC") || strings.HasPrefix(t, "PINF")
+}
+
+// isPackageAddress catches a package interface row that arrives without a
+// type: its URI is the package's own, with the interface in the fragment.
+func isPackageAddress(uri string) bool {
+	path := strings.ToLower(addressOf(uri))
+	return strings.HasPrefix(path, "/sap/bc/adt/packages/") ||
+		strings.Contains(path, "/object_type/pinf")
+}
+
+// addressOf drops the fragment from a row URI. A row's fragment points at a
+// position in the source, which is not part of the object's address.
+func addressOf(uri string) string {
+	if i := strings.Index(uri, "#"); i >= 0 {
+		uri = uri[:i]
+	}
+	return strings.TrimSpace(uri)
+}
+
+func isFunctionModule(adtType string) bool {
+	return strings.EqualFold(strings.TrimSpace(adtType), "FUGR/FF")
+}
+
+func isProgramInclude(adtType string) bool {
+	return strings.EqualFold(strings.TrimSpace(adtType), "PROG/I")
 }
 
 func firstNonEmpty(values ...string) string {
