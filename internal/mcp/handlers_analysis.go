@@ -170,12 +170,19 @@ func (s *Server) callGraphAnswer(ctx context.Context, request mcp.CallToolReques
 
 	switch direction {
 	case "callers":
-		callers, err := s.adtClient.WhereUsed(ctx, objectURI)
+		callers, unresolved, err := s.adtClient.WhereUsed(ctx, objectURI)
 		if err != nil {
 			return nil, fmt.Errorf("the where-used list could not be read for %s: %v", objectURI, err)
 		}
 		answer["source"] = sourceWhereUsed
 		answer["total"] = len(callers)
+		if len(unresolved) > 0 {
+			// Those includes are in the list, as themselves. Said beside it so
+			// an include standing where its program should be is not read as
+			// the program having no callers here.
+			answer["unresolved_includes"] = unresolved
+			answer["gap"] = adt.UnresolvedIncludesNote(unresolved)
+		}
 		if len(callers) > limit {
 			// Said, not left to be inferred from comparing "total" against the
 			// length of the array. A reader who does not make that comparison

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // A dump says what failed. This file answers the other half of the question:
@@ -78,6 +79,13 @@ type ImpactUnit struct {
 	// answer that quietly drops a unit is worse than one that says which unit
 	// it could not ask about.
 	Err string `json:"error,omitempty"`
+	// Unresolved names the program includes among this unit's callers that
+	// could not be resolved to their main program, and Gap says so in a
+	// sentence. They are kept apart from Note on purpose: Note means the unit
+	// could not be asked at all, while this unit was asked and answered, only
+	// with some callers reported as an include rather than as its program.
+	Unresolved []Unsearched `json:"unresolved,omitempty"`
+	Gap        string       `json:"gap,omitempty"`
 	// Note records a unit the query reached but cannot answer for, which is a
 	// different and more dangerous thing than an error: it comes back 200 with
 	// an empty list, and an empty list reads as "nobody calls this".
@@ -157,16 +165,25 @@ func (c *Client) DumpImpact(ctx context.Context, dump Dump, opts DumpImpactOptio
 		return nil, fmt.Errorf("this dump names no program, so there is nothing to ask a where-used list about")
 	}
 
+	includes := c.newIncludeResolver()
 	for i := range units {
 		if note := unanswerable(units[i]); note != "" {
 			units[i].Note = note
 			continue
 		}
-		callers, err := c.callersOf(ctx, units[i].URI, units[i].Object)
+		callers, unresolved, err := c.callersOf(ctx, units[i].URI, units[i].Object, includes)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				// Out of time is not one unit's problem: every unit after this
+				// would fail the same way, and a partial answer would read as
+				// a whole one.
+				return nil, fmt.Errorf("dump impact stopped at %s: %w", units[i].Object, ctxErr)
+			}
 			units[i].Err = err.Error()
 			continue
 		}
+		units[i].Unresolved = unresolved
+		units[i].Gap = UnresolvedIncludesNote(unresolved)
 		units[i].Total = len(callers)
 		for j := range callers {
 			callers[j].Distance = units[i].Distance
@@ -363,19 +380,26 @@ func adtSegment(name string) string {
 //
 // The name the object goes by is taken from its own URI, which is what lets the
 // self-references be dropped.
-func (c *Client) WhereUsed(ctx context.Context, objectURI string) ([]ExposedCaller, error) {
-	return c.callersOf(ctx, objectURI, objectNameFromURI(objectURI))
+//
+// The second result names the program includes that could not be resolved to
+// their main program; an empty one means every include was.
+func (c *Client) WhereUsed(ctx context.Context, objectURI string) ([]ExposedCaller, []Unsearched, error) {
+	return c.callersOf(ctx, objectURI, objectNameFromURI(objectURI), c.newIncludeResolver())
 }
 
 // callersOf is the one route from a where-used list to callers, shared by
 // WhereUsed and DumpImpact so that graph, explain, the MCP tools and dumps
 // --impact cannot disagree about who calls what.
-func (c *Client) callersOf(ctx context.Context, objectURI, target string) ([]ExposedCaller, error) {
+//
+// The Unsearched list names the program includes that could not be resolved
+// to their main program. They are still in the caller list, as themselves; the
+// list says the answer is less complete than it looks.
+func (c *Client) callersOf(ctx context.Context, objectURI, target string, includes *includeResolver) ([]ExposedCaller, []Unsearched, error) {
 	refs, err := c.FindReferences(ctx, objectURI, 0, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return c.resolveIncludes(ctx, exposedCallers(refs, target), target), nil
+	return includes.resolve(ctx, exposedCallers(refs, target), target)
 }
 
 // objectNameFromURI recovers the object's own name from its ADT path. The
@@ -540,14 +564,42 @@ func containsPart(list, part string) bool {
 	return false
 }
 
-// maxIncludeLookups bounds the requests resolveIncludes makes for one answer.
+// maxIncludeLookups bounds the requests one answer makes to resolve includes.
 // Each include costs a round trip, and a where-used list of a hub can name
 // hundreds. Past the bound an include is reported as itself, which is still
-// a true caller, only a less convenient one.
+// a true caller but not the program a dump stack names, so every include left
+// over is listed in the answer's unresolved gap rather than passed off as
+// resolved.
 const maxIncludeLookups = 50
 
-// resolveIncludes replaces each program include in a caller list with the
-// program it belongs to.
+// includeLookupWorkers is how many mainprograms requests run at once. Small:
+// these share the user's ICM session budget with everything else vsp does.
+const includeLookupWorkers = 4
+
+// includeLookup is the answer for one include: its main programs, or why
+// there are none.
+type includeLookup struct {
+	mains []SearchResult
+	err   error
+}
+
+// includeResolver resolves program includes to their main programs for one
+// answer. It is shared across the units of a dump impact query, so an
+// include that two units both name is asked about once, and the lookup cap
+// counts across the whole answer rather than per unit.
+type includeResolver struct {
+	c       *Client
+	mu      sync.Mutex
+	cache   map[string]includeLookup
+	lookups int
+}
+
+func (c *Client) newIncludeResolver() *includeResolver {
+	return &includeResolver{c: c, cache: map[string]includeLookup{}}
+}
+
+// resolve replaces each program include in a caller list with the program it
+// belongs to.
 //
 // An include is not a program anybody runs, and a dump stack names the main
 // program, not the include. Reported as itself, RSCUA_USER_COMPARE_INIT would
@@ -555,24 +607,99 @@ const maxIncludeLookups = 50
 // left to find the program by hand. The include's name is kept as the
 // component, since that is where the reference actually sits.
 //
-// An include whose main program cannot be read stays in the list as itself.
-// Dropping it would turn "could not ask" into "does not call", which is the
-// defect this whole list exists to avoid.
-func (c *Client) resolveIncludes(ctx context.Context, callers []ExposedCaller, target string) []ExposedCaller {
-	lookups := 0
-	var out []ExposedCaller
+// An include that could not be resolved — the lookup failed, or the cap was
+// reached — stays in the list as itself, because dropping it would turn
+// "could not ask" into "does not call". It is also returned as Unsearched, so
+// the answer says it is incomplete rather than reading as whole. A cancelled
+// or expired context is not a gap but a failed answer, and is returned as the
+// error.
+func (r *includeResolver) resolve(ctx context.Context, callers []ExposedCaller, target string) ([]ExposedCaller, []Unsearched, error) {
+	// Decide which includes this call will ask about, under the shared cap,
+	// before any request goes out — so which ones are left over does not
+	// depend on which request finished first.
+	var ask []string
+	planned := map[string]bool{}
+	r.mu.Lock()
 	for _, caller := range callers {
-		if !isProgramInclude(caller.Type) || caller.URI == "" || lookups >= maxIncludeLookups {
+		if !isProgramInclude(caller.Type) || caller.URI == "" {
+			continue
+		}
+		if _, done := r.cache[caller.URI]; done || planned[caller.URI] {
+			continue
+		}
+		if r.lookups >= maxIncludeLookups {
+			continue
+		}
+		r.lookups++
+		planned[caller.URI] = true
+		ask = append(ask, caller.URI)
+	}
+	r.mu.Unlock()
+
+	results := make([]includeLookup, len(ask))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < includeLookupWorkers && w < len(ask); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				if err := ctx.Err(); err != nil {
+					results[i] = includeLookup{err: err}
+					continue
+				}
+				mains, err := r.c.includeMainPrograms(ctx, ask[i])
+				results[i] = includeLookup{mains: mains, err: err}
+			}
+		}()
+	}
+	for i := range ask {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		return nil, nil, fmt.Errorf("resolving includes to their programs: %w", err)
+	}
+
+	r.mu.Lock()
+	for i, uri := range ask {
+		r.cache[uri] = results[i]
+	}
+	cache := make(map[string]includeLookup, len(r.cache))
+	for k, v := range r.cache {
+		cache[k] = v
+	}
+	r.mu.Unlock()
+
+	var out []ExposedCaller
+	var gaps []Unsearched
+	for _, caller := range callers {
+		if !isProgramInclude(caller.Type) || caller.URI == "" {
 			out = append(out, caller)
 			continue
 		}
-		lookups++
-		mains, err := c.includeMainPrograms(ctx, caller.URI)
-		if err != nil || len(mains) == 0 {
+		res, asked := cache[caller.URI]
+		switch {
+		case !asked:
+			gaps = append(gaps, Unsearched{
+				Object: caller.Name,
+				Reason: fmt.Sprintf("not resolved to its main program: the cap of %d include lookups per answer was reached", maxIncludeLookups),
+			})
+			out = append(out, caller)
+			continue
+		case res.err != nil:
+			gaps = append(gaps, Unsearched{Object: caller.Name, Reason: "not resolved to its main program: " + res.err.Error()})
+			out = append(out, caller)
+			continue
+		case len(res.mains) == 0:
+			// Answered, and the answer is that no program includes it. That is
+			// a fact about the include, not a gap in this answer.
 			out = append(out, caller)
 			continue
 		}
-		for _, m := range mains {
+		for _, m := range res.mains {
 			out = append(out, ExposedCaller{
 				Name:      strings.TrimSpace(m.Name),
 				Type:      strings.TrimSpace(m.Type),
@@ -583,7 +710,8 @@ func (c *Client) resolveIncludes(ctx context.Context, callers []ExposedCaller, t
 			})
 		}
 	}
-	return mergeCallers(out, target)
+	sort.SliceStable(gaps, func(i, j int) bool { return gaps[i].Object < gaps[j].Object })
+	return mergeCallers(out, target), gaps, nil
 }
 
 // includeMainProgramsAccept is the only content type the mainprograms
@@ -696,6 +824,28 @@ func addressOf(uri string) string {
 
 func isFunctionModule(adtType string) bool {
 	return strings.EqualFold(strings.TrimSpace(adtType), "FUGR/FF")
+}
+
+// UnresolvedIncludesNote says which program includes in a caller list are
+// listed as themselves because their main program could not be read. Empty
+// when there are none. Every surface that prints a caller list prints this
+// beside it, so a capped or failed lookup never reads as a complete answer.
+func UnresolvedIncludesNote(unresolved []Unsearched) string {
+	if len(unresolved) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d program includes are listed as themselves because their main program could not be read, "+
+		"so this is not a complete answer and a dump stack naming that program will not match them:", len(unresolved))
+	const named = 5
+	for i, u := range unresolved {
+		if i >= named {
+			fmt.Fprintf(&b, "\n  … and %d more", len(unresolved)-named)
+			break
+		}
+		fmt.Fprintf(&b, "\n  %s: %s", u.Object, oneLine(u.Reason))
+	}
+	return b.String()
 }
 
 func isProgramInclude(adtType string) bool {

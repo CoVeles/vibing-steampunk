@@ -463,6 +463,9 @@ func impactOfDump(ctx context.Context, client *adt.Client, cmd *cobra.Command, d
 			where = fmt.Sprintf("   frame %d, line %d", u.Frame.Position, u.Frame.Line)
 		}
 		fmt.Printf("  %-4s %-34s %4d direct callers%s\n", u.Type, u.Object, u.Total, where)
+		if u.Gap != "" {
+			fmt.Printf("       %s\n", strings.ReplaceAll(u.Gap, "\n", "\n       "))
+		}
 	}
 	fmt.Println()
 

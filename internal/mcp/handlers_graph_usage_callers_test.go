@@ -1,6 +1,15 @@
 package mcp
 
-import "testing"
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/oisee/vibing-steampunk/pkg/adt"
+)
 
 // Callers reach usage examples through the where-used list. Since #281 a
 // function module arrives as itself, namespaced ones escaped in the URI, and
@@ -38,5 +47,46 @@ func TestUsageTypeNameFromURIReadsModulesAndIncludes(t *testing.T) {
 			t.Errorf("%s: got (%q, %q, %q), want (%q, %q, %q)",
 				tc.uri, typ, name, grp, tc.wantType, tc.wantName, tc.wantGrp)
 		}
+	}
+}
+
+// An include whose main program could not be read is in the callers list as
+// itself, and the answer says so beside it rather than reading as whole.
+func TestCallersAnswerSaysWhichIncludesStayedUnresolved(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-csrf-token", "test-token")
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "usageReferences"):
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>` +
+				`<usageReferences:usageReferenceResult xmlns:usageReferences="http://www.sap.com/adt/ris/usageReferences" xmlns:adtcore="http://www.sap.com/adt/core"><usageReferences:referencedObjects>` +
+				`<usageReferences:referencedObject usageReferences:uri="/sap/bc/adt/packages/%24zdemo" usageReferences:isResult="false"><usageReferences:adtObject adtcore:name="$ZDEMO" adtcore:type="DEVC/K"/></usageReferences:referencedObject>` +
+				`<usageReferences:referencedObject usageReferences:uri="/sap/bc/adt/programs/includes/zdemo_incl" usageReferences:parentUri="/sap/bc/adt/packages/%24zdemo" usageReferences:isResult="true" usageReferences:usageInformation="gradeDirect,includeProductive">` +
+				`<usageReferences:adtObject adtcore:name="ZDEMO_INCL" adtcore:type="PROG/I"/></usageReferences:referencedObject>` +
+				`</usageReferences:referencedObjects></usageReferences:usageReferenceResult>`))
+		case strings.HasSuffix(r.URL.Path, "/mainprograms"):
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	s := &Server{adtClient: adt.NewClient(srv.URL, "user", "pass")}
+	var req mcp.CallToolRequest
+	req.Params.Arguments = map[string]any{"object_uri": "/sap/bc/adt/functions/groups/zdemo_fg/fmodules/zdemo_fm"}
+	answer, err := s.callGraphAnswer(context.Background(), req, "callers")
+	if err != nil {
+		t.Fatalf("callGraphAnswer: %v", err)
+	}
+	if answer["total"] != 1 {
+		t.Errorf("total = %v, want the include counted as a caller", answer["total"])
+	}
+	gap, _ := answer["gap"].(string)
+	if !strings.Contains(gap, "ZDEMO_INCL") {
+		t.Errorf("gap = %q, want the unresolved include named", gap)
+	}
+	if u, _ := answer["unresolved_includes"].([]adt.Unsearched); len(u) != 1 {
+		t.Errorf("unresolved_includes = %v", answer["unresolved_includes"])
 	}
 }

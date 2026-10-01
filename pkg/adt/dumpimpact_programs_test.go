@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -165,6 +166,7 @@ const compareMainProgramXML = `<?xml version="1.0" encoding="utf-8"?><adtcore:ob
 // Through the client, the way graph, explain, the MCP tool and dumps --impact
 // all reach it: includes come back as the program that runs them.
 func TestWhereUsedResolvesIncludesToTheirMainProgram(t *testing.T) {
+	var mu sync.Mutex
 	var lookups []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-csrf-token", "test-token")
@@ -173,7 +175,9 @@ func TestWhereUsedResolvesIncludesToTheirMainProgram(t *testing.T) {
 			w.Header().Set("Content-Type", "application/xml")
 			_, _ = w.Write([]byte(programCallersXML))
 		case strings.HasSuffix(r.URL.Path, "/mainprograms"):
+			mu.Lock()
 			lookups = append(lookups, r.URL.Path)
+			mu.Unlock()
 			// What the live system does with any other Accept header.
 			if r.Header.Get("Accept") != includeMainProgramsAccept {
 				w.WriteHeader(http.StatusNotAcceptable)
@@ -192,11 +196,15 @@ func TestWhereUsedResolvesIncludesToTheirMainProgram(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, "user", "pass")
-	callers, err := client.WhereUsed(context.Background(), "/sap/bc/adt/functions/groups/su_user/fmodules/bapi_user_get_detail")
+	callers, unresolved, err := client.WhereUsed(context.Background(), "/sap/bc/adt/functions/groups/su_user/fmodules/bapi_user_get_detail")
 	if err != nil {
 		t.Fatalf("WhereUsed: %v", err)
 	}
 
+	// The 404 is a gap: the include is listed, and the answer says why.
+	if len(unresolved) != 1 || unresolved[0].Object != "ZDEMO_ORPHAN_INCL" {
+		t.Errorf("unresolved = %+v, want the include whose lookup 404'd", unresolved)
+	}
 	if len(lookups) != 3 {
 		t.Errorf("want one main-program lookup per include, got %v", lookups)
 	}
