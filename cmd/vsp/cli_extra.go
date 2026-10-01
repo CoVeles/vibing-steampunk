@@ -743,6 +743,10 @@ func executeExitError(result *adt.ExecuteABAPResult, dumped []adt.Dump) error {
 		return fmt.Errorf("the code did not finish")
 	case len(dumped) > 0:
 		return fmt.Errorf("a runtime error appeared while this ran")
+	case result.Success && !result.CleanedUp:
+		// The code ran, but the temporary program is still in $TMP (the CLI
+		// never asks to keep it); the warning naming it is on stderr.
+		return fmt.Errorf("the code ran, but its temporary program %s was not deleted", result.ProgramName)
 	case !result.Success:
 		// No failure from the run, because there was no run: the temporary
 		// program could not be created, locked, written or activated. Its
