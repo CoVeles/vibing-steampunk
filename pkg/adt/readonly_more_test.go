@@ -52,3 +52,9 @@ func TestServiceBindingPublish_RefusedUnderReadOnly(t *testing.T) {
 		})
 	})
 }
+
+func TestSetPrettyPrinterSettings_RefusedUnderReadOnly(t *testing.T) {
+	assertReadOnlyRefusal(t, func(c *Client) error {
+		return c.SetPrettyPrinterSettings(context.Background(), &PrettyPrinterSettings{Indentation: true, Style: "keywordUpper"})
+	})
+}
