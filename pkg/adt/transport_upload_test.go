@@ -270,6 +270,8 @@ type fakeTransportWS struct {
 	// beginRequest overrides the request begin reports.
 	beginRequest string
 	addErr       *WSError
+	commitErr    *WSError
+	statusErr    *WSError
 	buffer       []map[string]any
 	files        map[string][]byte // download source
 	got          map[string][]byte
@@ -317,6 +319,9 @@ func (f *fakeTransportWS) SendDomainRequest(_ context.Context, domain, action st
 			f.got[k] = append(f.got[k], chunk...)
 			return ok(map[string]any{})
 		case "commit":
+			if f.commitErr != nil {
+				return &WSResponse{Success: false, Error: f.commitErr}, nil
+			}
 			return ok(map[string]any{"request": "XYZK900001", "cofile_path": "/trans/cofiles/K900001.XYZ", "data_path": "/trans/data/R900001.XYZ"})
 		case "abort":
 			return ok(map[string]any{"aborted": true})
@@ -338,6 +343,9 @@ func (f *fakeTransportWS) SendDomainRequest(_ context.Context, domain, action st
 		f.jobs++
 		return ok(map[string]any{"status": "pending", "ticket": "47110001", "job": "ZVSP_TRANSPORT_BUFFER", "job_count": "47110001", "request": p["request"]})
 	case "add_status":
+		if f.statusErr != nil {
+			return &WSResponse{Success: false, Error: f.statusErr}, nil
+		}
 		if len(f.statuses) == 0 {
 			return ok(map[string]any{"request": p["request"], "system": f.system, "outcome": "unknown", "job_count": p["job"]})
 		}
@@ -490,6 +498,7 @@ func TestUploadTransportAddFailure(t *testing.T) {
 	// An answer that did not arrive: a job may have been released.
 	ws = newFakeTransportWS()
 	ws.addErr = &WSError{Code: "SERVICE_EXCEPTION", Message: "connection reset"}
+	ws.statuses = []map[string]any{{"outcome": "unknown", "cofile_present": true, "data_present": true}}
 	res, err = uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
 	if err == nil || res.Status != TransportUnknown || !res.FilesWritten || !strings.Contains(res.Note, "unknown") ||
 		!strings.Contains(res.Note, "STMS") || !strings.Contains(res.Note, "SM37") || strings.Contains(res.Note, "  ") {
@@ -501,7 +510,7 @@ func TestUploadTransportAddFailure(t *testing.T) {
 type lostCommitWS struct{ *fakeTransportWS }
 
 func (l lostCommitWS) SendDomainRequest(ctx context.Context, domain, action string, params map[string]any, d time.Duration) (*WSResponse, error) {
-	if action == "upload_files" && params["step"] == "commit" {
+	if (action == "upload_files" && params["step"] == "commit") || action == "add_status" {
 		return nil, context.DeadlineExceeded
 	}
 	return l.fakeTransportWS.SendDomainRequest(ctx, domain, action, params, d)
@@ -512,8 +521,10 @@ func (l lostCommitWS) SendDomainRequest(ctx context.Context, domain, action stri
 func TestUploadTransportLostCommitAnswer(t *testing.T) {
 	ws := lostCommitWS{newFakeTransportWS()}
 	res, err := uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
+	// The lost answer is followed by a look at DIR_TRANS; here that look
+	// fails too, so both files are unknown.
 	if err == nil || res == nil || res.FilesWritten || res.Status != TransportNotAdded ||
-		!strings.Contains(res.Note, "whether its files were written to DIR_TRANS is unknown") {
+		res.CofileState != FileUnknown || res.DataState != FileUnknown {
 		t.Fatalf("%v %+v", err, res)
 	}
 	for _, a := range ws.actions() {
@@ -648,9 +659,11 @@ func TestUploadTransportOwnSID(t *testing.T) {
 // the result does not claim a rollback (critic, round 3 #3).
 func TestUploadTransportFilesKept(t *testing.T) {
 	ws := newFakeTransportWS()
-	ws.addErr = &WSError{Code: "ADD_FAILED_FILES_KEPT", Message: "Nothing was added. Not taken back: K900001.XYZ kept"}
+	ws.addErr = &WSError{Code: "ADD_FAILED_FILES_KEPT", Message: "Nothing was added. Not taken back: R900001.XYZ kept"}
+	ws.statuses = []map[string]any{{"outcome": "not_in_buffer", "cofile_present": false, "data_present": true}}
 	res, err := uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
-	if err == nil || res.Status != TransportNotAdded || res.RolledBack || !res.FilesWritten {
+	if err == nil || res.Status != TransportNotAdded || res.RolledBack || res.FilesWritten ||
+		res.CofileState != FileNotWritten || res.DataState != FileWritten {
 		t.Errorf("%v %+v", err, res)
 	}
 }
@@ -680,5 +693,60 @@ func TestValidateCofileHeaderNeedsThirteenFields(t *testing.T) {
 	}
 	if err := ValidateCofile([]byte("TESTUSER K QAS 3 1 0 0 0 0 0 0 0 0\n"+steps), "XYZ"); err != nil {
 		t.Errorf("13 fields refused: %v", err)
+	}
+}
+
+// After a commit or add that ZADT_VSP could not vouch for, the per-file state
+// comes from what is in DIR_TRANS, never from an assumption; and a refusal
+// that ZADT_VSP confirms left nothing says so without looking
+// (PR #296 review).
+func TestUploadTransportReportsRealFileStates(t *testing.T) {
+	cases := map[string]struct {
+		commitErr, addErr *WSError
+		present           map[string]any
+		cofile, data      string
+		looks             bool
+	}{
+		"commit failed in ZADT_VSP": {commitErr: &WSError{Code: "SERVICE_EXCEPTION", Message: "dump"},
+			present: map[string]any{"cofile_present": false, "data_present": true}, cofile: FileNotWritten, data: FileWritten, looks: true},
+		"commit cleanup incomplete": {commitErr: &WSError{Code: "WRITE_FAILED_FILES_LEFT", Message: "Cleanup incomplete"},
+			present: map[string]any{"cofile_present": true, "data_present": true}, cofile: FileWritten, data: FileWritten, looks: true},
+		"commit refused, nothing left": {commitErr: &WSError{Code: "WRITE_FAILED", Message: "Nothing was written."},
+			cofile: FileNotWritten, data: FileNotWritten},
+		"add failed in ZADT_VSP": {addErr: &WSError{Code: "SERVICE_EXCEPTION", Message: "dump"},
+			present: map[string]any{"cofile_present": true, "data_present": false}, cofile: FileWritten, data: FileNotWritten, looks: true},
+		"add rolled back": {addErr: &WSError{Code: "ADD_FAILED_ROLLED_BACK", Message: "deleted again"},
+			cofile: FileNotWritten, data: FileNotWritten},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			ws := newFakeTransportWS()
+			ws.commitErr, ws.addErr = c.commitErr, c.addErr
+			if c.present != nil {
+				ws.statuses = []map[string]any{c.present}
+			}
+			res, err := uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
+			if err == nil || res == nil {
+				t.Fatalf("%v %+v", err, res)
+			}
+			if res.CofileState != c.cofile || res.DataState != c.data || res.FilesWritten != (c.cofile == FileWritten && c.data == FileWritten) {
+				t.Errorf("states %s/%s written=%t; want %s/%s", res.CofileState, res.DataState, res.FilesWritten, c.cofile, c.data)
+			}
+			if res.RolledBack != (name == "add rolled back") {
+				t.Errorf("rolledBack %t", res.RolledBack)
+			}
+			looked := strings.Contains(strings.Join(ws.actions(), ","), "add_status")
+			if looked != c.looks {
+				t.Errorf("looked at DIR_TRANS: %t, want %t", looked, c.looks)
+			}
+		})
+	}
+	// A look that fails leaves both unknown.
+	ws := newFakeTransportWS()
+	ws.addErr = &WSError{Code: "SERVICE_EXCEPTION", Message: "dump"}
+	ws.statusErr = &WSError{Code: "SERVICE_EXCEPTION", Message: "dump"}
+	res, _ := uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
+	if res.CofileState != FileUnknown || res.DataState != FileUnknown || res.FilesWritten {
+		t.Errorf("%+v", res)
 	}
 }

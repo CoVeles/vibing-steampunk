@@ -618,7 +618,8 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
                 IMPORTING ev_opened = lv_data_open ev_path = ev_data_path ev_error = lv_error ).
     IF lv_error IS NOT INITIAL.
       DATA(lv_cleanup) = COND string( WHEN lv_data_open = abap_true THEN delete_file( iv_kind = `data` iv_name = is_up-data_name ) ).
-      ev_code = `WRITE_FAILED`.
+      " A code of its own when something of this call may be left behind.
+      ev_code = COND #( WHEN lv_cleanup IS INITIAL THEN `WRITE_FAILED` ELSE `WRITE_FAILED_FILES_LEFT` ).
       ev_message = |{ is_up-data_name }: { lv_error }. | &&
                    COND string( WHEN lv_data_open = abap_false THEN `Nothing was written.`
                                 WHEN lv_cleanup IS INITIAL THEN `What this call wrote was deleted again.`
@@ -637,7 +638,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ELSE.
         lv_cleanup2 = |{ is_up-data_name } kept: the cofile could not be deleted|.
       ENDIF.
-      ev_code = `WRITE_FAILED`.
+      ev_code = COND #( WHEN lv_cleanup IS INITIAL AND lv_cleanup2 IS INITIAL THEN `WRITE_FAILED` ELSE `WRITE_FAILED_FILES_LEFT` ).
       ev_message = |{ is_up-cofile_name }: { lv_error }. | &&
                    COND string( WHEN lv_cleanup IS INITIAL AND lv_cleanup2 IS INITIAL THEN `What this call wrote was deleted again.`
                                 ELSE |Cleanup incomplete: { lv_cleanup } { lv_cleanup2 }| ).

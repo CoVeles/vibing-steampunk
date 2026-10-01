@@ -754,3 +754,17 @@ func TestValidateCofileHeaderFieldsABAP(t *testing.T) {
 		t.Error("validate_cofile does not check the nine object counts")
 	}
 }
+
+// write_pair tells a complete cleanup from an incomplete one, so the client
+// never takes "nothing was left" for granted (PR #296 review).
+func TestWritePairReportsFilesLeft(t *testing.T) {
+	body := strings.ToUpper(strings.Join(methodStatements(abapStatements(transportServiceSource(t)), "WRITE_PAIR"), "\n"))
+	for _, want := range []string{
+		"EV_CODE = COND #( WHEN LV_CLEANUP IS INITIAL THEN `WRITE_FAILED` ELSE `WRITE_FAILED_FILES_LEFT` )",
+		"EV_CODE = COND #( WHEN LV_CLEANUP IS INITIAL AND LV_CLEANUP2 IS INITIAL THEN `WRITE_FAILED` ELSE `WRITE_FAILED_FILES_LEFT` )",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("write_pair lacks %s", want)
+		}
+	}
+}

@@ -339,17 +339,24 @@ type TransportUploadResult struct {
 	DataName   string `json:"datafile"`
 	CofileSize int    `json:"cofileSize"`
 	DataSize   int    `json:"dataSize"`
-	// FilesWritten says both files are in DIR_TRANS now.
-	FilesWritten bool   `json:"filesWritten"`
-	CofilePath   string `json:"cofilePath,omitempty"`
-	DataPath     string `json:"dataPath,omitempty"`
+	// FilesWritten says both of this upload's files are in DIR_TRANS, as
+	// last confirmed -- by ZADT_VSP, or by reading DIR_TRANS back.
+	FilesWritten bool `json:"filesWritten"`
+	// CofileState and DataState say what is known of each file this upload
+	// wrote: written (in DIR_TRANS), not_written (never written, or taken
+	// back), or unknown.
+	CofileState string `json:"cofileState"`
+	DataState   string `json:"dataState"`
+	CofilePath  string `json:"cofilePath,omitempty"`
+	DataPath    string `json:"dataPath,omitempty"`
 	// Status is the add's outcome as far as this call knows it: pending
 	// (the job is released; ask TransportAddStatus), not_added (certain:
 	// no job ran, or the files were taken back), or unknown.
 	Status string `json:"status"`
 	// Job is the background job doing the add, when one was started.
 	Job *TransportJob `json:"job,omitempty"`
-	// RolledBack says the files written by this upload were deleted again.
+	// RolledBack says ZADT_VSP confirmed both files written by this upload
+	// were deleted again.
 	RolledBack bool   `json:"rolledBack,omitempty"`
 	Note       string `json:"note"`
 }
@@ -719,6 +726,41 @@ func transportOutcomeNote(request, system, outcome, job, jobCount string) string
 	return fmt.Sprintf("whether %s is in the import queue is unknown -- %s", request, where)
 }
 
+// States of one of an upload's files.
+const (
+	FileWritten    = "written"
+	FileNotWritten = "not_written"
+	FileUnknown    = "unknown"
+)
+
+// setFiles records both files' states and derives FilesWritten from them.
+func (r *TransportUploadResult) setFiles(cofile, data string) {
+	r.CofileState, r.DataState = cofile, data
+	r.FilesWritten = cofile == FileWritten && data == FileWritten
+}
+
+// observeFiles reads back, read-only, whether the upload's two files are in
+// DIR_TRANS -- for when ZADT_VSP could not say (its answer was lost, it
+// failed, or its cleanup was incomplete). A file there is this upload's:
+// the upload refused to start while either existed, and wrote under the
+// request's lock. If the read fails, both are unknown.
+func (c *Client) observeFiles(ctx context.Context, ws TransportService, res *TransportUploadResult) {
+	octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	st, err := c.TransportAddStatus(octx, ws, res.Request, "")
+	if err != nil {
+		res.setFiles(FileUnknown, FileUnknown)
+		return
+	}
+	state := func(present bool) string {
+		if present {
+			return FileWritten
+		}
+		return FileNotWritten
+	}
+	res.setFiles(state(st.CofilePresent), state(st.DataPresent))
+}
+
 // TransportServiceError is a refusal or failure reported by
 // ZCL_VSP_TRANSPORT_SERVICE.
 type TransportServiceError struct {
@@ -866,22 +908,24 @@ func (c *Client) UploadTransport(ctx context.Context, ws TransportService, files
 	if err := transportCall(ctx, ws, "upload_files", map[string]any{
 		"step": "commit", "assembly_id": begin.AssemblyID,
 	}, 5*time.Minute, &commit); err != nil {
+		// No add was asked for, whatever happened to the files.
+		res.Status = TransportNotAdded
 		var se *TransportServiceError
-		if errors.As(err, &se) {
-			// ZADT_VSP answered: the commit refused, and deleted whatever it
-			// had written; add_to_buffer was never sent.
-			res.Status = TransportNotAdded
-			res.Note = fmt.Sprintf("%s was not added to the import queue; the commit was refused (%s)", files.Request, se.Code)
+		if errors.As(err, &se) && se.Code != "SERVICE_EXCEPTION" && se.Code != "WRITE_FAILED_FILES_LEFT" {
+			// ZADT_VSP refused the commit and confirmed that nothing of this
+			// upload was left in DIR_TRANS.
+			res.setFiles(FileNotWritten, FileNotWritten)
+			res.Note = fmt.Sprintf("%s was not added to the import queue; the commit was refused (%s) and nothing was left in DIR_TRANS", files.Request, se.Code)
 			return res, err
 		}
-		// The answer was lost: the files may or may not be in DIR_TRANS.
-		// No add was asked for.
-		res.Status = TransportNotAdded
-		res.Note = fmt.Sprintf("%s was not added to the import queue (no add was sent), but whether its files were written to DIR_TRANS is unknown -- "+
-			"vsp transport status %s shows whether they are there", files.Request, files.Request)
+		// The answer was lost, ZADT_VSP failed, or its cleanup was
+		// incomplete: look at DIR_TRANS instead of assuming.
+		c.observeFiles(ctx, ws, res)
+		res.Note = fmt.Sprintf("%s was not added to the import queue (no add was sent); what is left in DIR_TRANS: cofile %s, data file %s",
+			files.Request, res.CofileState, res.DataState)
 		return res, err
 	}
-	res.FilesWritten = true
+	res.setFiles(FileWritten, FileWritten)
 	res.CofilePath, res.DataPath = commit.CofilePath, commit.DataPath
 
 	var started transportJobStarted
@@ -890,18 +934,21 @@ func (c *Client) UploadTransport(ctx context.Context, ws TransportService, files
 		var se *TransportServiceError
 		switch {
 		case errors.As(addErr, &se) && se.Code == "ADD_FAILED_ROLLED_BACK":
-			// No job ran and the files were taken back.
-			res.Status, res.FilesWritten, res.RolledBack = TransportNotAdded, false, true
-		case errors.As(addErr, &se) && se.Code == "ADD_FAILED_FILES_KEPT":
-			// No job ran, but the files could not all be taken back: they
-			// are (some of them) still in DIR_TRANS.
-			res.Status, res.RolledBack = TransportNotAdded, false
-		case errors.As(addErr, &se) && (se.Code == "NOT_UPLOADED" || se.Code == "FILES_MISSING" || se.Code == "INVALID_REQUEST"):
-			// Refused before any job was scheduled.
+			// No job ran, and ZADT_VSP confirmed both files were taken back.
+			res.Status, res.RolledBack = TransportNotAdded, true
+			res.setFiles(FileNotWritten, FileNotWritten)
+		case errors.As(addErr, &se) && (se.Code == "ADD_FAILED_FILES_KEPT" || se.Code == "FILES_MISSING"):
+			// No job ran; the files are not all where they were. Look.
+			res.Status = TransportNotAdded
+			c.observeFiles(ctx, ws, res)
+		case errors.As(addErr, &se) && (se.Code == "NOT_UPLOADED" || se.Code == "INVALID_REQUEST"):
+			// Refused before any job was scheduled; the files are untouched.
 			res.Status = TransportNotAdded
 		default:
-			// The answer was lost: a job may have been scheduled.
+			// The answer was lost or ZADT_VSP failed: a job may have been
+			// scheduled, and the files may have been taken back. Look.
 			res.Status = TransportUnknown
+			c.observeFiles(ctx, ws, res)
 		}
 		res.Note = transportOutcomeNote(files.Request, res.System, res.Status, transportJobName, "")
 		return res, addErr

@@ -118,6 +118,8 @@ and S_CTS_ADMI with EPS1 (files) and TADD (buffer) on the system.
 			}
 			if res.RolledBack {
 				fmt.Fprintln(os.Stderr, "  the files this upload wrote were deleted again")
+			} else if !res.FilesWritten && res.CofileState != "" {
+				fmt.Fprintf(os.Stderr, "  in DIR_TRANS now: cofile %s, data file %s\n", res.CofileState, res.DataState)
 			}
 			if res.Job != nil {
 				fmt.Fprintf(os.Stderr, "  job %s %s released\n", res.Job.Name, res.Job.Count)
