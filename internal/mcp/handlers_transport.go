@@ -46,6 +46,10 @@ func (s *Server) routeTransportAction(ctx context.Context, action, objectType, o
 		return s.callHandler(ctx, s.handleAddTransportObjects, params)
 	case "remove_transport_object", "remove_from_transport":
 		return s.callHandler(ctx, s.handleRemoveTransportObject, params)
+	case "upload_transport":
+		return s.callHandler(ctx, s.handleUploadTransport, params)
+	case "transport_buffer":
+		return s.callHandler(ctx, s.handleTransportBuffer, params)
 	}
 	return nil, false, nil
 }
