@@ -21,7 +21,8 @@ func abapSeeds(f *testing.F) []string {
 	if err := json.Unmarshal(raw, &files); err != nil {
 		f.Fatal(err)
 	}
-	seeds := []string{
+	seeds := make([]string, 0, 12+len(files))
+	seeds = append(seeds,
 		"",
 		"DATA lv_x TYPE i.",
 		"DATA: lv_x TYPE i, lv_y TYPE string.",
@@ -30,7 +31,7 @@ func abapSeeds(f *testing.F) []string {
 		"METHOD m BY DATABASE PROCEDURE FOR HDB LANGUAGE SQLSCRIPT.\nselect 1 from dummy; ENDMETHOD.",
 		"lo->m( )->n( ). zcl=>s( ). a-b+c @d ##PRAGMA.",
 		"'unterminated", "|unterminated{ ", "`", ":", ":::,,..",
-	}
+	)
 	for _, file := range files {
 		var b strings.Builder
 		row, col := 1, 1
