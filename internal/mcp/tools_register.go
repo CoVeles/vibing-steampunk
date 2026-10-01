@@ -1113,7 +1113,10 @@ func (s *Server) registerCRUDTools(shouldRegister func(string) bool) {
 			),
 			mcp.WithString("fields",
 				mcp.Required(),
-				mcp.Description("JSON array of fields: [{\"name\":\"ID\",\"type\":\"CHAR32\",\"key\":true},{\"name\":\"VALUE\",\"type\":\"STRING\"}]. Types: CHAR/CHARnn, NUMC/NUMCnn, INT4, DEC, STRING, TIMESTAMPL, UUID, DATS, TIMS, or data element name."),
+				mcp.Description("JSON array of fields: [{\"name\":\"ID\",\"type\":\"CHAR32\",\"key\":true},{\"name\":\"VALUE\",\"type\":\"STRING\",\"notNull\":true}]. Attributes: name, type, length, decimals, description, key, notNull; any other attribute is refused. Attribute names are case-insensitive. Types: CHAR/CHARnn, NUMC/NUMCnn, INT4, DEC, STRING, TIMESTAMPL, UUID, DATS, TIMS, MANDT/CLIENT/CLNT/abap.clnt (client types), or data element name. Client field: a first key field of client type (MANDT, CLIENT, CLNT or abap.clnt) is the client field; without one, a 'key client : abap.clnt' field is put in front (see client_dependent). Non-key client-typed data columns (e.g. SRC_CLIENT) are allowed; a client-typed key field after the first is refused."),
+			),
+			mcp.WithBoolean("client_dependent",
+				mcp.Description("Left out: add a key field CLIENT (abap.clnt) in front, unless the first key field has client type MANDT/CLIENT/CLNT/abap.clnt. A first key field NAMED MANDT or CLIENT typed with another data element (e.g. SYMANDT, ZMANDT) is refused unless this is true, which uses that field as the client field as is (false is refused: SAP may see a client field there). Named MANDT/CLIENT with a built-in type (CHAR3, INT4) is refused unless this is false, since SAP would make the table client-independent. true: client-dependent, same rules. false: client-independent table, no client field is added."),
 			),
 			mcp.WithString("transport",
 				mcp.Description("Transport request number (optional for $TMP)"),
@@ -1441,7 +1444,7 @@ func (s *Server) registerWorkflowTools(shouldRegister func(string) bool) {
 func (s *Server) registerFileTools(shouldRegister func(string) bool) {
 	if shouldRegister("DeployFromFile") {
 		s.mcpServer.AddTool(mcp.NewTool("DeployFromFile",
-			mcp.WithDescription("✅ RECOMMENDED - Smart deploy from file: auto-detects if object exists and creates/updates accordingly. Solves token limit problem for large generated files (ML models, 3948+ lines). Example: DeployFromFile(file_path=\"/path/to/zcl_ml_iris.clas.abap\", package_name=\"$ZAML_IRIS\") deploys any size file. Workflow: Parse → Check existence → Create or Update → Lock → SyntaxCheck → Write → Unlock → Activate. Supports .clas.abap, .prog.abap, .intf.abap, .fugr.abap, .func.abap. Use this for all file-based deployments."),
+			mcp.WithDescription("✅ RECOMMENDED - Smart deploy from file: auto-detects if object exists and creates/updates accordingly. Solves token limit problem for large generated files (ML models, 3948+ lines). Example: DeployFromFile(file_path=\"/path/to/zcl_ml_iris.clas.abap\", package_name=\"$ZAML_IRIS\") deploys any size file. Workflow: Parse → Check existence → Create or Update → Lock → SyntaxCheck → Write → Unlock → Activate. Supports .clas.abap (and its .clas.testclasses/.locals_def/.locals_imp/.macros.abap includes), .prog.abap, .incl.abap, .intf.abap, .fugr.abap, function modules as {group}.fugr.{module}.abap (abapGit) or {group}.fugr.{module}.func.abap, and the RAP suffixes. A plain {name}.abap is typed from its first statement only when that statement names {name}; otherwise it is refused (or read as an include when no REPORT/CLASS/INTERFACE/FUNCTION statement opens it). Use this for all file-based deployments."),
 			mcp.WithString("file_path",
 				mcp.Required(),
 				mcp.Description("Absolute path to ABAP source file"),
