@@ -1332,6 +1332,38 @@ func (c *Client) deleteGated(ctx context.Context, objectURL, transport string) (
 	return "", true, nil
 }
 
+// gitObjectADTTypes are the ADT types a search hit may carry for an object
+// of a TADIR type. The main type alone is not enough: FUGR/FF is a function
+// module, not its group, and the module's URI must never stand in for the
+// group's. A TADIR type not listed here is matched by its main type.
+var gitObjectADTTypes = map[string][]string{
+	"PROG": {"PROG/P", "PROG/I"},
+	"CLAS": {"CLAS/OC"},
+	"INTF": {"INTF/OI"},
+	"FUGR": {"FUGR/F"},
+	"TABL": {"TABL/DT", "TABL/DS"},
+	"DTEL": {"DTEL/DE"},
+	"DOMA": {"DOMA/DD"},
+	"TTYP": {"TTYP/DA"},
+	"DDLS": {"DDLS/DF"},
+}
+
+// gitHitIsObject says whether a search hit of ADT type adtType is the object
+// itself for TADIR type objType, not a part of it or another kind of object.
+func gitHitIsObject(objType, adtType string) bool {
+	adtType = strings.ToUpper(strings.TrimSpace(adtType))
+	if allowed, ok := gitObjectADTTypes[objType]; ok {
+		for _, a := range allowed {
+			if adtType == a {
+				return true
+			}
+		}
+		return false
+	}
+	main, _, _ := strings.Cut(adtType, "/")
+	return main == objType
+}
+
 // gitDeleteURL is the ADT URI of the object TADIR lists as type/name in
 // pkg. The TADIR type alone does not name the ADT collection -- a PROG may
 // be an include (/programs/includes), a TABL a structure or an append
@@ -1365,8 +1397,7 @@ func (c *Client) gitDeleteURL(ctx context.Context, objType, name, pkg string) (s
 	}
 	found := ""
 	for _, h := range hits {
-		main, _, _ := strings.Cut(strings.ToUpper(strings.TrimSpace(h.Type)), "/")
-		if main != objType {
+		if !gitHitIsObject(objType, h.Type) {
 			continue
 		}
 		hp := strings.TrimSpace(h.PackageName)

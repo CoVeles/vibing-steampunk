@@ -1366,3 +1366,28 @@ func TestWaitGitImportReportsADisconnect(t *testing.T) {
 		t.Errorf("deadline: %+v, %v", st, err)
 	}
 }
+
+// A function module of the same name as its group comes first in the search,
+// even from another package: the group's own hit gives the address, and the
+// module neither stands in for it nor counts as the group having moved.
+func TestGitDeleteURLTakesTheObjectNotItsPart(t *testing.T) {
+	route := func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "informationsystem/search") {
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">`+
+				`<adtcore:objectReference adtcore:uri="/sap/bc/adt/functions/groups/zother/fmodules/zdemo_fg" adtcore:type="FUGR/FF" adtcore:name="ZDEMO_FG" adtcore:packageName="$ZOTHER"/>`+
+				`<adtcore:objectReference adtcore:uri="/sap/bc/adt/functions/groups/zdemo_fg" adtcore:type="FUGR/F" adtcore:name="ZDEMO_FG" adtcore:packageName="$ZDEMO"/>`+
+				`</adtcore:objectReferences>`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+	cl := newStubbedClient(t, &adtRecorder{}, route)
+	u, err := cl.gitDeleteURL(context.Background(), "FUGR", "ZDEMO_FG", "$ZDEMO")
+	if err != nil || u != "/sap/bc/adt/functions/groups/zdemo_fg" {
+		t.Fatalf("got %q, %v; want the group's own address", u, err)
+	}
+	if !gitHitIsObject("PROG", "PROG/I") || gitHitIsObject("FUGR", "FUGR/FF") || !gitHitIsObject("ZZZZ", "ZZZZ/XY") {
+		t.Error("gitHitIsObject")
+	}
+}
