@@ -12,10 +12,12 @@ name: OSD integration (advisory)
 #
 # Target, chosen by binary name only (.github/ci/osd-up.sh):
 #   osd   the Bun build with the ADT facade. Pinned in .github/ci/osd.version.
-#   osgo  the Go build. Pinned in .github/ci/osgo.version, empty until the
-#         first release that ships osgo-* assets; it has no ADT until OSG 0.6,
-#         so it runs as a smoke check and turns into the full suite on its own
-#         the day HEAD /sap/bc/adt/core/discovery answers 200.
+#   osgo  the Go build, started with -home/-port, ready on GET /health.
+#         Pinned in .github/ci/osgo.version, empty until dell names the first
+#         vscode-v0.5.N tag with osgo-* assets. OData only for now (the ADT
+#         facade moves to ABAP compiled to Go, ADR 0007), so it runs as a smoke
+#         check and turns into the full suite on its own the day
+#         HEAD /sap/bc/adt/core/discovery answers 200.
 on:
   push:
     branches: [main]
@@ -105,7 +107,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           OSD_BINARY: ${{ matrix.target }}
-          STG_PORT: '3030'
+          STG_PORT: ${{ matrix.target == 'osgo' && '3095' || '3030' }}
           TAG: ${{ steps.latest.outputs.tag || steps.plan.outputs.tag }}
         run: |
           status=0

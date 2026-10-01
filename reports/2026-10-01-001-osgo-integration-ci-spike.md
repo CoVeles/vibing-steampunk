@@ -23,9 +23,10 @@ MIT; local checkouts at `~/dev/osg-research` and `~/dev/open-steamgate`):
 | | OSD | OSGo |
 |---|---|---|
 | What | The whole system as one Bun binary: ICF, Gateway, apps, SQLite, **ADT façade** (`tools/adt-facade.mjs`) | The same system compiled to Go by `gogen` (`tools/gogen/go/cmd/osgo`) |
-| Release assets | Every `vscode-v0.4.*` tag: `osd-linux-x64`, `osd-linux-arm64`, `osd-darwin-arm64`, `osd-windows-x64.exe`, each with `.sha256` (checked for 1413, 1414, 1444) | None today. Planned for OSG 0.5: `osgo-*` on the same `vscode-v*` tags, static (CGO off, pure-Go SQLite), with `.sha256` |
-| ADT | Yes, under `/sap/bc/adt/` | No. HEAD `/sap/bc/adt/core/discovery` is not 200. The façade port is OSG 0.6 |
-| Start | `osd up` | `osgo -port … -db … -home …`; the 0.5 binary takes the same env as OSD |
+| Release assets | Every `vscode-v0.4.*` tag: `osd-linux-x64`, `osd-linux-arm64`, `osd-darwin-arm64`, `osd-windows-x64.exe`, each with `.sha256` (checked for 1413, 1414, 1444) | None today. From the first `vscode-v0.5.N` tag (dell will name it): `osgo-linux-x64`, `osgo-linux-arm64`, `osgo-darwin-arm64`, `osgo-windows-x64.exe`, static (CGO off, pure-Go SQLite), each with `.sha256` |
+| ADT | Yes, under `/sap/bc/adt/` | No, OData only. HEAD `/sap/bc/adt/core/discovery` is not 200. The ADT façade is moving to ABAP compiled to Go and JS (ADR 0007) |
+| Start | `osd up` | `./osgo-linux-x64 -home "$RUNNER_TEMP/osgo-home" -port 3095`; a fresh `-home` is a full reset |
+| Ready | `GET /sap/bc/adt/core/http/build`, `serving == live` | `GET /health` until `status` is `ready` (about 0.55 s). Not the build stamp |
 
 **Decision (stoker, osg-research and dell, relayed):** the full suite runs on
 the **OSD release binary, pinned to exactly `vscode-v0.4.1444`**, never
@@ -201,9 +202,11 @@ Files:
 Rows:
 
 - **The pinned OSD** runs on push, PR and nightly.
-- **OSGo** skips while `osgo.version` is empty. Once a tag is pinned it starts
-  the binary, and if HEAD `/sap/bc/adt/core/discovery` is 200 it runs the full
-  suite; otherwise the start itself is the smoke check.
+- **OSGo** skips while `osgo.version` is empty. Once a `vscode-v0.5.N` tag is
+  pinned it starts the binary with `-home <fresh dir> -port 3095` and polls
+  `GET /health` until `status` is `ready`. If HEAD
+  `/sap/bc/adt/core/discovery` is 200 it runs the full suite; otherwise the
+  start itself is the smoke check.
 - **The latest `vscode-v0.4.*` OSD** runs nightly only.
 - `workflow_dispatch` takes `target` and `tag`.
 
@@ -229,6 +232,21 @@ When the variable is unset, which is the case on A4H, nothing changes, and the
 summary would count such skips separately. I left this out, because a 404
 classified as `missing-endpoint` already says the same thing without
 touching 20 tests.
+
+**Planned next step (osg-research's suggestion):** the 7 `missing-object`
+tests should skip by **capability**, never by host name. Each of them reads an
+SAP-standard object (SAPMSSY0, RS_ABAP_SOURCE_SCAN, BASIS, I_ABAPPACKAGE,
+`/DMO/`, `/UI5/`, ZCL_ABAPGIT_AJSON). Before using such a fixture, the test
+asks the target whether it is there:
+
+- discovery (`core/discovery`) for whether the collection exists at all;
+- a search or a 404 "does not exist" for whether the object exists.
+
+If either says no, the test skips with "fixture <name> absent on this target".
+A test never checks whether it is talking to OSD. The same test then runs
+unchanged on A4H, on OSD, and on any other target, and a skip names the
+missing fixture rather than the system. Until this lands, the classifier
+reports these tests as `missing-object` and does not skip them.
 
 ## 5. Scenario-suite plan
 
@@ -371,11 +389,16 @@ diff.
 8. **Test include.** POST `oo/classes/{n}/includes` (creating the
    test-classes include) is not served, which blocks vsp's class-with-tests
    flow. Is it planned?
-9. **OSGo 0.5.**
-   - Which tag will first carry `osgo-*`?
-   - Which readiness route will it use (`osd-up.sh` waits for any answer on
-     `/` until this is documented)?
-   - Is the start command `osgo` with no subcommand?
+9. ~~**OSGo 0.5.**~~ Answered by dell:
+   - **Tag:** the first `vscode-v0.5.N` tag ships `osgo-*`, each with a
+     `.sha256`. dell will name the exact tag; it then goes into
+     `.github/ci/osgo.version`.
+   - **Readiness:** `GET /health` until `status` is `ready`, about 0.55 s.
+   - **Start:** `./osgo-linux-x64 -home <dir> -port 3095`. A fresh `-home` is a
+     full reset.
+   - **Scope:** OData only; no ADT yet (ADR 0007).
+
+   `osd-up.sh` and the workflow's OSGo row are wired to this.
 10. **`ModificationSupport: NoModification`** on a writable object's lock
     response. Is this deliberate, and what does A4H return there?
 

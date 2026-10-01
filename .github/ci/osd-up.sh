@@ -5,10 +5,11 @@
 #
 #   .github/ci/osd-up.sh <workdir> [tag]      # tag defaults to .github/ci/$OSD_BINARY.version
 #
-# OSD_BINARY picks the target by binary name and nothing else: osd (default,
-# the Bun build, ADT facade included) or osgo (the Go build, from release 0.5;
-# no ADT until 0.6). Both take the same environment: STG_PORT, STG_DB_PATH,
-# XDG_DATA_HOME, STG_ADT_SID.
+# OSD_BINARY picks the target by binary name: osd (default, the Bun build,
+# ADT facade included) or osgo (the Go build, first shipped in a vscode-v0.5.N
+# tag; OData only, no ADT yet). osd takes its state from the environment
+# (STG_PORT, STG_DB_PATH, XDG_DATA_HOME); osgo from -home and -port, where a
+# fresh -home is a full reset.
 #
 # Prints KEY=VALUE lines for the caller on success (SAP_URL, OSD_PID, OSD_TAG,
 # OSD_WORKDIR, and OSD_ADT: the HTTP status of HEAD /sap/bc/adt/core/discovery,
@@ -59,9 +60,12 @@ export XDG_DATA_HOME="$work/xdg" HOME="$work/home" STG_DB_PATH="$work/db/osd.sql
 if [ "$binary" = osd ]; then
   (cd "$work/cwd" && "$bin" doctor) > "$work/doctor.log" 2>&1 || true
 fi
-# osd starts with `up`; osgo takes no subcommand (its port, database and home
-# come from the same environment).
-start=(up); [ "$binary" = osd ] || start=()
+# osd starts with `up`; osgo with its home and port as flags.
+if [ "$binary" = osd ]; then
+  start=(up)
+else
+  start=(-home "$work/osgo-home" -port "$port")
+fi
 (cd "$work/cwd" && exec "$bin" "${start[@]}") > "$work/osd.log" 2>&1 &
 pid=$!
 
@@ -69,15 +73,15 @@ url="http://localhost:$port"
 # OSD is ready when its build stamp answers and the generation the source
 # built is the one being served (system.serving == system.live). The stamp is
 # OSD's own endpoint, not ADT's: a real system answers 404 there.
-# OSGo's readiness route is not documented yet (it is not the build stamp);
-# until it is, any HTTP answer on / counts.
+# OSGo is ready when GET /health says status=ready (about 0.55 s); it has no
+# build stamp.
 ready() {
   if [ "$binary" = osd ]; then
     body=$(curl -fsS -m 5 "$url/sap/bc/adt/core/http/build" 2>/dev/null) &&
       jq -e '.system.serving != null and .system.serving == .system.live' <<<"$body" >/dev/null
   else
-    body=$(curl -sS -m 5 -o /dev/null -w '{"status":%{http_code}}' "$url/" 2>/dev/null) &&
-      [ "$(jq -r .status <<<"$body")" != 000 ]
+    body=$(curl -fsS -m 5 "$url/health" 2>/dev/null) &&
+      jq -e '.status == "ready"' <<<"$body" >/dev/null
   fi
 }
 deadline=$((SECONDS + timeout_s))
