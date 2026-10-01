@@ -674,7 +674,7 @@ func (a *gitResultAnswer) result() *GitImportResult {
 	t := strings.TrimSpace
 	r := &GitImportResult{Outcome: a.Outcome, Code: a.Code, Message: t(a.Message), System: a.System, Client: a.Client,
 		Package: t(a.Package), RepoKey: t(a.RepoKey), RepoName: t(a.RepoName), RepoCreated: a.RepoCreated, PackageCreated: a.PkgCreated,
-		Transport: t(a.Transport), InfoCount: a.InfoCount, Log: []GitLogLine{}, Tadir: []GitTadirRow{}}
+		Transport: t(a.Transport), InfoCount: a.InfoCount, Log: []GitLogLine{}, Tadir: []GitTadirRow{}, Decisions: []GitDecision{}}
 	for _, l := range a.Log {
 		r.Log = append(r.Log, GitLogLine{Type: t(l.Type), Text: t(l.Text), ObjType: t(l.ObjType), ObjName: t(l.ObjName)})
 	}
