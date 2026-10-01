@@ -127,9 +127,14 @@ func TestGenerateTableDDL_ClientField(t *testing.T) {
 			wantErr: "is MANDT your client field? pass client_dependent:true",
 		},
 		{
-			name:    "first key named CLIENT with type CHAR3 needs client_dependent",
+			name:    "first key named CLIENT with data element ZCLIENT needs client_dependent",
+			opts:    tableOpts(TableField{Name: "client", Type: "ZCLIENT", IsKey: true}, id),
+			wantErr: "is CLIENT your client field? pass client_dependent:true",
+		},
+		{
+			name:    "first key named CLIENT with built-in CHAR3 is refused by default",
 			opts:    tableOpts(TableField{Name: "client", Type: "CHAR3", IsKey: true}, id),
-			wantErr: "is CLIENT your client field?",
+			wantErr: "give it type MANDT",
 		},
 		{
 			name: "client_dependent true makes a named MANDT first key the client field as is",
@@ -140,10 +145,77 @@ func TestGenerateTableDDL_ClientField(t *testing.T) {
 			}(),
 			wantClient: nil, // no abap.clnt line added; /abc/mandt is used as is
 		},
+
+		// Under client_dependent:true, SAP would make the table
+		// client-independent while vsp reported client_dependent:true.
 		{
-			name: "client_dependent false keeps a named MANDT first key as a plain field",
+			name: "client_dependent true refuses a named MANDT of built-in type CHAR3",
+			opts: func() CreateTableOptions {
+				o := tableOpts(TableField{Name: "MANDT", Type: "CHAR3", IsKey: true}, id)
+				o.ClientDependent = boolPtr(true)
+				return o
+			}(),
+			wantErr: "SAP never treats as a client field",
+		},
+		{
+			name: "client_dependent true refuses a named MANDT of built-in type NUMC3",
+			opts: func() CreateTableOptions {
+				o := tableOpts(TableField{Name: "MANDT", Type: "NUMC3", IsKey: true}, id)
+				o.ClientDependent = boolPtr(true)
+				return o
+			}(),
+			wantErr: "SAP never treats as a client field",
+		},
+		{
+			name: "client_dependent true refuses a named MANDT of built-in type INT4",
+			opts: func() CreateTableOptions {
+				o := tableOpts(TableField{Name: "MANDT", Type: "INT4", IsKey: true}, id)
+				o.ClientDependent = boolPtr(true)
+				return o
+			}(),
+			wantErr: "SAP never treats as a client field",
+		},
+		{
+			name: "client_dependent true refuses a named MANDT of built-in type STRING",
+			opts: func() CreateTableOptions {
+				o := tableOpts(TableField{Name: "MANDT", Type: "STRING", IsKey: true}, id)
+				o.ClientDependent = boolPtr(true)
+				return o
+			}(),
+			wantErr: "SAP never treats as a client field",
+		},
+		{
+			name: "client_dependent true refuses a named MANDT of built-in type abap.char(3)",
+			opts: func() CreateTableOptions {
+				o := tableOpts(TableField{Name: "MANDT", Type: "abap.char(3)", IsKey: true}, id)
+				o.ClientDependent = boolPtr(true)
+				return o
+			}(),
+			wantErr: "SAP never treats as a client field",
+		},
+		{
+			// Under client_dependent:false, SAP may well make it client-dependent.
+			name: "client_dependent false refuses a named MANDT data element",
 			opts: func() CreateTableOptions {
 				o := tableOpts(TableField{Name: "MANDT", Type: "ZMANDT", IsKey: true}, id)
+				o.ClientDependent = boolPtr(false)
+				return o
+			}(),
+			wantErr: "looks like a client field; rename it or pass client_dependent:true",
+		},
+		{
+			name: "client_dependent false refuses a named CLIENT data element",
+			opts: func() CreateTableOptions {
+				o := tableOpts(TableField{Name: "CLIENT", Type: "SYMANDT", IsKey: true}, id)
+				o.ClientDependent = boolPtr(false)
+				return o
+			}(),
+			wantErr: "looks like a client field",
+		},
+		{
+			name: "client_dependent false keeps a named MANDT of built-in type as a plain field",
+			opts: func() CreateTableOptions {
+				o := tableOpts(TableField{Name: "MANDT", Type: "CHAR3", IsKey: true}, id)
 				o.ClientDependent = boolPtr(false)
 				return o
 			}(),

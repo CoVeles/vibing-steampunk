@@ -1697,9 +1697,17 @@ func isClientFieldName(name string) bool {
 //     field contradicts it and is refused.
 //   - A client-typed (MANDT, CLIENT, CLNT, abap.clnt) first key field is the
 //     client field.
-//   - A first key field named MANDT or CLIENT with another type (SYMANDT,
-//     ZMANDT, CHAR3) is refused unless client_dependent is given: true makes
-//     it the client field as is.
+//   - A first key field named MANDT or CLIENT whose type is some other data
+//     element (SYMANDT, ZMANDT) may or may not be a client field; vsp cannot
+//     tell. It is refused unless client_dependent is given: true makes it the
+//     client field as is, false is refused too (SAP would see a client field
+//     there if the data element is one, so the table may well not be
+//     client-independent).
+//   - A first key field named MANDT or CLIENT with a built-in type (CHAR3,
+//     NUMC3, INT4, STRING, abap.char(3)) is never a client field to SAP: the
+//     table is client-independent. client_dependent false accepts it as a
+//     plain field; left out or true, it is refused, since the name says
+//     client field and the table would not be client-dependent.
 //   - Otherwise (nil or true) CLIENT is added in front.
 //   - A later client-typed key field is refused: only the first key field can
 //     be the client field.
@@ -1716,17 +1724,29 @@ func tableClientPlan(opts CreateTableOptions) (add bool, own int, err error) {
 	firstTyped := first.IsKey && isClientFieldType(first)
 	firstNamed := first.IsKey && !isClientFieldType(first) && isClientFieldName(first.Name)
 
+	// A built-in type is never a client field to SAP; a data element might be.
+	firstBuiltin := firstNamed && strings.HasPrefix(mapFieldType(first), "abap.")
+	firstName := strings.ToUpper(strings.TrimSpace(first.Name))
+
 	if opts.ClientDependent != nil && !*opts.ClientDependent {
 		if firstTyped {
 			return false, own, fmt.Errorf("client_dependent is false, but the first key field %s has client type %s, which makes the table client-dependent; drop the field or leave client_dependent out",
-				strings.ToUpper(first.Name), first.Type)
+				firstName, first.Type)
+		}
+		if firstNamed && !firstBuiltin {
+			return false, own, fmt.Errorf("client_dependent is false, but %s looks like a client field; rename it or pass client_dependent:true (it is the first key field, and if its type %s is a client data element, SAP makes the table client-dependent)",
+				firstName, first.Type)
 		}
 		return false, own, nil
 	}
 
+	if firstBuiltin {
+		return false, own, fmt.Errorf("field 1 is a key field named %s with built-in type %s, which SAP never treats as a client field, so the table would not be client-dependent; is %s your client field? give it type MANDT if so, or rename it, or pass client_dependent:false for a client-independent table",
+			firstName, first.Type, firstName)
+	}
 	if firstNamed && opts.ClientDependent == nil {
 		return false, own, fmt.Errorf("field 1 is a key field named %s with type %s, which vsp does not know as a client type; is %s your client field? pass client_dependent:true if so (and the field will be used as is), or rename it",
-			strings.ToUpper(first.Name), first.Type, strings.ToUpper(first.Name))
+			firstName, first.Type, firstName)
 	}
 	if firstTyped || firstNamed {
 		own = 0
