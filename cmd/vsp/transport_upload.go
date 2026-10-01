@@ -106,8 +106,9 @@ and S_CTS_ADMI with EPS1 (files) and TADD (buffer) on the system.
 var transportBufferCmd = &cobra.Command{
 	Use:   "buffer [REQUEST]",
 	Short: "Show the connected system's import buffer, or one request in it (needs ZADT_VSP)",
-	Long: `Read the import buffer (import queue) of the connected system, through
-TMS_TP_SHOW_BUFFER. Read-only. Requires --enable-transports.
+	Long: `Read the import buffer (import queue) of the connected system: the buffer
+file DIR_TRANS/buffer/<SID>, read through SAP's file layer -- no tp, no job,
+nothing written. Allowed under --read-only. Requires --enable-transports.
 
   SAP_ENABLE_TRANSPORTS=true vsp -s qassys transport buffer
   SAP_ENABLE_TRANSPORTS=true vsp -s qassys transport buffer TR-EXAMPLE`,

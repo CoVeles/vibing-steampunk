@@ -1004,6 +1004,10 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     ENDIF.
     DATA(lv_offset) = zcl_vsp_utils=>extract_param_int( iv_params = lv_params iv_name = 'offset' ).
     DATA(lv_length) = zcl_vsp_utils=>extract_param_int( iv_params = lv_params iv_name = 'length' ).
+    IF lv_offset < 0.
+      rs_response = err( iv_id = is_message-id iv_code = 'INVALID_PARAM' iv_message = `offset must be a non-negative number` ).
+      RETURN.
+    ENDIF.
     IF lv_length <= 0 OR lv_length > c_max_chunk.
       lv_length = c_max_chunk.
     ENDIF.

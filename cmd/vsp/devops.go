@@ -3723,6 +3723,30 @@ func runInstallAbapGit(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// objectKindSummary counts the objects by kind, as "1 interface, 9 classes,
+// 1 program", so that the count cannot drift from the list.
+func objectKindSummary(objects []embedded.ObjectInfo) string {
+	names := []struct{ typ, one, many string }{
+		{"INTF", "interface", "interfaces"}, {"CLAS", "class", "classes"}, {"PROG", "program", "programs"},
+	}
+	var parts []string
+	for _, n := range names {
+		c := 0
+		for _, o := range objects {
+			if o.Type == n.typ {
+				c++
+			}
+		}
+		switch {
+		case c == 1:
+			parts = append(parts, "1 "+n.one)
+		case c > 1:
+			parts = append(parts, fmt.Sprintf("%d %s", c, n.many))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
 func runInstallList(_ *cobra.Command, _ []string) error {
 	fmt.Println("Available Installable Components")
 	fmt.Println("================================")
@@ -3733,7 +3757,7 @@ func runInstallList(_ *cobra.Command, _ []string) error {
 	fmt.Printf("1. zadt-vsp\n")
 	fmt.Printf("   Description: ZADT_VSP WebSocket handler for advanced features\n")
 	fmt.Printf("   Default package: $ZADT_VSP\n")
-	fmt.Printf("   Objects: %d (1 interface, %d classes)\n", len(objects), len(objects)-1)
+	fmt.Printf("   Objects: %d (%s)\n", len(objects), objectKindSummary(objects))
 	fmt.Printf("   Status: Embedded (always available)\n")
 	fmt.Printf("   Install: vsp install zadt-vsp\n")
 	fmt.Println()
