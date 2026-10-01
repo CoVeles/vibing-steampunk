@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/oisee/vibing-steampunk/pkg/adt"
 	"github.com/spf13/cobra"
@@ -27,7 +29,8 @@ statement with a host variable), so a temporary ZVSP_CHK_* program is created
 in $TMP and deleted afterwards, whatever the check's outcome. For that reason
 it is refused under --read-only.
 
-Exit status: 0 when SAP found no error (warnings allowed), 1 otherwise.
+Exit status: 0 when SAP found no error (warnings allowed) and the temporary
+program was deleted, 1 otherwise. Ctrl-C still deletes the program.
 
 Examples:
   vsp check-abap "DATA ls TYPE t000. DATA(s) = |{ ls }|."
@@ -80,7 +83,12 @@ func runCheckABAP(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	result, err := client.CheckABAP(context.Background(), code)
+	// Ctrl-C cancels the check rather than killing the process, so CheckABAP
+	// gets to run its deferred delete of the temporary program.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	result, err := client.CheckABAP(ctx, code)
 	if err != nil {
 		return fmt.Errorf("check-abap: %w", err)
 	}
@@ -93,6 +101,11 @@ func runCheckABAP(cmd *cobra.Command, args []string) error {
 	}
 	for _, w := range result.Warnings {
 		fmt.Fprintf(os.Stderr, "! %s\n", w)
+	}
+	if !result.CleanedUp {
+		// A leftover program is a failure whatever the check found: a script
+		// reading only the exit status must not take it as a clean run.
+		return fmt.Errorf("the temporary program %s may still be in $TMP; delete it", result.ProgramName)
 	}
 	if !result.OK {
 		return fmt.Errorf("the snippet does not compile")

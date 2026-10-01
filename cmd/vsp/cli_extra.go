@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"encoding/json"
@@ -647,7 +649,10 @@ func runExecute(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	ctx := context.Background()
+	// Ctrl-C cancels the run rather than killing the process, so ExecuteABAP
+	// gets to run its deferred delete of the temporary program.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// What ST22 already held before any of this ran. It has to be read first —
 	// afterwards there is no way to tell an old dump from a new one — and it is

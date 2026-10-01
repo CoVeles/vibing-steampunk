@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/oisee/vibing-steampunk/pkg/adt"
@@ -95,6 +96,12 @@ func (s *Server) handleCheckABAP(ctx context.Context, request mcp.CallToolReques
 	}
 
 	output, _ := json.MarshalIndent(result, "", "  ")
+	if !result.CleanedUp {
+		// The check itself is in the payload, but a program left in $TMP is
+		// a failure of the call: it is named up front so it gets deleted.
+		return newToolResultError(fmt.Sprintf("check_abap left the temporary program %s in $TMP: %s\n\n%s",
+			result.ProgramName, strings.Join(result.Warnings, "; "), output)), nil
+	}
 	return mcp.NewToolResultText(string(output)), nil
 }
 
