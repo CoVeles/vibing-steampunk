@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // --- line mapping ---
@@ -108,11 +109,13 @@ func TestCheckRunProcessedRefusesAnUncheckedReport(t *testing.T) {
 const checkRunTypeError = `<?xml version="1.0" encoding="utf-8"?><chkrun:checkRunReports xmlns:chkrun="http://www.sap.com/adt/checkrun"><chkrun:checkReport chkrun:reporter="abapCheckRun" chkrun:status="processed" chkrun:statusText="checked"><chkrun:checkMessageList><chkrun:checkMessage chkrun:uri="/sap/bc/adt/programs/includes/{prog}/source/main?context=x#start={line},13" chkrun:type="E" chkrun:shortText="&quot;LS&quot; cannot be converted to a character-like value."/></chkrun:checkMessageList></chkrun:checkReport></chkrun:checkRunReports>`
 
 type checkABAPServer struct {
-	checkStatus  int
-	createStatus int
-	lockStatus   int
-	deleteStatus int
-	cancelOnRun  context.CancelFunc
+	cancelOnCreate context.CancelFunc
+	checkStatus    int
+	createStatus   int
+	probeStatus    int
+	lockStatus     int
+	deleteStatus   int
+	cancelOnRun    context.CancelFunc
 	// checkBody, when set, is the checkrun answer: given the program's name in
 	// lower case and the wrapper line holding the snippet's first line.
 	checkBody func(prog string, firstLine int) string
@@ -167,12 +170,22 @@ func (s *checkABAPServer) start(t *testing.T, opts ...Option) *Client {
 			s.record("unlock")
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/programs/programs"):
 			s.record("create")
+			if s.cancelOnCreate != nil {
+				// SAP commits the program, and the caller gives up before
+				// the answer arrives.
+				s.cancelOnCreate()
+				time.Sleep(50 * time.Millisecond)
+			}
 			if s.createStatus != 0 {
 				w.WriteHeader(s.createStatus)
 			}
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/programs/programs/"):
-			// The existence probe after a failed create: the program is there.
+			// The existence probe after a failed create: the program is
+			// there, unless probeStatus says otherwise.
 			s.record("probe")
+			if s.probeStatus != 0 {
+				w.WriteHeader(s.probeStatus)
+			}
 		case r.Method == http.MethodDelete:
 			s.record("delete")
 			if s.deleteStatus != 0 {
@@ -493,5 +506,37 @@ func TestCheckABAPFindingsMatchTheProgramInThePathOnly(t *testing.T) {
 	}
 	if f := findings[3]; f.Line != 0 || f.WrapperLine != 0 {
 		t.Fatalf("finding = %+v: a name in an unescaped query must not place the message either", f)
+	}
+}
+
+func TestCheckABAPReportsAProgramCreatedAsTheCallerCancelled(t *testing.T) {
+	// Ctrl-C during the create: the POST may have landed. The probe has to
+	// get out despite the cancellation, so the program is reported by name
+	// rather than left behind in silence — and it is still not deleted.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := &checkABAPServer{cancelOnCreate: cancel}
+	_, err := srv.start(t).CheckABAP(ctx, "DATA lv TYPE i.")
+	if got, want := srv.sequence(), "create,probe"; got != want {
+		t.Fatalf("requests = %s, want %s", got, want)
+	}
+	var pce *PartialCreateError
+	if !errors.As(err, &pce) || !pce.LeftInPlace {
+		t.Fatalf("error = %v, want the program reported as left in place", err)
+	}
+}
+
+func TestCheckABAPWarnsThatAnInterruptedCreateMayStillLand(t *testing.T) {
+	// The probe answers 404, but the create was cut off by the caller, and
+	// SAP can still commit it afterwards: the program is named regardless.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := &checkABAPServer{cancelOnCreate: cancel, probeStatus: http.StatusNotFound}
+	_, err := srv.start(t).CheckABAP(ctx, "DATA lv TYPE i.")
+	if err == nil || !strings.Contains(err.Error(), "SAP may still complete it") || !regexp.MustCompile(`look for ZVSP_CHK_[0-9]{8} in \$TMP`).MatchString(err.Error()) {
+		t.Fatalf("error = %v, want the program named as possibly created", err)
+	}
+	if got, want := srv.sequence(), "create,probe"; got != want {
+		t.Fatalf("requests = %s, want %s", got, want)
 	}
 }

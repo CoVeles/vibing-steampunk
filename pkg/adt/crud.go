@@ -552,14 +552,33 @@ func (c *Client) reconcileFailedCreate(ctx context.Context, opts CreateObjectOpt
 		return createErr
 	}
 
-	exists, probeErr := c.objectExistsByURL(ctx, objectURL)
+	probeCtx := ctx
+	if opts.leavePartialObject {
+		// A throwaway object's create is most often cut short by the
+		// caller's own cancellation (Ctrl-C), after SAP may already have
+		// committed it. The probe is a read, so it may outlive that
+		// cancellation; with the caller's context it never leaves the
+		// process, and a program left behind would go unreported.
+		var cancel context.CancelFunc
+		probeCtx, cancel = failureCleanupContext(ctx)
+		defer cancel()
+	}
+	exists, probeErr := c.objectExistsByURL(probeCtx, objectURL)
 	if probeErr != nil {
+		if opts.leavePartialObject {
+			return fmt.Errorf("%w (whether %s was created anyway could not be checked: %v)", createErr, opts.Name, probeErr)
+		}
 		// Probe inconclusive (5xx, network, auth). Returning the
 		// original error keeps the existing failure semantics so we do
 		// not regress callers who already handle plain create errors.
 		return createErr
 	}
 	if !exists {
+		if opts.leavePartialObject && ctx.Err() != nil {
+			// Seen live: SAP goes on with a create whose client hung up,
+			// and can commit it after this probe came back 404.
+			return fmt.Errorf("%w (the create was interrupted and SAP may still complete it: look for %s in %s)", createErr, opts.Name, opts.PackageName)
+		}
 		// SAP did not persist anything — original error is final.
 		return createErr
 	}
