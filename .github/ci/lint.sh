@@ -43,6 +43,11 @@ wrote_canary=
 cleanup() { rm -rf "$out"; if [ -n "$wrote_canary" ]; then rm -rf "${canary_dir:?}"; fi; }
 trap cleanup EXIT
 
+# setup-go registers a problem matcher that turns every `file:line:col: msg`
+# log line into an annotation. In full mode that would pin ten random old
+# findings on the PR; the gate writes its own annotations for new issues.
+if in_ci; then echo "::remove-matcher owner=go::"; fi
+
 command -v golangci-lint >/dev/null || die "golangci-lint is not on PATH"
 command -v jq >/dev/null || die "jq is not on PATH"
 have=$(golangci-lint version --short 2>/dev/null || golangci-lint version 2>&1)
