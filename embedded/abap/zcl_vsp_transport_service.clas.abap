@@ -132,6 +132,11 @@ CLASS zcl_vsp_transport_service DEFINITION
       IMPORTING is_message         TYPE zif_vsp_service=>ty_message
       RETURNING VALUE(rs_response) TYPE zif_vsp_service=>ty_response.
 
+    "! Discards the upload in progress -- only the one the caller names.
+    METHODS upload_abort
+      IMPORTING is_message         TYPE zif_vsp_service=>ty_message
+      RETURNING VALUE(rs_response) TYPE zif_vsp_service=>ty_response.
+
     METHODS handle_add_to_buffer
       IMPORTING is_message         TYPE zif_vsp_service=>ty_message
       RETURNING VALUE(rs_response) TYPE zif_vsp_service=>ty_response.
@@ -261,9 +266,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       WHEN 'commit'.
         rs_response = upload_commit( is_message ).
       WHEN 'abort'.
-        CLEAR ms_assembly.
-        rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id
-          iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_bool( iv_key = 'aborted' iv_value = abap_true ) ) ).
+        rs_response = upload_abort( is_message ).
       WHEN OTHERS.
         rs_response = err( iv_id = is_message-id iv_code = 'INVALID_PARAM'
                            iv_message = |step must be begin, chunk, commit or abort, not '{ lv_step }'| ).
@@ -413,6 +416,19 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ( zcl_vsp_utils=>json_int( iv_key = 'cofile_received' iv_value = xstrlen( ms_assembly-cofile ) ) )
       ( zcl_vsp_utils=>json_int( iv_key = 'data_received' iv_value = xstrlen( ms_assembly-data ) ) )
     ) ) ) ).
+  ENDMETHOD.
+
+
+  METHOD upload_abort.
+    DATA(lv_id) = zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'assembly_id' ).
+    IF ms_assembly-id IS INITIAL OR lv_id <> ms_assembly-id.
+      rs_response = err( iv_id = is_message-id iv_code = 'NO_UPLOAD'
+                         iv_message = `No upload with this assembly_id is in progress in this session; nothing was discarded` ).
+      RETURN.
+    ENDIF.
+    CLEAR ms_assembly.
+    rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id
+      iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_bool( iv_key = 'aborted' iv_value = abap_true ) ) ).
   ENDMETHOD.
 
 

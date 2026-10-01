@@ -387,3 +387,28 @@ func TestTransportServiceGuardBites(t *testing.T) {
 		}
 	}
 }
+
+// step=abort discards only the upload it names: an abort with another
+// assembly id (a stale client, a second one) must not clear the assembly.
+func TestTransportServiceAbortChecksAssemblyID(t *testing.T) {
+	stmts := abapStatements(transportServiceSource(t))
+	for _, st := range methodStatements(stmts, "HANDLE_UPLOAD_FILES") {
+		if strings.Contains(strings.ToUpper(st), "CLEAR MS_ASSEMBLY") {
+			t.Errorf("handle_upload_files clears the assembly itself: %s", st)
+		}
+	}
+	body := methodStatements(stmts, "UPLOAD_ABORT")
+	guard, clear := -1, -1
+	for i, st := range body {
+		up := strings.ToUpper(st)
+		if guard < 0 && strings.HasPrefix(up, "IF MS_ASSEMBLY-ID IS INITIAL OR LV_ID <> MS_ASSEMBLY-ID") {
+			guard = i
+		}
+		if clear < 0 && up == "CLEAR MS_ASSEMBLY" {
+			clear = i
+		}
+	}
+	if guard < 0 || clear < 0 || clear < guard {
+		t.Errorf("upload_abort must check the assembly id before clearing: guard at %d, clear at %d", guard, clear)
+	}
+}
