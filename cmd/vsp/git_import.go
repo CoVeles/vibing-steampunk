@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -34,7 +35,10 @@ for it (--wait) and prints the outcome, abapGit's errors and warnings, the
 TADIR rows created or changed and the repository key.
 
 Nothing that exists is overwritten without --overwrite (and a package that
-already has a repository is refused without it). Unmet requirements or
+already has a repository is refused without it). A package that exists
+without a repository is imported into without --overwrite; its own package
+entry is left as it is. --overwrite also needs deletes allowed, since
+abapGit deletes and recreates an object whose type changed. Unmet requirements or
 dependencies, an object of another package, a package move, potential data
 loss and an unsupported object type refuse the import. A local object the
 zip does not have is never deleted.
@@ -50,6 +54,7 @@ as for any write); a local ($) package takes none.
 	RunE: func(cmd *cobra.Command, args []string) error {
 		pkg, _ := cmd.Flags().GetString("package")
 		transport, _ := cmd.Flags().GetString("transport")
+		overwrite, _ := cmd.Flags().GetBool("overwrite")
 		// Every gate before the zip is read or a connection opened. A
 		// .vsp.json system's client does not see SAP_READ_ONLY, so the
 		// CLI's own read-only test comes first.
@@ -64,7 +69,7 @@ as for any write); a local ($) package takes none.
 		if err != nil {
 			return err
 		}
-		if err = client.CheckGitImportPolicy(pkg, transport); err != nil {
+		if err = client.CheckGitImportPolicy(pkg, transport, overwrite); err != nil {
 			return err
 		}
 		data, err := adt.ReadGitZip(args[0])
@@ -84,11 +89,18 @@ as for any write); a local ($) package takes none.
 		}
 		defer closeWS()
 
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		repoName, _ := cmd.Flags().GetString("repo-name")
-		overwrite, _ := cmd.Flags().GetBool("overwrite")
 		started, err := client.StartGitImport(ctx, ws, data, adt.GitImportOptions{Package: pkg, RepoName: repoName, Overwrite: overwrite, Transport: transport})
+		var unconfirmed *adt.GitImportUnconfirmedError
+		if errors.As(err, &unconfirmed) {
+			// The job may be running: say what is known, and fail.
+			if asJSON, _ := cmd.Flags().GetBool("json"); asJSON {
+				_ = printJSON(gitImportOutput{Started: started})
+			}
+			return err
+		}
 		if err != nil {
 			return err
 		}
@@ -205,7 +217,9 @@ var gitImportStatusCmd = &cobra.Command{
 			return err
 		}
 		defer closeWS()
-		st, err := client.GitImportStatus(context.Background(), ws, args[0])
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		st, err := client.GitImportStatus(ctx, ws, args[0])
 		if err != nil {
 			return err
 		}
@@ -220,20 +234,26 @@ var gitImportStatusCmd = &cobra.Command{
 
 var gitDeleteObjectsCmd = &cobra.Command{
 	Use:   `delete-objects --package <PACKAGE> "TYPE NAME" ...`,
-	Short: "Delete exactly the given objects of a package, its abapGit repository, and the package if empty (needs ZADT_VSP)",
+	Short: "Delete exactly the given objects of a package, then the package if empty (needs ZADT_VSP)",
 	Long: `Delete exactly the named TADIR items of a package -- each only if the
 package's TADIR has it, each through the same gated delete as any other --
-then the abapGit repository registered for that package (its row; the
-objects are not touched by that), then the package itself if nothing and no
-subpackage is left in it. Nothing outside the package is deleted, and a
-package is never deleted as an item. If an object cannot be deleted, the
-repository and the package stay.
+then the package itself if nothing and no subpackage is left in it and no
+abapGit repository is registered for it. Nothing outside the package is
+deleted, and a package is never deleted as an item. If an object cannot be
+deleted, the repository and the package stay.
+
+The abapGit repository registered for the package (its row: URL, branch,
+settings; not its objects) is kept unless --delete-repo is given, and even
+then it is unregistered only when it is an offline repository and the
+package is empty after the deletes. An online repository is never
+unregistered: --delete-repo with one is refused before anything is deleted.
 
 Refused under read_only/SAP_READ_ONLY; the package must pass
 allowed_packages; a transportable package needs --allow-transportable-edits
 and --transport.
 
-  vsp -s devsys git delete-objects --package '$ZDEMO' "PROG ZDEMO_REPORT" "CLAS ZCL_DEMO"`,
+  vsp -s devsys git delete-objects --package '$ZDEMO' "PROG ZDEMO_REPORT" "CLAS ZCL_DEMO"
+  vsp -s devsys git delete-objects --package '$ZDEMO' --delete-repo "PROG ZDEMO_REPORT"`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		pkg, _ := cmd.Flags().GetString("package")
@@ -261,7 +281,10 @@ and --transport.
 			return err
 		}
 		defer closeWS()
-		res, derr := client.DeleteGitObjects(context.Background(), ws, pkg, items, transport)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		deleteRepo, _ := cmd.Flags().GetBool("delete-repo")
+		res, derr := client.DeleteGitObjects(ctx, ws, pkg, items, transport, deleteRepo)
 		if res != nil {
 			if asJSON, _ := cmd.Flags().GetBool("json"); asJSON {
 				if err := printJSON(res); err != nil {
@@ -314,6 +337,7 @@ func init() {
 	gitImportStatusCmd.Flags().Bool("json", false, "Emit JSON")
 	gitDeleteObjectsCmd.Flags().String("package", "", "The package (required)")
 	gitDeleteObjectsCmd.Flags().String("transport", "", "Transport request, for a transportable package")
+	gitDeleteObjectsCmd.Flags().Bool("delete-repo", false, "Also unregister the package's abapGit repository: only an offline one, only once the package is empty")
 	gitDeleteObjectsCmd.Flags().Bool("json", false, "Emit JSON")
 	gitCmd.AddCommand(gitImportZipCmd, gitImportStatusCmd, gitDeleteObjectsCmd)
 	rootCmd.AddCommand(gitCmd)

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -128,6 +129,29 @@ func TestAnalyzeGitZipRefuses(t *testing.T) {
 	if _, err := AnalyzeGitZip(demoZip(t, "PREFIX"), "$Z DEMO"); err == nil {
 		t.Error("a package name with a blank accepted")
 	}
+	// Two .abapgit.xml at the root: which one abapGit reads is not defined.
+	var two bytes.Buffer
+	w := zip.NewWriter(&two)
+	for _, n := range []string{".abapgit.xml", "./.abapgit.xml"} {
+		f, _ := w.Create(n)
+		_, _ = f.Write([]byte(dotAbapgitXML("/src/", "PREFIX")))
+	}
+	_ = w.Close()
+	if _, err := AnalyzeGitZip(two.Bytes(), "$ZDEMO"); err == nil || !strings.Contains(err.Error(), "more than one .abapgit.xml") {
+		t.Errorf("two .abapgit.xml: %v", err)
+	}
+	// Declared to unpack past 200 MB: refused from the directory alone.
+	var bomb bytes.Buffer
+	w = zip.NewWriter(&bomb)
+	f, _ := w.Create(".abapgit.xml")
+	_, _ = f.Write([]byte(dotAbapgitXML("/src/", "PREFIX")))
+	raw, _ := w.CreateRaw(&zip.FileHeader{Name: "src/zdemo.prog.abap", Method: zip.Deflate, CompressedSize64: 2, UncompressedSize64: 300 << 20})
+	_, _ = raw.Write([]byte{3, 0})
+	_ = w.Close()
+	if _, err := AnalyzeGitZip(bomb.Bytes(), "$ZDEMO"); err == nil || !strings.Contains(err.Error(), "200 MB") {
+		t.Errorf("300 MB unpacked: %v", err)
+	}
+
 	big := make([]byte, GitZipMaxBytes+1)
 	if _, err := AnalyzeGitZip(big, "$ZDEMO"); err == nil || !strings.Contains(err.Error(), "limit") {
 		t.Errorf("over the limit: %v", err)
@@ -141,22 +165,26 @@ func TestCheckGitImportPolicy(t *testing.T) {
 		name      string
 		opts      []Option
 		pkg, tr   string
+		overwrite bool
 		wantError string
 	}{
-		{"read-only", []Option{WithReadOnly()}, "$ZDEMO", "", "read-only"},
-		{"create disallowed", []Option{WithSafety(SafetyConfig{DisallowedOps: "C"})}, "$ZDEMO", "", "blocked"},
-		{"activate disallowed", []Option{WithSafety(SafetyConfig{DisallowedOps: "A"})}, "$ZDEMO", "", "blocked"},
-		{"package outside whitelist", []Option{WithAllowedPackages("$ZOTHER")}, "$ZDEMO", "", "blocked by safety"},
-		{"transportable without opt-in", nil, "ZDEMO", "TRXK900001", "transportable"},
-		{"transportable, transport outside whitelist", []Option{WithAllowTransportableEdits(), WithAllowedTransports("ABCK*")}, "ZDEMO", "TRXK900001", "allowed transports"},
-		{"local with a transport", nil, "$ZDEMO", "TRXK900001", "takes no transport"},
-		{"malformed transport", []Option{WithAllowTransportableEdits()}, "ZDEMO", "TR-1", "not <SID>K"},
-		{"local ok", []Option{WithAllowedPackages("$Z*")}, "$ZDEMO", "", ""},
-		{"transportable ok", []Option{WithAllowTransportableEdits()}, "ZDEMO", "TRXK900001", ""},
+		{"read-only", []Option{WithReadOnly()}, "$ZDEMO", "", false, "read-only"},
+		{"create disallowed", []Option{WithSafety(SafetyConfig{DisallowedOps: "C"})}, "$ZDEMO", "", false, "blocked"},
+		{"activate disallowed", []Option{WithSafety(SafetyConfig{DisallowedOps: "A"})}, "$ZDEMO", "", false, "blocked"},
+		// abapGit's delete_add deletes an object and creates it again.
+		{"overwrite, delete disallowed", []Option{WithSafety(SafetyConfig{DisallowedOps: "D"})}, "$ZDEMO", "", true, "blocked"},
+		{"no overwrite, delete disallowed", []Option{WithSafety(SafetyConfig{DisallowedOps: "D"})}, "$ZDEMO", "", false, ""},
+		{"package outside whitelist", []Option{WithAllowedPackages("$ZOTHER")}, "$ZDEMO", "", false, "blocked by safety"},
+		{"transportable without opt-in", nil, "ZDEMO", "TRXK900001", false, "transportable"},
+		{"transportable, transport outside whitelist", []Option{WithAllowTransportableEdits(), WithAllowedTransports("ABCK*")}, "ZDEMO", "TRXK900001", false, "allowed transports"},
+		{"local with a transport", nil, "$ZDEMO", "TRXK900001", false, "takes no transport"},
+		{"malformed transport", []Option{WithAllowTransportableEdits()}, "ZDEMO", "TR-1", false, "not <SID>K"},
+		{"local ok", []Option{WithAllowedPackages("$Z*")}, "$ZDEMO", "", true, ""},
+		{"transportable ok", []Option{WithAllowTransportableEdits()}, "ZDEMO", "TRXK900001", false, ""},
 	}
 	for _, c := range cases {
 		cl := NewClient("http://sap.invalid", "TESTUSER", "pw", c.opts...)
-		err := cl.CheckGitImportPolicy(c.pkg, c.tr)
+		err := cl.CheckGitImportPolicy(c.pkg, c.tr, c.overwrite)
 		switch {
 		case c.wantError == "" && err != nil:
 			t.Errorf("%s: %v", c.name, err)
@@ -187,6 +215,38 @@ func TestCheckGitImportPlanChecksEveryPackage(t *testing.T) {
 	}
 }
 
+// abapGit refuses a repository whose packages mix local and transportable
+// ones; so does vsp, before anything is sent, either way round.
+func TestCheckGitImportPlanRefusesALocalTransportableMix(t *testing.T) {
+	cl := NewClient("http://sap.invalid", "TESTUSER", "pw", WithAllowTransportableEdits())
+	for _, plan := range []*GitZipPlan{
+		{Package: "ZDEMO", FolderLogic: GitFolderLogicFull, Packages: []string{"ZDEMO", "$ZDEMO_SUB"}},
+		{Package: "$ZDEMO", FolderLogic: GitFolderLogicFull, Packages: []string{"$ZDEMO", "ZDEMO_SUB"}},
+	} {
+		if err := cl.CheckGitImportPlan(plan); err == nil || !strings.Contains(err.Error(), "mix of local and transportable") {
+			t.Errorf("%v: %v", plan.Packages, err)
+		}
+	}
+	// From a zip: FULL folder logic names the package after the folder, so
+	// a folder "$sub" under a transportable target is a local package.
+	data := makeZip(t, dotAbapgitXML("/src/", "FULL"), map[string]string{"src/$sub/zdemo.prog.abap": "REPORT zdemo."})
+	plan, err := AnalyzeGitZip(data, "ZDEMO")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.CheckGitImportPlan(plan); err == nil || !strings.Contains(err.Error(), "$SUB") {
+		t.Errorf("%v: %v", plan.Packages, err)
+	}
+	for _, ok := range []*GitZipPlan{
+		{Package: "ZDEMO", Packages: []string{"ZDEMO", "ZDEMO_SUB"}},
+		{Package: "$ZDEMO", Packages: []string{"$ZDEMO", "$ZDEMO_SUB"}},
+	} {
+		if err := cl.CheckGitImportPlan(ok); err != nil {
+			t.Errorf("%v refused: %v", ok.Packages, err)
+		}
+	}
+}
+
 // --- the git domain, faked ----------------------------------------------------
 
 type fakeGitWS struct {
@@ -204,6 +264,10 @@ type fakeGitWS struct {
 	status []map[string]any
 	// beginPackage overrides the package begin reports.
 	beginPackage string
+	// commitErr fails the commit without an answer; commitRefusal answers
+	// it with a refusal.
+	commitErr     error
+	commitRefusal *WSError
 }
 
 func (f *fakeGitWS) SendDomainRequest(_ context.Context, domain, action string, params map[string]any, _ time.Duration) (*WSResponse, error) {
@@ -237,6 +301,12 @@ func (f *fakeGitWS) SendDomainRequest(_ context.Context, domain, action string, 
 			f.got = append(f.got, c...)
 			return ok(map[string]any{"received": len(f.got)})
 		case "commit":
+			if f.commitErr != nil {
+				return nil, f.commitErr
+			}
+			if f.commitRefusal != nil {
+				return &WSResponse{Success: false, Error: f.commitRefusal}, nil
+			}
 			return ok(map[string]any{"status": "pending", "job": "ZVSP_GIT_IMPORT", "job_count": "12345678", "package": "$ZDEMO"})
 		case "abort":
 			return ok(map[string]any{"aborted": true})
@@ -382,6 +452,36 @@ func TestStartGitImportAbortsOnMismatch(t *testing.T) {
 	}
 }
 
+// A commit without an answer may have started the job: StartGitImport says
+// so and returns what it knows. A refusal is an answer: nothing started.
+func TestStartGitImportCommitWithoutAnswer(t *testing.T) {
+	cl := NewClient("http://sap.invalid", "TESTUSER", "pw")
+	ws := &fakeGitWS{commitErr: context.DeadlineExceeded}
+	started, err := cl.StartGitImport(context.Background(), ws, demoZip(t, "PREFIX"), GitImportOptions{Package: "$ZDEMO"})
+	var unconfirmed *GitImportUnconfirmedError
+	if !errors.As(err, &unconfirmed) || started == nil || unconfirmed.Started != started {
+		t.Fatalf("got %+v, %v", started, err)
+	}
+	for _, want := range []string{"may be running", "SM37", "ZVSP_GIT_IMPORT", "TESTUSER", "git_import_status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not say %q: %v", want, err)
+		}
+	}
+	if started.System != "XYZ" || started.Package != "$ZDEMO" || started.Job != "ZVSP_GIT_IMPORT" || started.JobCount != "" || started.Plan == nil {
+		t.Errorf("what is known: %+v", started)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the cause is lost: %v", err)
+	}
+
+	ws = &fakeGitWS{commitRefusal: &WSError{Code: "CHECKSUM_MISMATCH", Message: "Nothing was imported."}}
+	started, err = cl.StartGitImport(context.Background(), ws, demoZip(t, "PREFIX"), GitImportOptions{Package: "$ZDEMO"})
+	var se *GitServiceError
+	if started != nil || !errors.As(err, &se) || errors.As(err, &unconfirmed) {
+		t.Errorf("a refused commit: %+v, %v", started, err)
+	}
+}
+
 func TestGitImportStatusParsesTheResult(t *testing.T) {
 	ws := &fakeGitWS{status: []map[string]any{
 		{"job": "ZVSP_GIT_IMPORT", "job_count": "12345678", "job_found": true, "job_status": "R", "outcome": "pending"},
@@ -497,6 +597,12 @@ func pkgContents(pkg string, objs [][2]string, subs []string, repo bool) map[str
 	return m
 }
 
+// online makes the repository of package contents an online one.
+func online(m map[string]any) map[string]any {
+	m["repo"] = map[string]any{"key": "000000000002", "name": "upstream", "offline": false}
+	return m
+}
+
 // gitDeleteRoute answers the ADT side of deletes: the search the gate uses
 // (every name in package pkgOf[name]), LOCK, DELETE.
 func gitDeleteRoute(pkgOf map[string]string, uris map[string]string, failDelete map[string]bool) http.HandlerFunc {
@@ -551,11 +657,11 @@ func TestDeleteGitObjectsScope(t *testing.T) {
 	cl := newStubbedClient(t, rec, gitDeleteRoute(pkgOf, uris, nil), WithAllowedPackages("$ZDEMO"))
 	ws := &fakeGitWS{contents: []map[string]any{
 		pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}, {"PROG", "ZDEMO_KEEP"}}, nil, true),
-		pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_KEEP"}}, nil, false),
+		pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_KEEP"}}, nil, true),
 	}}
 	res, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{
 		{"PROG", "ZDEMO_REPORT"}, {"PROG", "ZDEMO_ELSE"}, {"DEVC", "$ZDEMO"}, {"PROG", "ZDEMO_ABSENT"},
-	}, "")
+	}, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,11 +678,70 @@ func TestDeleteGitObjectsScope(t *testing.T) {
 	if d := deletedPaths(rec.snapshot()); len(d) != 1 || d[0] != uris["ZDEMO_REPORT"] {
 		t.Errorf("DELETEs %v; want exactly %s", d, uris["ZDEMO_REPORT"])
 	}
-	if !res.RepoDeleted || res.PackageDeleted || len(res.Remaining) != 1 {
-		t.Errorf("repo deleted %t, package deleted %t, remaining %v: a package with an object left must stay", res.RepoDeleted, res.PackageDeleted, res.Remaining)
+	// ZDEMO_KEEP remains: even with delete_repo the repository stays, and
+	// so does the package.
+	if res.RepoDeleted || res.PackageDeleted || len(res.Remaining) != 1 || !strings.Contains(res.RepoNote, "remain") {
+		t.Errorf("repo deleted %t (%s), package deleted %t, remaining %v: a package with an object left keeps both",
+			res.RepoDeleted, res.RepoNote, res.PackageDeleted, res.Remaining)
 	}
-	if p := ws.params("delete_repo"); p == nil || p["package"] != "$ZDEMO" || p["key"] != "000000000001" {
-		t.Errorf("delete_repo %v", p)
+	if p := ws.params("delete_repo"); p != nil {
+		t.Errorf("delete_repo sent with an object left: %v", p)
+	}
+}
+
+// The repository is unregistered only on delete_repo, only an offline one,
+// only from a package left empty; an online one never, and delete_repo
+// with one is refused before anything is deleted. The package goes only
+// when no repository is registered for it any more.
+func TestDeleteGitObjectsRepositoryRules(t *testing.T) {
+	uris := map[string]string{"ZDEMO_REPORT": "/sap/bc/adt/programs/programs/zdemo_report", "$ZDEMO": "/sap/bc/adt/packages/%24ZDEMO"}
+	pkgOf := map[string]string{"ZDEMO_REPORT": "$ZDEMO", "$ZDEMO": "$ZDEMO"}
+	full := func() map[string]any { return pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}}, nil, true) }
+	empty := func() map[string]any { return pkgContents("$ZDEMO", nil, nil, true) }
+	cases := []struct {
+		name                 string
+		contents             []map[string]any
+		deleteRepo           bool
+		wantErr              string
+		wantDeletes          int
+		wantActions          string
+		repoDeleted, pkgGone bool
+		repoNote             string
+	}{
+		{"online repository, delete_repo: refused before anything", []map[string]any{online(full())}, true,
+			"never unregisters an online repository", 0, "package_objects", false, false, ""},
+		{"online repository, no delete_repo: kept, and the package with it", []map[string]any{online(full()), online(empty())}, false,
+			"", 1, "package_objects,package_objects", false, false, "online"},
+		{"offline repository, no delete_repo: kept, and the package with it", []map[string]any{full(), empty()}, false,
+			"", 1, "package_objects,package_objects", false, false, "delete_repo"},
+		{"offline repository, delete_repo, package empty: unregistered, then the package", []map[string]any{full(), empty()}, true,
+			"", 2, "package_objects,package_objects,delete_repo", true, true, ""},
+		{"no repository: the package goes", []map[string]any{pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}}, nil, false), pkgContents("$ZDEMO", nil, nil, false)}, false,
+			"", 2, "package_objects,package_objects", false, true, "no abapGit repository"},
+	}
+	for _, c := range cases {
+		rec := &adtRecorder{}
+		cl := newStubbedClient(t, rec, gitDeleteRoute(pkgOf, uris, nil), WithAllowedPackages("$ZDEMO"))
+		ws := &fakeGitWS{contents: c.contents}
+		res, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "", c.deleteRepo)
+		switch {
+		case c.wantErr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErr)):
+			t.Errorf("%s: error %v, want %q", c.name, err, c.wantErr)
+		case c.wantErr == "" && err != nil:
+			t.Errorf("%s: %v", c.name, err)
+		}
+		if n := len(deletedPaths(rec.snapshot())); n != c.wantDeletes {
+			t.Errorf("%s: %d DELETEs, want %d", c.name, n, c.wantDeletes)
+		}
+		if a := strings.Join(ws.actions(), ","); a != c.wantActions {
+			t.Errorf("%s: git actions %s, want %s", c.name, a, c.wantActions)
+		}
+		if res == nil {
+			continue
+		}
+		if res.RepoDeleted != c.repoDeleted || res.PackageDeleted != c.pkgGone || !strings.Contains(res.RepoNote, c.repoNote) {
+			t.Errorf("%s: repo deleted %t (%q), package deleted %t (%q)", c.name, res.RepoDeleted, res.RepoNote, res.PackageDeleted, res.PackageNote)
+		}
 	}
 }
 
@@ -590,9 +755,9 @@ func TestDeleteGitObjectsRemovesTheEmptyPackageLast(t *testing.T) {
 	cl := newStubbedClient(t, rec, gitDeleteRoute(pkgOf, uris, nil), WithAllowedPackages("$ZDEMO"))
 	ws := &fakeGitWS{contents: []map[string]any{
 		pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}}, nil, true),
-		pkgContents("$ZDEMO", nil, nil, false),
+		pkgContents("$ZDEMO", nil, nil, true),
 	}}
-	res, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "")
+	res, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +765,7 @@ func TestDeleteGitObjectsRemovesTheEmptyPackageLast(t *testing.T) {
 	if len(d) != 2 || d[0] != uris["ZDEMO_REPORT"] || d[1] != "/sap/bc/adt/packages/$ZDEMO" || !res.PackageDeleted {
 		t.Errorf("DELETEs %v, package deleted %t", d, res.PackageDeleted)
 	}
-	if acts := strings.Join(ws.actions(), ","); acts != "package_objects,delete_repo,package_objects" {
+	if acts := strings.Join(ws.actions(), ","); acts != "package_objects,package_objects,delete_repo" {
 		t.Errorf("git actions %s", acts)
 	}
 	// Each DELETE is followed by an UNLOCK of the same object: a DELETE
@@ -621,10 +786,10 @@ func TestDeleteGitObjectsRemovesTheEmptyPackageLast(t *testing.T) {
 	cl = newStubbedClient(t, rec, gitDeleteRoute(pkgOf, uris, nil), WithAllowedPackages("$ZDEMO"))
 	ws = &fakeGitWS{contents: []map[string]any{
 		pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}}, nil, true),
-		pkgContents("$ZDEMO", nil, []string{"$ZDEMO_SUB"}, false),
+		pkgContents("$ZDEMO", nil, []string{"$ZDEMO_SUB"}, true),
 	}}
-	res, err = cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "")
-	if err != nil || res.PackageDeleted || len(deletedPaths(rec.snapshot())) != 1 {
+	res, err = cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "", true)
+	if err != nil || res.PackageDeleted || res.RepoDeleted || len(deletedPaths(rec.snapshot())) != 1 || ws.params("delete_repo") != nil {
 		t.Errorf("a package with a subpackage was deleted: %+v %v", res, err)
 	}
 }
@@ -636,7 +801,7 @@ func TestDeleteGitObjectsStopsOnFailure(t *testing.T) {
 	rec := &adtRecorder{}
 	cl := newStubbedClient(t, rec, gitDeleteRoute(pkgOf, uris, map[string]bool{"ZDEMO_REPORT": true}), WithAllowedPackages("$ZDEMO"))
 	ws := &fakeGitWS{contents: []map[string]any{pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}}, nil, true)}}
-	res, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "")
+	res, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "", true)
 	if err == nil || res == nil || res.RepoDeleted || res.PackageDeleted {
 		t.Fatalf("a failed delete went on: %+v %v", res, err)
 	}
@@ -651,7 +816,7 @@ func TestDeleteGitObjectsStopsOnFailure(t *testing.T) {
 func TestDeleteGitObjectsGatesAndForeignObjects(t *testing.T) {
 	ws := &fakeGitWS{}
 	cl := NewClient("http://sap.invalid", "TESTUSER", "pw", WithReadOnly())
-	if _, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, ""); err == nil || len(ws.actions()) != 0 {
+	if _, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "", true); err == nil || len(ws.actions()) != 0 {
 		t.Errorf("read-only: %v, %v", err, ws.actions())
 	}
 
@@ -659,7 +824,7 @@ func TestDeleteGitObjectsGatesAndForeignObjects(t *testing.T) {
 	rec := &adtRecorder{}
 	cl = newStubbedClient(t, rec, gitDeleteRoute(map[string]string{"ZDEMO_ELSE": "$ZOTHER"}, uris, nil)) // no whitelist at all
 	ws = &fakeGitWS{contents: []map[string]any{pkgContents("$ZDEMO", [][2]string{{"PROG", "@ZDEMO_ELSE"}}, nil, false)}}
-	res, _ := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_ELSE"}}, "")
+	res, _ := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_ELSE"}}, "", false)
 	if d := deletedPaths(rec.snapshot()); len(d) != 0 {
 		t.Errorf("an object of another package was deleted: %v (%+v)", d, res)
 	}

@@ -35,8 +35,11 @@ import (
 const (
 	// GitZipMaxBytes caps the zip.
 	GitZipMaxBytes = 20 << 20
-	// gitZipMaxEntries caps the files in it.
-	gitZipMaxEntries = 50000
+	// gitZipMaxEntries caps the files in it, and gitZipMaxUnzipped their
+	// declared uncompressed size (200 MB). ZCL_VSP_GIT_SERVICE checks the
+	// same limits from the zip's directory before abapGit decompresses it.
+	gitZipMaxEntries  = 50000
+	gitZipMaxUnzipped = 200 << 20
 	// gitDotAbapgitMaxBytes caps .abapgit.xml, the one file read here.
 	gitDotAbapgitMaxBytes = 1 << 20
 	// gitUploadChunk is the payload of one WebSocket message, before base64.
@@ -123,6 +126,13 @@ func AnalyzeGitZip(data []byte, pkg string) (*GitZipPlan, error) {
 	if len(zr.File) > gitZipMaxEntries {
 		return nil, fmt.Errorf("the zip has %d entries, over the %d limit", len(zr.File), gitZipMaxEntries)
 	}
+	var unzipped uint64
+	for _, f := range zr.File {
+		unzipped += f.UncompressedSize64
+		if unzipped > gitZipMaxUnzipped {
+			return nil, fmt.Errorf("the zip unpacks to more than %d bytes (200 MB), the limit", gitZipMaxUnzipped)
+		}
+	}
 
 	var dot *zip.File
 	type entry struct{ dir, file string }
@@ -138,6 +148,9 @@ func AnalyzeGitZip(data []byte, pkg string) (*GitZipPlan, error) {
 		}
 		dir, file := path.Split(clean)
 		if dir == "/" && file == ".abapgit.xml" {
+			if dot != nil {
+				return nil, errors.New("the zip has more than one .abapgit.xml at its root: which one abapGit would read is not defined")
+			}
 			dot = f
 			continue
 		}
@@ -325,16 +338,21 @@ type GitImportOptions struct {
 func isLocalPackage(pkg string) bool { return strings.HasPrefix(pkg, "$") }
 
 // CheckGitImportPolicy runs the checks an import into pkg needs before the
-// zip is even read: not read-only, create/update/activate allowed, the
-// target in the package whitelist, and for a transportable target the
-// opt-in to transportable edits, with the transport whitelist on a named
-// request. It does no I/O.
-func (c *Client) CheckGitImportPolicy(pkg, transport string) error {
+// zip is even read: not read-only, create/update/activate allowed -- and
+// delete too with overwrite, since abapGit's delete_add deletes an object and
+// creates it again --, the target in the package whitelist, and for a
+// transportable target the opt-in to transportable edits, with the
+// transport whitelist on a named request. It does no I/O.
+func (c *Client) CheckGitImportPolicy(pkg, transport string, overwrite bool) error {
 	const op = "GitImportZip"
 	if c.config.Safety.ReadOnly {
 		return fmt.Errorf("operation '%s' is blocked: read-only mode enabled (an import creates and changes objects)", op)
 	}
-	for _, o := range []OperationType{OpCreate, OpUpdate, OpActivate} {
+	ops := []OperationType{OpCreate, OpUpdate, OpActivate}
+	if overwrite {
+		ops = append(ops, OpDelete)
+	}
+	for _, o := range ops {
 		if err := c.checkSafety(o, op); err != nil {
 			return err
 		}
@@ -493,7 +511,7 @@ type gitCommitAnswer struct {
 // client, the chunks, and commit (size and SHA-256, a zip with .abapgit.xml,
 // the job). The import's outcome is WaitGitImport's or GitImportStatus's.
 func (c *Client) StartGitImport(ctx context.Context, ws GitService, zipData []byte, opts GitImportOptions) (*GitImportStarted, error) {
-	if err := c.CheckGitImportPolicy(opts.Package, opts.Transport); err != nil {
+	if err := c.CheckGitImportPolicy(opts.Package, opts.Transport, opts.Overwrite); err != nil {
 		return nil, err
 	}
 	plan, err := AnalyzeGitZip(zipData, opts.Package)
@@ -558,16 +576,44 @@ func (c *Client) StartGitImport(ctx context.Context, ws GitService, zipData []by
 		}
 	}
 	var commit gitCommitAnswer
-	if err := gitCall(ctx, ws, "import_zip", map[string]any{"step": "commit", "assembly_id": begin.AssemblyID}, 2*time.Minute, &commit); err != nil {
-		return nil, err
-	}
 	started := &GitImportStarted{System: begin.System, Client: begin.Client, Package: plan.Package,
-		Job: orDefaultString(commit.Job, gitImportJobName), JobCount: commit.JobCount, Transport: transport, Plan: plan}
+		Job: gitImportJobName, Transport: transport, Plan: plan}
 	if reason != "" {
 		started.Note = "transport: " + reason
 	}
+	if err := gitCall(ctx, ws, "import_zip", map[string]any{"step": "commit", "assembly_id": begin.AssemblyID}, 2*time.Minute, &commit); err != nil {
+		var se *GitServiceError
+		if errors.As(err, &se) {
+			// ZADT_VSP answered: the commit was refused (size, SHA-256, the
+			// zip, the job), and nothing was started.
+			return nil, err
+		}
+		// No answer: the job may have been scheduled before the
+		// connection failed or the time ran out.
+		owner := ""
+		if u := strings.TrimSpace(c.config.Username); u != "" {
+			owner = " of user " + strings.ToUpper(u)
+		}
+		started.Note = strings.TrimSpace(fmt.Sprintf("the import may be running: the commit got no answer (%v). Look for job %s%s in SM37, "+
+			"and read its outcome with git_import_status (vsp git import-status <job number>) before importing again. %s",
+			err, gitImportJobName, owner, started.Note))
+		return started, &GitImportUnconfirmedError{Err: err, Started: started}
+	}
+	started.Job = orDefaultString(commit.Job, gitImportJobName)
+	started.JobCount = commit.JobCount
 	return started, nil
 }
+
+// GitImportUnconfirmedError says the zip was sent and the commit got no
+// answer: the import job may have been started, or not. Started holds what
+// is known (no job number).
+type GitImportUnconfirmedError struct {
+	Err     error
+	Started *GitImportStarted
+}
+
+func (e *GitImportUnconfirmedError) Error() string { return e.Started.Note }
+func (e *GitImportUnconfirmedError) Unwrap() error { return e.Err }
 
 func orDefaultString(v, d string) string {
 	if v == "" {
@@ -594,8 +640,10 @@ type GitTadirRow struct {
 }
 
 // GitDecision is what the import decided for one object abapGit's checks
-// listed: add, update, overwrite, delete_add (Y with overwrite) or delete
-// (always N: a local object not in the zip is kept).
+// listed: add, update, overwrite, delete_add (Y with overwrite), delete
+// (always N: a local object not in the zip is kept), or package_kept (always
+// N: the target package existed without a repository, and its own entry is
+// left as it is).
 type GitDecision struct {
 	ObjType  string `json:"objType"`
 	ObjName  string `json:"objName"`
@@ -1059,7 +1107,8 @@ type GitDeleteResult struct {
 	Package string             `json:"package"`
 	Objects []GitDeleteOutcome `json:"objects"`
 	// RepoDeleted says the repository row registered for the package was
-	// removed (its objects are not touched by that).
+	// removed (its objects are not touched by that): only on delete_repo,
+	// only an offline repository, only of a package left empty.
 	RepoDeleted bool         `json:"repoDeleted"`
 	Repo        *GitRepoInfo `json:"repo,omitempty"`
 	RepoNote    string       `json:"repoNote,omitempty"`
@@ -1130,15 +1179,23 @@ func (c *Client) deleteGated(ctx context.Context, objectURL, transport string) (
 	return "", nil
 }
 
-// DeleteGitObjects deletes exactly the given objects of pkg, then the abapGit
-// repository registered for pkg, then pkg itself if nothing is left in it.
+// DeleteGitObjects deletes exactly the given objects of pkg, then -- only
+// when deleteRepo is set -- the offline abapGit repository registered for
+// pkg, then pkg itself if nothing is left in it and no repository is
+// registered for it any more.
 //
 // An object is deleted only when the package's TADIR has it (R3TR, devclass
 // pkg exactly); anything else is skipped and said so. A package is never an
 // item: pkg goes last, only empty, and a subpackage never. Every delete goes
 // through DeleteObject's gate. When an object cannot be deleted, the
 // repository and the package are left alone.
-func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string, items []GitDeleteItem, transport string) (*GitDeleteResult, error) {
+//
+// A repository registration (URL, branch, settings) is dropped only on an
+// explicit deleteRepo, only for an offline repository, and only once the
+// package is empty; ZCL_VSP_GIT_SERVICE checks the same again. An online
+// repository is never unregistered: deleteRepo with one is refused before
+// anything is deleted.
+func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string, items []GitDeleteItem, transport string, deleteRepo bool) (*GitDeleteResult, error) {
 	transport = strings.ToUpper(strings.TrimSpace(transport))
 	if err := c.CheckGitDelete(pkg, transport); err != nil {
 		return nil, err
@@ -1156,6 +1213,10 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 	}
 	if contents.Truncated {
 		return nil, fmt.Errorf("package %s has more TADIR rows than one read returns; delete in SE80", p)
+	}
+	if deleteRepo && contents.Repo != nil && !contents.Repo.Offline {
+		return nil, fmt.Errorf("package %s has online abapGit repository %s %q: vsp never unregisters an online repository (its URL, branch and settings); "+
+			"remove it in abapGit if that is wanted, and call again without delete_repo. Nothing was deleted", p, contents.Repo.Key, contents.Repo.Name)
 	}
 	res := &GitDeleteResult{Package: p, Repo: contents.Repo}
 
@@ -1201,42 +1262,58 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 		}
 	}
 
-	// The repository row: only the one registered for exactly this package.
-	var repoAnswer struct {
-		Key  string `json:"key"`
-		Name string `json:"name"`
-	}
-	params := map[string]any{"package": p}
-	if contents.Repo != nil {
-		params["key"] = contents.Repo.Key
-	}
-	err = gitCall(ctx, ws, "delete_repo", params, time.Minute, &repoAnswer)
-	var se *GitServiceError
-	switch {
-	case err == nil:
-		res.RepoDeleted = true
-		res.Repo = &GitRepoInfo{Key: strings.TrimSpace(repoAnswer.Key), Name: strings.TrimSpace(repoAnswer.Name), Offline: contents.Repo != nil && contents.Repo.Offline}
-	case errors.As(err, &se) && se.Code == "REPO_NOT_FOUND":
-		res.RepoNote = "no abapGit repository is registered for " + p
-	default:
-		res.RepoNote = "not deleted: " + err.Error()
-		res.PackageNote = "kept: the repository row could not be deleted"
-		return res, err
-	}
-
-	// The package, if nothing is left in it.
+	// What is left decides about the repository and the package.
 	after, err := c.GitPackageObjects(ctx, ws, p)
 	if err != nil {
+		res.RepoNote = "kept: the package's contents could not be read again"
 		res.PackageNote = "kept: its contents could not be read again: " + err.Error()
 		return res, err
 	}
-	if rest := after.Remaining(); len(rest) > 0 || after.Truncated {
-		res.Remaining = rest
+	rest := after.Remaining()
+	empty := len(rest) == 0 && !after.Truncated && after.Exists
+	res.Remaining = rest
+	repo := after.Repo
+	switch {
+	case repo == nil:
+		res.RepoNote = "no abapGit repository is registered for " + p
+	case !repo.Offline:
+		res.RepoNote = fmt.Sprintf("kept: %s is an online repository; vsp never unregisters one", repo.Key)
+	case !deleteRepo:
+		res.RepoNote = fmt.Sprintf("kept: repository %s stays registered (delete_repo: true, or --delete-repo, unregisters an offline repository once the package is empty)", repo.Key)
+	case !empty:
+		res.RepoNote = fmt.Sprintf("kept: %d object(s) remain in the package; an offline repository is unregistered only from an empty package", len(rest))
+	default:
+		var repoAnswer struct {
+			Key  string `json:"key"`
+			Name string `json:"name"`
+		}
+		err = gitCall(ctx, ws, "delete_repo", map[string]any{"package": p, "key": repo.Key}, time.Minute, &repoAnswer)
+		var se *GitServiceError
+		switch {
+		case err == nil:
+			res.RepoDeleted = true
+			res.Repo = &GitRepoInfo{Key: strings.TrimSpace(repoAnswer.Key), Name: strings.TrimSpace(repoAnswer.Name), Offline: true}
+			repo = nil
+		case errors.As(err, &se) && se.Code == "REPO_NOT_FOUND":
+			res.RepoNote = "no abapGit repository is registered for " + p
+			repo = nil
+		default:
+			res.RepoNote = "not deleted: " + err.Error()
+			res.PackageNote = "kept: its repository could not be unregistered"
+			return res, err
+		}
+	}
+
+	// The package, if nothing is left in it and no repository points at it.
+	switch {
+	case !after.Exists:
+		res.PackageNote = "already gone"
+		return res, nil
+	case !empty:
 		res.PackageNote = fmt.Sprintf("kept: %d object(s) remain in it", len(rest))
 		return res, nil
-	}
-	if !after.Exists {
-		res.PackageNote = "already gone"
+	case repo != nil:
+		res.PackageNote = fmt.Sprintf("kept: abapGit repository %s is still registered for it", repo.Key)
 		return res, nil
 	}
 	note, err := c.deleteGated(ctx, GetObjectURL(ObjectTypePackage, p, ""), transport)

@@ -540,14 +540,20 @@ vsp -s devsys git import-zip ./demo.zip --package '$ZDEMO'               # waits
 vsp -s devsys git import-zip ./demo.zip --package '$ZDEMO' --overwrite   # into its existing offline repository, overwriting
 vsp -s devsys git import-status 12345678                                 # a job still running, read-only
 vsp -s devsys git delete-objects --package '$ZDEMO' "PROG ZDEMO_REPORT" "CLAS ZCL_DEMO"
+vsp -s devsys git delete-objects --package '$ZDEMO' --delete-repo "PROG ZDEMO_REPORT"   # and unregister its offline repository
 ```
 
 MCP: `system` with `git_import_zip` (`file_path` or `zip_base64`, `package`,
 `repo_name`, `overwrite`, `transport`, `wait_seconds`), the read-only
-`git_import_status` (`job`), and `git_delete_objects` (`package`, `objects`).
+`git_import_status` (`job`), and `git_delete_objects` (`package`, `objects`,
+`delete_repo`).
 
 Nothing that exists is overwritten without `overwrite`, and a package that
-already has a repository is refused without it. Unmet requirements or APACK
+already has a repository is refused without it. A package that exists
+without a repository is imported into without `overwrite`; its own package
+entry is left as it is. `overwrite` also needs deletes allowed
+(`--disallowed-ops` without `D`), since abapGit deletes and recreates an
+object whose type changed. Unmet requirements or APACK
 dependencies, an object of another package, a package move, potential data
 loss, an unsupported object type and table content refuse the import; a
 local object the zip does not have is never deleted. Before a byte is sent,
@@ -560,10 +566,21 @@ the import. Refused under `--read-only`.
 
 `git_delete_objects` deletes exactly the listed TADIR items -- each only when
 the package's TADIR has it, each through the same gated delete as any other
--- then the abapGit repository registered for exactly that package (its row),
-then the package itself if nothing and no subpackage is left. Nothing outside
-the package is deleted, a package is never an item, and when an object
-cannot be deleted the repository and the package stay.
+-- then the package itself if nothing and no subpackage is left and no
+abapGit repository is registered for it. Nothing outside the package is
+deleted, a package is never an item, and when an object cannot be deleted
+the repository and the package stay. The repository registered for the
+package (its row: URL, branch, settings) is kept unless `delete_repo: true`
+(`--delete-repo`) is given, and then it is unregistered only if it is offline
+and the package is empty after the deletes; ZADT_VSP checks both again. An
+online repository is never unregistered: `delete_repo` with one is refused
+before anything is deleted.
+
+A zip is refused above 20 MB, 50,000 entries or 200 MB unpacked (its
+declared sizes, checked by vsp and again by ZADT_VSP before abapGit unpacks
+it), and with more than one `.abapgit.xml` at its root. If the import's
+commit gets no answer, the job may be running: vsp says so, and
+`git_import_status` or SM37 (job `ZVSP_GIT_IMPORT`) tells.
 
 abapGit's deserialize commits with `WAIT`, which a ZADT_VSP (APC) session may
 not do (it dumps `APC_ILLEGAL_STATEMENT`), so the import runs as background

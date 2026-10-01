@@ -25,6 +25,10 @@ type gitFakeWS struct {
 	dials   int
 	// result is what import_status reports once the job is done.
 	result map[string]any
+	// pkg is what package_objects reports.
+	pkg map[string]any
+	// commitErr fails the commit without an answer.
+	commitErr error
 }
 
 func (f *gitFakeWS) SendDomainRequest(_ context.Context, domain, action string, params map[string]any, _ time.Duration) (*adt.WSResponse, error) {
@@ -39,7 +43,12 @@ func (f *gitFakeWS) SendDomainRequest(_ context.Context, domain, action string, 
 	case "import_zip:begin":
 		data = map[string]any{"assembly_id": "A1", "package": params["package"], "system": "XYZ", "client": "100"}
 	case "import_zip:commit":
+		if f.commitErr != nil {
+			return nil, f.commitErr
+		}
 		data = map[string]any{"status": "pending", "job": "ZVSP_GIT_IMPORT", "job_count": "12345678"}
+	case "package_objects":
+		data = f.pkg
 	case "import_status":
 		data = map[string]any{"job": "ZVSP_GIT_IMPORT", "job_count": params["job"], "job_found": true, "job_status": "F",
 			"outcome": "done", "result": f.result}
@@ -138,6 +147,8 @@ func TestGitImportZipGates(t *testing.T) {
 		"both":                         {nil, map[string]any{"package": "$ZDEMO", "file_path": zipPath, "zip_base64": "AAAA"}, "not both"},
 		"no package":                   {nil, map[string]any{"file_path": zipPath}, "package is required"},
 		"missing file":                 {nil, map[string]any{"package": "$ZDEMO", "file_path": filepath.Join(t.TempDir(), "none.zip")}, "zip:"},
+		"overwrite, deletes disabled": {func(c *Config) { c.DisallowedOps = "D" },
+			map[string]any{"package": "$ZDEMO", "file_path": zipPath, "overwrite": true}, "blocked"},
 	}
 	for name, c := range cases {
 		s, ws := gitServer(t, c.cfg)
@@ -233,5 +244,40 @@ func TestGitImportStatusUnderReadOnly(t *testing.T) {
 	res := callGit(t, s, "git_import_status", map[string]any{"job": "12345678"})
 	if res.IsError || !strings.Contains(uploadResultText(res), `"status": "imported"`) {
 		t.Errorf("status: %s", uploadResultText(res))
+	}
+}
+
+// A commit without an answer: the job may be running, and the answer says
+// so, as an error, with what is known.
+func TestGitImportZipCommitWithoutAnswer(t *testing.T) {
+	s, ws := gitServer(t, nil)
+	ws.commitErr = context.DeadlineExceeded
+	res := callGit(t, s, "git_import_zip", map[string]any{"package": "$ZDEMO", "file_path": gitDemoZip(t)})
+	text := uploadResultText(res)
+	if !res.IsError || !strings.Contains(text, "may be running") || !strings.Contains(text, "SM37") || !strings.Contains(text, `"status": "unknown"`) {
+		t.Errorf("got %s", text)
+	}
+	for _, c := range ws.calls() {
+		if c == "git.import_status" {
+			t.Error("asked for a status without a job number")
+		}
+	}
+}
+
+// delete_repo with an online repository is refused before anything is
+// deleted, as a bool and as a string.
+func TestGitDeleteObjectsRefusesAnOnlineRepository(t *testing.T) {
+	for _, flag := range []any{true, "true"} {
+		s, ws := gitServer(t, nil)
+		ws.pkg = map[string]any{"package": "$ZDEMO", "exists": true,
+			"objects": []any{map[string]any{"pgmid": "R3TR", "object": "PROG", "obj_name": "ZDEMO_REPORT", "devclass": "$ZDEMO"}},
+			"repo":    map[string]any{"key": "000000000002", "name": "upstream", "offline": false}}
+		res := callGit(t, s, "git_delete_objects", map[string]any{"package": "$ZDEMO", "objects": []any{"PROG ZDEMO_REPORT"}, "delete_repo": flag})
+		if !res.IsError || !strings.Contains(uploadResultText(res), "online") {
+			t.Errorf("%v: %s", flag, uploadResultText(res))
+		}
+		if got := strings.Join(ws.calls(), ","); got != "git.package_objects" {
+			t.Errorf("%v: calls %s", flag, got)
+		}
 	}
 }

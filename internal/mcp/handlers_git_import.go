@@ -51,8 +51,13 @@ func (s *Server) handleGitImportZip(ctx context.Context, request mcp.CallToolReq
 	pkg := getStringParam(args, "package")
 	transport := strings.ToUpper(strings.TrimSpace(transportParam(args)))
 
+	overwrite, _ := getBoolParam(args, "overwrite")
+	if v := strings.ToLower(getStringParam(args, "overwrite")); v == "true" {
+		overwrite = true
+	}
+
 	// Policy first, before the zip is even looked at.
-	if err := s.adtClient.CheckGitImportPolicy(pkg, transport); err != nil {
+	if err := s.adtClient.CheckGitImportPolicy(pkg, transport, overwrite); err != nil {
 		return newToolResultError(err.Error()), nil
 	}
 
@@ -84,10 +89,6 @@ func (s *Server) handleGitImportZip(ctx context.Context, request mcp.CallToolReq
 		return newToolResultError(err.Error()), nil
 	}
 
-	overwrite, _ := getBoolParam(args, "overwrite")
-	if v := strings.ToLower(getStringParam(args, "overwrite")); v == "true" {
-		overwrite = true
-	}
 	wait := gitImportDefaultWait
 	if f, ok := getFloatParam(args, "wait_seconds"); ok {
 		if f < 0 {
@@ -103,6 +104,23 @@ func (s *Server) handleGitImportZip(ctx context.Context, request mcp.CallToolReq
 	started, err := s.adtClient.StartGitImport(ctx, ws, data, adt.GitImportOptions{
 		Package: pkg, RepoName: getStringParam(args, "repo_name"), Overwrite: overwrite, Transport: transport,
 	})
+	var unconfirmed *adt.GitImportUnconfirmedError
+	if errors.As(err, &unconfirmed) {
+		// The zip was sent and the commit got no answer: the job may be
+		// running. What is known, as an error result.
+		res := newToolResultJSON(map[string]any{
+			"status":    adt.GitJobUnknown,
+			"system":    started.System,
+			"client":    started.Client,
+			"package":   started.Package,
+			"job":       started.Job,
+			"transport": started.Transport,
+			"packages":  plan.Packages,
+			"note":      started.Note,
+		})
+		res.IsError = true
+		return res, nil
+	}
 	if err != nil {
 		return newToolResultError(err.Error()), nil
 	}
@@ -199,15 +217,18 @@ func (s *Server) handleGitImportStatus(ctx context.Context, request mcp.CallTool
 }
 
 // handleGitDeleteObjects deletes exactly the listed objects of a package,
-// then the abapGit repository registered for it, then the package if it is
-// empty:
+// then, with delete_repo: true, the offline abapGit repository registered
+// for it once the package is empty, then the package if it is empty and no
+// repository is registered for it:
 //
 //	SAP(action="system", params={"type": "git_delete_objects", "package": "$ZDEMO",
-//	    "objects": ["PROG ZDEMO_REPORT", "CLAS ZCL_DEMO"]})
+//	    "objects": ["PROG ZDEMO_REPORT", "CLAS ZCL_DEMO"], "delete_repo": true})
 //
 // An object is deleted only if the package's TADIR has it; nothing outside
 // the package, and no package but the emptied one itself, is ever deleted.
-// Every delete goes through DeleteObject's gate.
+// Every delete goes through DeleteObject's gate. A repository registration
+// is dropped only on delete_repo, only an offline one; an online one never
+// (delete_repo with one is refused before anything is deleted).
 func (s *Server) handleGitDeleteObjects(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := request.GetArguments()
 	pkg := getStringParam(args, "package")
@@ -227,7 +248,11 @@ func (s *Server) handleGitDeleteObjects(ctx context.Context, request mcp.CallToo
 	if err != nil {
 		return newToolResultError(err.Error()), nil
 	}
-	res, err := s.adtClient.DeleteGitObjects(ctx, ws, pkg, items, transport)
+	deleteRepo, _ := getBoolParam(args, "delete_repo")
+	if v := strings.ToLower(getStringParam(args, "delete_repo")); v == "true" {
+		deleteRepo = true
+	}
+	res, err := s.adtClient.DeleteGitObjects(ctx, ws, pkg, items, transport, deleteRepo)
 	if err != nil {
 		if res == nil {
 			return newToolResultError(err.Error()), nil
