@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // --- Compile-only check of an ad-hoc snippet ---
@@ -92,8 +91,10 @@ func (c *Client) CheckABAP(ctx context.Context, code string) (result *CheckABAPR
 		}
 	}
 
-	timestamp := fmt.Sprintf("%d", time.Now().UnixNano()/1000000)
-	programName := strings.ToUpper(checkABAPProgramPrefix + timestamp[len(timestamp)-8:])
+	programName, err := temporaryProgramName(checkABAPProgramPrefix)
+	if err != nil {
+		return nil, err
+	}
 	objectURL := "/sap/bc/adt/programs/programs/" + url.PathEscape(programName)
 	source := executeWrapperSource(programName, "RISK LEVEL HARMLESS", "lv_result", code)
 
@@ -102,6 +103,9 @@ func (c *Client) CheckABAP(ctx context.Context, code string) (result *CheckABAPR
 		Name:        programName,
 		Description: "Temp program for CheckABAP",
 		PackageName: "$TMP",
+		// A failed create whose object then turns out to exist is reported,
+		// not deleted: nothing shows this call created it.
+		leavePartialObject: true,
 	}); err != nil {
 		return nil, fmt.Errorf("creating the temporary program %s in $TMP: %w", programName, err)
 	}
@@ -113,7 +117,7 @@ func (c *Client) CheckABAP(ctx context.Context, code string) (result *CheckABAPR
 	defer func() {
 		cleanupCtx, cancel := failureCleanupContext(ctx)
 		defer cancel()
-		warnings := c.deleteTemporaryProgram(cleanupCtx, objectURL)
+		warnings := c.deleteTemporaryProgram(cleanupCtx, objectURL, programName)
 		result.CleanedUp = len(warnings) == 0
 		result.Warnings = append(result.Warnings, warnings...)
 		if err != nil && len(warnings) > 0 {
@@ -162,7 +166,13 @@ func checkRunProcessed(data []byte) error {
 		return errors.New("syntax check returned no report, so the code cannot be shown to have been checked")
 	}
 	for _, r := range resp.Reports {
-		if r.Status != "" && !strings.EqualFold(r.Status, "processed") {
+		// Fail closed: a report that does not say it was processed is not
+		// taken as a check. Every report A4H and the captured fixtures show
+		// carries a status, so a missing one is a shape this code has not seen.
+		if r.Status == "" {
+			return errors.New("syntax check report has no status, so the code cannot be shown to have been checked")
+		}
+		if !strings.EqualFold(r.Status, "processed") {
 			return fmt.Errorf("SAP did not check the code (status %s): %s", r.Status, r.StatusText)
 		}
 	}
@@ -186,7 +196,7 @@ func checkABAPFindings(messages []SyntaxCheckResult, programName string, offset,
 		if m.Line > 0 {
 			f.Column = m.Offset + 1
 		}
-		ours := programName != "" && strings.Contains(strings.ToUpper(m.URI), strings.ToUpper(programName))
+		ours := uriNamesProgram(m.URI, programName)
 		if ours && offset > 0 && m.Line >= offset && m.Line < offset+lines {
 			f.Line = m.Line - offset + 1
 		} else if ours {
@@ -199,6 +209,29 @@ func checkABAPFindings(messages []SyntaxCheckResult, programName string, offset,
 		findings = append(findings, f)
 	}
 	return findings
+}
+
+// uriNamesProgram says whether a message URI points into programName.
+//
+// Only the path counts, and only a whole segment of it: the query of a message
+// about another include can name the temporary program as its context
+// (`?context=.../programs/zvsp_chk_…`), and that does not make its line one of
+// ours.
+func uriNamesProgram(uri, programName string) bool {
+	if programName == "" {
+		return false
+	}
+	path, _, _ := strings.Cut(uri, "?")
+	path, _, _ = strings.Cut(path, "#")
+	for _, segment := range strings.Split(path, "/") {
+		if unescaped, err := url.PathUnescape(segment); err == nil {
+			segment = unescaped
+		}
+		if strings.EqualFold(segment, programName) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkSeverity spells a checkrun message type as a word. Anything SAP sends

@@ -2,10 +2,11 @@ package adt
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // --- Execute ABAP Code via Unit Test ---
@@ -145,9 +146,10 @@ func (c *Client) ExecuteABAP(ctx context.Context, code string, opts *ExecuteABAP
 		Output: []string{},
 	}
 
-	// Generate unique program name using timestamp
-	timestamp := fmt.Sprintf("%d", time.Now().UnixNano()/1000000)                     // milliseconds
-	programName := strings.ToUpper(opts.ProgramPrefix + timestamp[len(timestamp)-8:]) // Last 8 digits
+	programName, err := temporaryProgramName(opts.ProgramPrefix)
+	if err != nil {
+		return nil, err
+	}
 	result.ProgramName = programName
 	objectURL := fmt.Sprintf("/sap/bc/adt/programs/programs/%s", url.PathEscape(programName))
 
@@ -163,11 +165,13 @@ func (c *Client) ExecuteABAP(ctx context.Context, code string, opts *ExecuteABAP
 	source := executeWrapperSource(programName, riskLevelABAP, opts.ReturnVariable, code)
 
 	// Step 1: Create the temp program
-	err := c.CreateObject(ctx, CreateObjectOptions{
+	err = c.CreateObject(ctx, CreateObjectOptions{
 		ObjectType:  ObjectTypeProgram,
 		Name:        programName,
 		Description: "Temp program for ExecuteABAP",
 		PackageName: "$TMP",
+		// A failed create must not delete an object it cannot show is its own.
+		leavePartialObject: true,
 	})
 	if err != nil {
 		result.Message = fmt.Sprintf("Failed to create temp program: %v", err)
@@ -190,7 +194,7 @@ func (c *Client) ExecuteABAP(ctx context.Context, code string, opts *ExecuteABAP
 			cleanupCtx, cancel := failureCleanupContext(ctx)
 			defer cancel()
 
-			warnings := c.deleteTemporaryProgram(cleanupCtx, objectURL)
+			warnings := c.deleteTemporaryProgram(cleanupCtx, objectURL, programName)
 			for _, warning := range warnings {
 				appendExecuteCleanupWarning(result, warning)
 			}
@@ -355,19 +359,41 @@ func (c *Client) ExecuteABAP(ctx context.Context, code string, opts *ExecuteABAP
 // DELETE is attempted once. A failed request is an unknown result, not
 // permission to retry a potentially completed mutation, and a successful one
 // is not followed by a read to verify the object is gone.
-func (c *Client) deleteTemporaryProgram(ctx context.Context, objectURL string) []string {
+//
+// Every warning names the program, because a warning means it may still be in
+// $TMP and the name is what the user needs to find and delete it.
+func (c *Client) deleteTemporaryProgram(ctx context.Context, objectURL, programName string) []string {
 	lock, err := c.LockObject(ctx, objectURL, "MODIFY")
 	if err != nil {
-		return []string{fmt.Sprintf("could not lock the temporary program for cleanup: %v", err)}
+		return []string{fmt.Sprintf("could not lock the temporary program for cleanup, so %s is still in $TMP: %v", programName, err)}
 	}
 	if err := c.DeleteObject(ctx, objectURL, lock.LockHandle, ""); err != nil {
-		warnings := []string{fmt.Sprintf("temporary-program DELETE outcome is unknown and was not retried: %v", err)}
+		warnings := []string{fmt.Sprintf("temporary-program DELETE outcome is unknown and was not retried, so %s may still be in $TMP: %v", programName, err)}
 		if unlockErr := c.releaseLockAfterFailure(ctx, objectURL, lock.LockHandle); unlockErr != nil {
 			warnings = append(warnings, strandedLockAdvice(objectURL, unlockErr))
 		}
 		return warnings
 	}
 	return nil
+}
+
+// temporaryProgramDigits is how many random digits follow a temporary
+// program's prefix: the same eight the millisecond timestamp used to supply,
+// so names keep their shape and length (ZTEMP_EXEC_ + 8 = 19 characters, well
+// inside the 30 a program name may have).
+const temporaryProgramDigits = 8
+
+// temporaryProgramName returns prefix followed by eight random digits.
+//
+// The digits come from crypto/rand rather than the clock: two calls in the
+// same millisecond — two agents, or one agent's parallel calls — used to get
+// the same name, and the second create then met the first one's program.
+func temporaryProgramName(prefix string) (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(100_000_000))
+	if err != nil {
+		return "", fmt.Errorf("generating a temporary program name: %w", err)
+	}
+	return strings.ToUpper(fmt.Sprintf("%s%0*d", prefix, temporaryProgramDigits, n.Int64())), nil
 }
 
 func appendExecuteCleanupWarning(result *ExecuteABAPResult, warning string) {

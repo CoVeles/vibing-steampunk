@@ -339,6 +339,15 @@ type CreateObjectOptions struct {
 	// For SIA7: the IAM app being assigned.
 	AppID string `json:"appID,omitempty"`
 
+	// leavePartialObject is for the workflows that create a throwaway object
+	// under a generated name (CheckABAP, ExecuteABAP). When the create fails
+	// with anything but "already exists" and the probe then finds an object of
+	// that name, nothing shows that this call created it: the name could have
+	// been taken already, with the failure hiding the conflict. Such a caller
+	// must never delete a stranger's object to tidy up after itself, so with
+	// this set the object is left in place and reported, not deleted.
+	leavePartialObject bool
+
 	// For SRVB: category per SAP domain SRVB_BND_CATEGORY:
 	// "0" = UI (User Interface), "1" = A2X (Application to X users, i.e. Web API)
 	BindingCategory string `json:"bindingCategory,omitempty"`
@@ -470,12 +479,18 @@ type PartialCreateError struct {
 	CleanupActions []string
 	CleanupOK      bool
 	ManualSteps    []string
+	// LeftInPlace means no cleanup was attempted: the object exists, but
+	// the caller could not show it was the one that created it.
+	LeftInPlace bool
 }
 
 func (e *PartialCreateError) Error() string {
 	status := "cleanup attempted"
-	if e.CleanupOK {
+	switch {
+	case e.CleanupOK:
 		status = "cleanup ok"
+	case e.LeftInPlace:
+		status = "object left in place, not deleted"
 	}
 	return fmt.Sprintf("create failed after partial persistence (%s): %s [object=%s package=%s transport=%s]",
 		status, e.OriginalErr, e.ObjectURL, e.Package, e.Transport)
@@ -547,6 +562,22 @@ func (c *Client) reconcileFailedCreate(ctx context.Context, opts CreateObjectOpt
 	if !exists {
 		// SAP did not persist anything — original error is final.
 		return createErr
+	}
+
+	if opts.leavePartialObject {
+		return &PartialCreateError{
+			ObjectURL:   objectURL,
+			Package:     opts.PackageName,
+			Transport:   opts.Transport,
+			OriginalErr: createErr,
+			LeftInPlace: true,
+			CleanupActions: []string{
+				"not deleted: the create failed, yet an object of this name exists, and nothing shows this call created it",
+			},
+			ManualSteps: []string{
+				fmt.Sprintf("look at %s (created by, created on); if it is an empty program this call left behind, delete it in SE80 or with vsp", opts.Name),
+			},
+		}
 	}
 
 	pce := c.cleanupPartialObject(ctx, objectURL, opts.PackageName, opts.Transport)
