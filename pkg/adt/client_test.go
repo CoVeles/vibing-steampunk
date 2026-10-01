@@ -586,11 +586,12 @@ func TestClient_CheckObjectPackageByName(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			search := newSearchResponse("/sap/bc/adt/programs/programs/zdemo_report", tc.hitType, "ZDEMO_REPORT", tc.hitPackage)
+			defer search.Body.Close()
+			discovery := newTestResponse("OK")
+			defer discovery.Body.Close()
 			mock := &mockTransportClient{
-				responses: map[string]*http.Response{
-					"search":    newSearchResponse("/sap/bc/adt/programs/programs/zdemo_report", tc.hitType, "ZDEMO_REPORT", tc.hitPackage),
-					"discovery": newTestResponse("OK"),
-				},
+				responses: map[string]*http.Response{"search": search, "discovery": discovery},
 			}
 			cfg := NewConfig("https://sap.example.com:44300", "user", "pass", WithAllowedPackages("Z*"))
 			client := NewClientWithTransport(cfg, NewTransportWithClient(cfg, mock))

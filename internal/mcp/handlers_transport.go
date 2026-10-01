@@ -478,7 +478,7 @@ func (s *Server) handleMoveTransportObject(ctx context.Context, request mcp.Call
 	if from == "" || to == "" {
 		return newToolResultError("from and to (request numbers) are required"), nil
 	}
-	if err := s.checkTransportWrite("MoveTransportObject", from, to); err != nil {
+	if err = s.checkTransportWrite("MoveTransportObject", from, to); err != nil {
 		return newToolResultError(err.Error()), nil
 	}
 	if err := s.ensureDebugWSClient(ctx); err != nil {

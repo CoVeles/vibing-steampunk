@@ -1112,8 +1112,9 @@ func actionCases() []actionCase {
 // tableCases are the SAP() actions routed through tables, enumerated from the
 // tables themselves.
 func (s *Server) tableCases() []actionCase {
-	var out []actionCase
-	for _, t := range s.AnalyzeTypes() {
+	analyze := s.AnalyzeTypes()
+	out := make([]actionCase, 0, len(analyze)+len(s.i18nTypes())+len(s.revisionTypes())+len(s.lintTypes()))
+	for _, t := range analyze {
 		out = append(out, actionCase{Name: "SAP analyze type=" + t, Action: "analyze", Params: kv("type", t)})
 	}
 	i18nExtra := map[string]map[string]any{
@@ -1615,7 +1616,7 @@ func TestReadOnlyInvariant(t *testing.T) {
 	}
 
 	cases := append(actionCases(), expert.tableCases()...)
-	var outcomes []probeOutcome
+	outcomes := make([]probeOutcome, 0, 2*(len(tools)+len(cases)))
 	for _, world := range []string{"present", "absent"} {
 		env.sap.absent.Store(world == "absent")
 		for _, o := range env.runAll(expert, tools, cases) {
@@ -1714,7 +1715,7 @@ func assertReadOnlyInvariant(t *testing.T, outcomes []probeOutcome, unrouted []s
 		}
 	}
 
-	var names []string
+	names := make([]string, 0, len(unclassified))
 	for n := range unclassified {
 		names = append(names, n)
 	}
@@ -1731,7 +1732,7 @@ func assertReadOnlyInvariant(t *testing.T, outcomes []probeOutcome, unrouted []s
 		}
 	}
 
-	var gapNames []string
+	gapNames := make([]string, 0, len(gaps))
 	for n := range gaps {
 		gapNames = append(gapNames, n)
 	}
@@ -1832,7 +1833,7 @@ func testPackageGate(t *testing.T) {
 		cases[c.Name] = c
 	}
 
-	var names []string
+	names := make([]string, 0, len(packageGated))
 	for n := range packageGated {
 		names = append(names, n)
 	}
