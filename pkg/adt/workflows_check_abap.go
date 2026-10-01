@@ -28,6 +28,11 @@ type CheckABAPFinding struct {
 	// Message is SAP's text, verbatim.
 	Message     string `json:"message"`
 	WrapperLine int    `json:"wrapperLine,omitempty"`
+	// AfterSnippet marks a message SAP placed in the wrapper after the
+	// snippet's last line. It is nearly always the snippet's fault all the
+	// same: a last statement without its period runs on into the wrapper, and
+	// a block left open is reported at ENDMETHOD.
+	AfterSnippet bool `json:"afterSnippet,omitempty"`
 }
 
 // CheckABAPResult is the outcome of CheckABAP.
@@ -186,6 +191,7 @@ func checkABAPFindings(messages []SyntaxCheckResult, programName string, offset,
 			f.Line = m.Line - offset + 1
 		} else if ours {
 			f.WrapperLine = m.Line
+			f.AfterSnippet = offset > 0 && m.Line >= offset+lines
 		} else {
 			// Another object's position means nothing in this snippet.
 			f.Column = 0

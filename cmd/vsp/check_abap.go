@@ -110,6 +110,8 @@ func printCheckABAPResult(w io.Writer, result *adt.CheckABAPResult) {
 		switch {
 		case f.Line > 0:
 			fmt.Fprintf(w, "%d:%d: %s: %s\n", f.Line, f.Column, f.Severity, f.Message)
+		case f.AfterSnippet:
+			fmt.Fprintf(w, "after the snippet's last line (a statement without its period, or a block left open?): %s: %s\n", f.Severity, f.Message)
 		case f.WrapperLine > 0:
 			fmt.Fprintf(w, "outside the snippet (wrapper line %d): %s: %s\n", f.WrapperLine, f.Severity, f.Message)
 		default:

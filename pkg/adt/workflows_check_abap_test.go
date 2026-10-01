@@ -46,8 +46,17 @@ func TestCheckABAPFindingsOutsideTheSnippetKeepTheWrapperLine(t *testing.T) {
 	findings := checkABAPFindings([]SyntaxCheckResult{
 		{URI: "/sap/bc/adt/programs/includes/zvsp_chk_1/source/main", Line: 24, Offset: 2, Severity: "E", Text: "Incorrect nesting"},
 	}, "ZVSP_CHK_1", 18, 1)
-	if f := findings[0]; f.Line != 0 || f.WrapperLine != 24 {
-		t.Fatalf("finding = %+v, want snippet line 0 and wrapper line 24", f)
+	if f := findings[0]; f.Line != 0 || f.WrapperLine != 24 || !f.AfterSnippet {
+		t.Fatalf("finding = %+v, want snippet line 0, wrapper line 24, after the snippet", f)
+	}
+}
+
+func TestCheckABAPFindingsInThePreambleAreNotAfterTheSnippet(t *testing.T) {
+	findings := checkABAPFindings([]SyntaxCheckResult{
+		{URI: "/sap/bc/adt/programs/includes/zvsp_chk_1/source/main", Line: 3, Severity: "W", Text: "preamble"},
+	}, "ZVSP_CHK_1", 18, 1)
+	if f := findings[0]; f.Line != 0 || f.WrapperLine != 3 || f.AfterSnippet {
+		t.Fatalf("finding = %+v, want wrapper line 3 and not after the snippet", f)
 	}
 }
 
