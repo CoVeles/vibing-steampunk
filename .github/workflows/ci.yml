@@ -142,8 +142,13 @@ jobs:
   # decoders that matter most; the seed corpus already runs in the test job,
   # and anything the fuzzer finds is uploaded for `go test -run` to replay.
   fuzz:
-    name: fuzz
+    name: fuzz (advisory)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Advisory: what a fuzzer finds in thirty seconds is often older than the
+    # pull request it ran on, and must not block that PR. The crashers are
+    # uploaded either way, and the seed corpus still gates in the test job.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
