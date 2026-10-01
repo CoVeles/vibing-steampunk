@@ -171,7 +171,9 @@ CLASS zcl_vsp_transport_service DEFINITION
 
     "! Deletes the files of an upload that was committed but never handed to
     "! a buffer job (abandoned: the session ended, or a new upload began).
-    METHODS rollback_written.
+    METHODS rollback_written
+      EXPORTING ev_rolled_back TYPE abap_bool
+                ev_message     TYPE string.
 
     "! The buffer file DIR_TRANS/buffer/&lt;SID&gt;, read through EPS. ev_exists is
     "! false only when a directory listing shows it absent.
@@ -628,7 +630,13 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
                 IMPORTING ev_opened = lv_cofile_open ev_path = ev_cofile_path ev_error = lv_error ).
     IF lv_error IS NOT INITIAL.
       lv_cleanup = COND string( WHEN lv_cofile_open = abap_true THEN delete_file( iv_kind = `cofile` iv_name = is_up-cofile_name ) ).
-      DATA(lv_cleanup2) = delete_file( iv_kind = `data` iv_name = is_up-data_name iv_sha = is_up-data_sha ).
+      " The data file only once no cofile of ours is left.
+      DATA lv_cleanup2 TYPE string.
+      IF lv_cleanup IS INITIAL.
+        lv_cleanup2 = delete_file( iv_kind = `data` iv_name = is_up-data_name iv_sha = is_up-data_sha ).
+      ELSE.
+        lv_cleanup2 = |{ is_up-data_name } kept: the cofile could not be deleted|.
+      ENDIF.
       ev_code = `WRITE_FAILED`.
       ev_message = |{ is_up-cofile_name }: { lv_error }. | &&
                    COND string( WHEN lv_cleanup IS INITIAL AND lv_cleanup2 IS INITIAL THEN `What this call wrote was deleted again.`
@@ -676,10 +684,11 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
                IMPORTING ev_jobcount = lv_jobcount ev_error = lv_error ).
     IF lv_error IS NOT INITIAL.
       " Nothing reached tp: the request is not in the buffer, so this
-      " upload's files go again.
-      rollback_written( ).
-      rs_response = err( iv_id = is_message-id iv_code = 'ADD_FAILED_ROLLED_BACK'
-                         iv_message = |The buffer job could not be started: { lv_error }. Nothing was added; the files this upload wrote were deleted again.| ).
+      " upload's files go again -- and the answer says whether they did.
+      rollback_written( IMPORTING ev_rolled_back = DATA(lv_rolled_back) ev_message = DATA(lv_rollback_msg) ).
+      rs_response = err( iv_id = is_message-id
+                         iv_code = COND #( WHEN lv_rolled_back = abap_true THEN `ADD_FAILED_ROLLED_BACK` ELSE `ADD_FAILED_FILES_KEPT` )
+                         iv_message = |The buffer job could not be started: { lv_error }. Nothing was added. { lv_rollback_msg }| ).
       RETURN.
     ENDIF.
     " Handed over: from here the job owns the outcome, and the files.
@@ -1101,10 +1110,17 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         " Certainly not in the buffer: the upload's files go again, so that
         " the same pair can be uploaded once more.
         ls_res-outcome = `not_added`.
+        " The cofile first; the data file only once the cofile is gone, so a
+        " cofile is never left without its data file.
+        DATA lv_del2 TYPE string.
         DATA(lv_del1) = delete_file( iv_kind = `cofile` iv_name = |K{ lv_number }.{ lv_sid }|
                                      iv_sha = CONV string( cl_http_utility=>decode_x_base64( lv_shac ) ) ).
-        DATA(lv_del2) = delete_file( iv_kind = `data` iv_name = |R{ lv_number }.{ lv_sid }|
-                                     iv_sha = CONV string( cl_http_utility=>decode_x_base64( lv_shad ) ) ).
+        IF lv_del1 IS INITIAL.
+          lv_del2 = delete_file( iv_kind = `data` iv_name = |R{ lv_number }.{ lv_sid }|
+                                 iv_sha = CONV string( cl_http_utility=>decode_x_base64( lv_shad ) ) ).
+        ELSE.
+          lv_del2 = |R{ lv_number }.{ lv_sid } kept: the cofile could not be taken back|.
+        ENDIF.
         ls_res-rolled_back = xsdbool( lv_del1 IS INITIAL AND lv_del2 IS INITIAL ).
         IF ls_res-rolled_back = abap_false.
           ls_res-message = |{ ls_res-message } Files not taken back: { lv_del1 } { lv_del2 }|.
@@ -1218,14 +1234,29 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
 
 
   METHOD rollback_written.
+    DATA lv_del2 TYPE string.
+
+    CLEAR: ev_rolled_back, ev_message.
     IF ms_written-request IS INITIAL.
       RETURN.
     ENDIF.
     " Only the files as this upload wrote them; one changed since is kept.
-    IF lock_request( ms_written-request ) IS INITIAL.
-      delete_file( iv_kind = `cofile` iv_name = ms_written-cofile_name iv_sha = ms_written-cofile_sha ).
-      delete_file( iv_kind = `data` iv_name = ms_written-data_name iv_sha = ms_written-data_sha ).
+    " The cofile first, the data file only once the cofile is gone.
+    DATA(lv_lock) = lock_request( ms_written-request ).
+    IF lv_lock IS NOT INITIAL.
+      ev_message = |The files of { ms_written-request } were not taken back: { lv_lock }|.
+    ELSE.
+      DATA(lv_del1) = delete_file( iv_kind = `cofile` iv_name = ms_written-cofile_name iv_sha = ms_written-cofile_sha ).
+      IF lv_del1 IS INITIAL.
+        lv_del2 = delete_file( iv_kind = `data` iv_name = ms_written-data_name iv_sha = ms_written-data_sha ).
+      ELSE.
+        lv_del2 = |{ ms_written-data_name } kept: the cofile could not be taken back|.
+      ENDIF.
       unlock_request( ms_written-request ).
+      ev_rolled_back = xsdbool( lv_del1 IS INITIAL AND lv_del2 IS INITIAL ).
+      ev_message = COND #( WHEN ev_rolled_back = abap_true
+                           THEN |{ ms_written-cofile_name } and { ms_written-data_name } were deleted again.|
+                           ELSE |Not taken back: { lv_del1 } { lv_del2 }| ).
     ENDIF.
     CLEAR ms_written.
   ENDMETHOD.

@@ -882,6 +882,10 @@ func (c *Client) UploadTransport(ctx context.Context, ws TransportService, files
 		case errors.As(addErr, &se) && se.Code == "ADD_FAILED_ROLLED_BACK":
 			// No job ran and the files were taken back.
 			res.Status, res.FilesWritten, res.RolledBack = TransportNotAdded, false, true
+		case errors.As(addErr, &se) && se.Code == "ADD_FAILED_FILES_KEPT":
+			// No job ran, but the files could not all be taken back: they
+			// are (some of them) still in DIR_TRANS.
+			res.Status, res.RolledBack = TransportNotAdded, false
 		case errors.As(addErr, &se) && (se.Code == "NOT_UPLOADED" || se.Code == "FILES_MISSING" || se.Code == "INVALID_REQUEST"):
 			// Refused before any job was scheduled.
 			res.Status = TransportNotAdded

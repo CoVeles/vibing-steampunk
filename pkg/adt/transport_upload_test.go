@@ -643,3 +643,14 @@ func TestUploadTransportOwnSID(t *testing.T) {
 		t.Fatalf("%v %+v", err, res)
 	}
 }
+
+// When no job could be started and the files could not all be taken back,
+// the result does not claim a rollback (critic, round 3 #3).
+func TestUploadTransportFilesKept(t *testing.T) {
+	ws := newFakeTransportWS()
+	ws.addErr = &WSError{Code: "ADD_FAILED_FILES_KEPT", Message: "Nothing was added. Not taken back: K900001.XYZ kept"}
+	res, err := uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
+	if err == nil || res.Status != TransportNotAdded || res.RolledBack || !res.FilesWritten {
+		t.Errorf("%v %+v", err, res)
+	}
+}

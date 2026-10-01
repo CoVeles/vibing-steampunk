@@ -712,3 +712,33 @@ func TestJobRunsOnlyWithItsOwnVariant(t *testing.T) {
 		t.Errorf("the variant check does not refuse: %v", job[check:min(len(job), check+7)])
 	}
 }
+
+// A rollback deletes the data file only once the cofile is gone, so a cofile
+// is never left without its data file; and rollback_written reports what it
+// did -- the lock's and each delete's result -- instead of assuming it
+// (critic, round 3 #3 and #4).
+func TestRollbackKeepsPairsAndTellsTheTruth(t *testing.T) {
+	stmts := abapStatements(transportServiceSource(t))
+	for method, guard := range map[string]string{"RUN_JOB": "IF LV_DEL1 IS INITIAL", "ROLLBACK_WRITTEN": "IF LV_DEL1 IS INITIAL", "WRITE_PAIR": "IF LV_CLEANUP IS INITIAL"} {
+		body := methodStatements(stmts, method)
+		for i, st := range body {
+			up := strings.ToUpper(st)
+			if strings.Contains(up, "DELETE_FILE( IV_KIND = `DATA`") && strings.Contains(up, "IV_SHA") {
+				if i == 0 || strings.ToUpper(body[i-1]) != guard {
+					t.Errorf("%s deletes the data file without first making sure the cofile is gone: %s", method, st)
+				}
+			}
+		}
+	}
+	rb := strings.ToUpper(strings.Join(methodStatements(stmts, "ROLLBACK_WRITTEN"), "\n"))
+	for _, want := range []string{"DATA(LV_LOCK) = LOCK_REQUEST( MS_WRITTEN-REQUEST )", "IF LV_LOCK IS NOT INITIAL",
+		"EV_ROLLED_BACK = XSDBOOL( LV_DEL1 IS INITIAL AND LV_DEL2 IS INITIAL )"} {
+		if !strings.Contains(rb, want) {
+			t.Errorf("rollback_written lacks %q", want)
+		}
+	}
+	add := strings.ToUpper(strings.Join(methodStatements(stmts, "HANDLE_ADD_TO_BUFFER"), "\n"))
+	if !strings.Contains(add, "WHEN LV_ROLLED_BACK = ABAP_TRUE THEN `ADD_FAILED_ROLLED_BACK` ELSE `ADD_FAILED_FILES_KEPT`") {
+		t.Error("add_to_buffer claims a rollback without checking it happened")
+	}
+}
