@@ -805,9 +805,10 @@ The headline changes are in the **"New in the last three releases"** callout at 
 - **`--read-only` covers more.** Besides object edits it now refuses transport
   writes (create, release, delete, merge, move, entry add/remove — with
   `--enable-transports` too), `SAP(action="rfc")` `call`, `RunReport` /
-  `RunReportAsync`, and gCTS create, delete, clone, pull, commit and
-  switch-branch. Reads stay allowed. The CLI's `vsp rfc call`, `rfc run` and
-  non-GET `rfc adt` now honour `read_only` in `.vsp.json` and `SAP_READ_ONLY`.
+  `RunReportAsync`, `SetTextElements`, and gCTS create, delete, clone, pull,
+  commit and switch-branch. Reads stay allowed. The CLI's `vsp rfc call`,
+  `rfc run`, non-GET `rfc adt`, and the `run` and `call` commands of the
+  `vsp debug` REPL now honour `read_only` in `.vsp.json` and `SAP_READ_ONLY`.
 - **A named system must be the connected one.** When `-s` / `SAP_SYSTEM` names a
   `.vsp.json` entry whose `url`/`client` differ from `SAP_URL`/`SAP_CLIENT`, the
   server warns at startup and refuses RFC use. An entry without a `url` (gateway
@@ -815,7 +816,8 @@ The headline changes are in the **"New in the last three releases"** callout at 
   differs from the server's own gateway is refused, so the configured RFC
   credentials are never sent to a caller-chosen host.
 - **`--block-free-sql` covers `rfc read_table`** when the caller passes a
-  `where`. Reads without one, and `search`, are unchanged.
+  `where`, and so do `block_free_sql` / `SAP_BLOCK_FREE_SQL` for
+  `vsp rfc read-table --where`. Reads without one, and `search`, are unchanged.
 - **Go toolchain:** `go.mod` pins `toolchain go1.26.8`.
 - **HTTP transport:** mcp-go v1.1.0 answers 403 to a request from a loopback
   address that carries a non-loopback `Host` header (DNS-rebinding protection).
