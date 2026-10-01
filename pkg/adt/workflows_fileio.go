@@ -213,6 +213,63 @@ type SaveToFileResult struct {
 	Message    string `json:"message,omitempty"`
 }
 
+// exportExtension is the file suffix ExportToFile writes for each type: the
+// one ParseABAPFile reads back as the same type.
+func exportExtension(objType CreatableObjectType) string {
+	switch objType {
+	case ObjectTypeClass:
+		return ".clas.abap"
+	case ObjectTypeProgram:
+		return ".prog.abap"
+	case ObjectTypeInterface:
+		return ".intf.abap"
+	case ObjectTypeFunctionGroup:
+		return ".fugr.abap"
+	case ObjectTypeFunctionMod:
+		return ".func.abap"
+	case ObjectTypeInclude:
+		// Plain .abap made the importer guess, and an include has nothing in
+		// it to guess from (issue #235).
+		return ".incl.abap"
+	// RAP object types (using ABAPGit-compatible extensions)
+	case ObjectTypeDDLS:
+		return ".ddls.asddls"
+	case ObjectTypeBDEF:
+		return ".bdef.asbdef"
+	case ObjectTypeSRVD:
+		return ".srvd.srvdsrv"
+	default:
+		return ".abap"
+	}
+}
+
+// ExportFilePath is the path ExportToFile writes an object to. outputPath is
+// either a directory or, when it already ends in the type's suffix, the file
+// itself; an include also accepts a path ending in plain .abap as a file,
+// which is what that suffix used to be.
+//
+// A function module exported with its group is named
+// {group}.fugr.{module}.func.abap, so that importing it again knows the group
+// the module is addressed under.
+func ExportFilePath(objType CreatableObjectType, objectName, parentName, outputPath string) string {
+	ext := exportExtension(objType)
+	if outputPath == "" {
+		outputPath = "."
+	}
+	lowerOut := strings.ToLower(outputPath)
+	if strings.HasSuffix(lowerOut, ext) ||
+		(objType == ObjectTypeInclude && strings.HasSuffix(lowerOut, ".abap")) {
+		return outputPath
+	}
+	// Replace namespace slashes with # for filesystem compatibility (abapGit convention)
+	safe := func(name string) string { return strings.ReplaceAll(strings.ToLower(name), "/", "#") }
+	fileName := safe(objectName) + ext
+	if objType == ObjectTypeFunctionMod && parentName != "" {
+		fileName = safe(parentName) + ".fugr." + fileName
+	}
+	return filepath.Join(outputPath, fileName)
+}
+
 // SaveToFile saves an ABAP object's source code to a local file.
 //
 // Workflow: GetSource → WriteFile
@@ -224,45 +281,8 @@ func (c *Client) SaveToFile(ctx context.Context, objType CreatableObjectType, ob
 		ObjectType: string(objType),
 	}
 
-	// 1. Determine file extension
-	var ext string
-	switch objType {
-	case ObjectTypeClass:
-		ext = ".clas.abap"
-	case ObjectTypeProgram:
-		ext = ".prog.abap"
-	case ObjectTypeInterface:
-		ext = ".intf.abap"
-	case ObjectTypeFunctionGroup:
-		ext = ".fugr.abap"
-	case ObjectTypeFunctionMod:
-		ext = ".func.abap"
-	case ObjectTypeInclude:
-		ext = ".abap"
-	// RAP object types (using ABAPGit-compatible extensions)
-	case ObjectTypeDDLS:
-		ext = ".ddls.asddls"
-	case ObjectTypeBDEF:
-		ext = ".bdef.asbdef"
-	case ObjectTypeSRVD:
-		ext = ".srvd.srvdsrv"
-	default:
-		ext = ".abap"
-	}
-
-	// 2. Build file path
-	if outputPath == "" {
-		outputPath = "."
-	}
-	if !strings.HasSuffix(outputPath, ext) {
-		// outputPath is a directory
-		objectName = strings.ToLower(objectName)
-		// Replace namespace slashes with # for filesystem compatibility (abapGit convention)
-		safeFileName := strings.ReplaceAll(objectName, "/", "#")
-		result.FilePath = filepath.Join(outputPath, safeFileName+ext)
-	} else {
-		result.FilePath = outputPath
-	}
+	// 1-2. Build the file path; ExportFilePath says how each type is named.
+	result.FilePath = ExportFilePath(objType, objectName, parentName, outputPath)
 
 	// 3. Get object source
 	objectURL, err := c.buildObjectURLWithParent(objType, objectName, parentName)

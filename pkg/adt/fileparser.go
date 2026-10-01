@@ -129,9 +129,39 @@ func ParseABAPFile(filePath string) (*ABAPFileInfo, error) {
 		info.ObjectType = ObjectTypeBDEF
 	case strings.HasSuffix(baseName, ".srvd.srvdsrv"):
 		info.ObjectType = ObjectTypeSRVD
+	// abapGit's own name for a function module: {group}.fugr.{module}.abap.
+	// The group's other includes share the pattern, so the content decides.
+	case fugrMemberGroup(baseName) != "":
+		info.ParentName = fugrMemberGroup(baseName)
+		kind, err := detectTypeFromContent(filePath)
+		if err != nil {
+			return nil, err
+		}
+		if kind != ObjectTypeFunctionMod {
+			return nil, fmt.Errorf("%s is part of function group %s but holds no FUNCTION statement: a function group's own includes cannot be deployed one file at a time (a function module file starts with FUNCTION)", baseName, info.ParentName)
+		}
+		info.ObjectType = ObjectTypeFunctionMod
 	case ext == ".abap":
-		// Generic .abap: detect from content
-		return parseFromContent(filePath)
+		// Generic .abap: the type comes from the first statement. This used to
+		// call back into ParseABAPFile on the same path, which landed here
+		// again, and the recursion killed the process (issue #237).
+		kind, err := detectTypeFromContent(filePath)
+		if err != nil {
+			return nil, err
+		}
+		if kind == "" {
+			// No REPORT, CLASS, INTERFACE or FUNCTION statement opens it, so it
+			// can only be an include. Exports before issue #235 wrote includes
+			// as {name}.abap, and those still read back as the include.
+			name, err := legacyIncludeName(baseName)
+			if err != nil {
+				return nil, err
+			}
+			info.ObjectType = ObjectTypeInclude
+			info.ObjectName = name
+		} else {
+			info.ObjectType = kind
+		}
 	default:
 		return nil, fmt.Errorf("unsupported file extension: %s (expected .clas.abap, .clas.testclasses.abap, .clas.locals_def.abap, .clas.locals_imp.abap, .prog.abap, .incl.abap, .intf.abap, .fugr.abap, .func.abap, .ddls.asddls, .bdef.asbdef, or .srvd.srvdsrv)", ext)
 	}
@@ -256,42 +286,115 @@ func ParseABAPFile(filePath string) (*ABAPFileInfo, error) {
 	return info, nil
 }
 
-// parseFromContent detects object type by scanning file content
-func parseFromContent(filePath string) (*ABAPFileInfo, error) {
+// fugrMemberGroup returns the function group of an abapGit function group
+// member, {group}.fugr.{member}.abap, and "" for any other name. The group's
+// own {group}.fugr.abap and vsp's {group}.fugr.{module}.func.abap are matched
+// by their own cases before this one is asked.
+func fugrMemberGroup(baseName string) string {
+	lower := strings.ToLower(baseName)
+	if !strings.HasSuffix(lower, ".abap") {
+		return ""
+	}
+	idx := strings.Index(lower, ".fugr.")
+	if idx <= 0 {
+		return ""
+	}
+	member := lower[idx+len(".fugr.") : len(lower)-len(".abap")]
+	if member == "" || strings.Contains(member, ".") {
+		return ""
+	}
+	return strings.ReplaceAll(strings.ToUpper(baseName[:idx]), "#", "/")
+}
+
+// abapObjectName is a repository object name, optionally with a /NAMESPACE/.
+var abapObjectName = regexp.MustCompile(`^(/[A-Z0-9_]+/)?[A-Z0-9_]+$`)
+
+// legacyIncludeName names an include from a plain {name}.abap file, the name
+// ExportToFile gave includes before issue #235. Anything that is not a plain
+// object name is refused rather than guessed at.
+func legacyIncludeName(baseName string) (string, error) {
+	stem := strings.TrimSuffix(baseName, ".abap")
+	name := strings.ToUpper(strings.ReplaceAll(stem, "#", "/"))
+	if len(name) > 40 || !abapObjectName.MatchString(name) {
+		return "", fmt.Errorf("cannot tell what %s is: no REPORT, PROGRAM, CLASS, INTERFACE, FUNCTION-POOL or FUNCTION statement opens it, and %q is not an include name; name it with its type (.prog.abap, .incl.abap, .clas.abap, .intf.abap, .fugr.abap, {group}.fugr.{module}.abap)", baseName, stem)
+	}
+	return name, nil
+}
+
+// detectTypeFromContent reads the first ABAP statement of a file and says
+// what kind of object it opens. It returns "" with no error when the
+// statement opens none (an include), and an error when the file is empty or
+// opens with a local class or interface, which is ambiguous.
+//
+// It only reads; it never parses the file as a whole. That is the caller's
+// job, done once the type is known.
+func detectTypeFromContent(filePath string) (CreatableObjectType, error) {
+	stmt, err := firstABAPStatement(filePath)
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Base(filePath)
+	if stmt == "" {
+		return "", fmt.Errorf("could not detect the object type of %s: it holds no ABAP statement", base)
+	}
+	tokens := strings.Fields(strings.ToUpper(stmt))
+	switch tokens[0] {
+	case "REPORT", "PROGRAM":
+		return ObjectTypeProgram, nil
+	case "FUNCTION-POOL":
+		return ObjectTypeFunctionGroup, nil
+	case "FUNCTION":
+		return ObjectTypeFunctionMod, nil
+	case "CLASS", "INTERFACE":
+		// A global class or interface is declared PUBLIC. Without it the
+		// statement declares a local one, which is what a program's include
+		// opens with; deploying it as a global object named after the local
+		// one would be wrong either way it went, so say so instead.
+		for _, t := range tokens[1:] {
+			if t == "PUBLIC" {
+				if tokens[0] == "CLASS" {
+					return ObjectTypeClass, nil
+				}
+				return ObjectTypeInterface, nil
+			}
+		}
+		return "", fmt.Errorf("could not detect the object type of %s: it opens with a %s that is not PUBLIC, so it may be an include holding a local %s; rename it to .%s.abap if it is the global object, or .incl.abap if it is an include", base, strings.ToLower(tokens[0]), strings.ToLower(tokens[0]), map[string]string{"CLASS": "clas", "INTERFACE": "intf"}[tokens[0]])
+	}
+	return "", nil
+}
+
+// firstABAPStatement returns the text of the first statement in the file, up
+// to its period, with comments removed and lines joined. It reads at most the
+// first 200 lines.
+func firstABAPStatement(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return "", fmt.Errorf("opening file: %w", err)
 	}
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.ToUpper(strings.TrimSpace(scanner.Text()))
-
-		if strings.HasPrefix(line, "CLASS ") && strings.Contains(line, "DEFINITION") {
-			// Re-parse with known type
-			file.Close()
-			return ParseABAPFile(filePath)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var stmt strings.Builder
+	for lineNum := 0; lineNum < 200 && scanner.Scan(); lineNum++ {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "*") {
+			continue // a full-line comment
 		}
-		if strings.HasPrefix(line, "REPORT ") || strings.HasPrefix(line, "PROGRAM ") {
-			file.Close()
-			return ParseABAPFile(filePath)
+		if i := strings.Index(line, "\""); i >= 0 {
+			line = line[:i] // an end-of-line comment
 		}
-		if strings.HasPrefix(line, "INTERFACE ") {
-			file.Close()
-			return ParseABAPFile(filePath)
+		if i := strings.Index(line, "."); i >= 0 {
+			stmt.WriteString(line[:i])
+			return strings.TrimSpace(stmt.String()), nil
 		}
-		if strings.HasPrefix(line, "FUNCTION-POOL ") {
-			file.Close()
-			return ParseABAPFile(filePath)
-		}
-		if strings.HasPrefix(line, "FUNCTION ") {
-			file.Close()
-			return ParseABAPFile(filePath)
-		}
+		stmt.WriteString(line)
+		stmt.WriteString(" ")
 	}
-
-	return nil, fmt.Errorf("could not detect object type from file content")
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("reading file: %w", err)
+	}
+	return strings.TrimSpace(stmt.String()), nil
 }
 
 // parseClassName extracts class name from CLASS <name> DEFINITION
