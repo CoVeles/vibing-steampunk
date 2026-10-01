@@ -190,21 +190,11 @@ func (c *Client) ExecuteABAP(ctx context.Context, code string, opts *ExecuteABAP
 			cleanupCtx, cancel := failureCleanupContext(ctx)
 			defer cancel()
 
-			lock, lockErr := c.LockObject(cleanupCtx, objectURL, "MODIFY")
-			if lockErr != nil {
-				appendExecuteCleanupWarning(result, fmt.Sprintf("could not lock the temporary program for cleanup: %v", lockErr))
-				return
+			warnings := c.deleteTemporaryProgram(cleanupCtx, objectURL)
+			for _, warning := range warnings {
+				appendExecuteCleanupWarning(result, warning)
 			}
-
-			// DELETE is intentionally attempted once. A failed request is an
-			// unknown result, not permission to retry a potentially completed
-			// mutation. CleanedUp therefore means only that this DELETE succeeded;
-			// it does not claim a subsequent read verified the object is absent.
-			if deleteErr := c.DeleteObject(cleanupCtx, objectURL, lock.LockHandle, ""); deleteErr != nil {
-				appendExecuteCleanupWarning(result, fmt.Sprintf("temporary-program DELETE outcome is unknown and was not retried: %v", deleteErr))
-				if unlockErr := c.releaseLockAfterFailure(cleanupCtx, objectURL, lock.LockHandle); unlockErr != nil {
-					appendExecuteCleanupWarning(result, strandedLockAdvice(objectURL, unlockErr))
-				}
+			if len(warnings) > 0 {
 				return
 			}
 
@@ -357,6 +347,27 @@ func (c *Client) ExecuteABAP(ctx context.Context, code string, opts *ExecuteABAP
 	}
 
 	return result, nil
+}
+
+// deleteTemporaryProgram removes a program a workflow created for itself, and
+// returns what went wrong; no warnings means the DELETE succeeded.
+//
+// DELETE is attempted once. A failed request is an unknown result, not
+// permission to retry a potentially completed mutation, and a successful one
+// is not followed by a read to verify the object is gone.
+func (c *Client) deleteTemporaryProgram(ctx context.Context, objectURL string) []string {
+	lock, err := c.LockObject(ctx, objectURL, "MODIFY")
+	if err != nil {
+		return []string{fmt.Sprintf("could not lock the temporary program for cleanup: %v", err)}
+	}
+	if err := c.DeleteObject(ctx, objectURL, lock.LockHandle, ""); err != nil {
+		warnings := []string{fmt.Sprintf("temporary-program DELETE outcome is unknown and was not retried: %v", err)}
+		if unlockErr := c.releaseLockAfterFailure(ctx, objectURL, lock.LockHandle); unlockErr != nil {
+			warnings = append(warnings, strandedLockAdvice(objectURL, unlockErr))
+		}
+		return warnings
+	}
+	return nil
 }
 
 func appendExecuteCleanupWarning(result *ExecuteABAPResult, warning string) {
