@@ -15,12 +15,12 @@ func TestMemoryCache_BasicOperations(t *testing.T) {
 
 	// Test PutNode and GetNode
 	node := &cache.Node{
-		ID:          "ME.ZCL_TEST\\ME:METHOD",
-		ObjectType:  "CLAS",
-		ObjectName:  "ZCL_TEST",
-		Package:     "$TMP",
-		SourceHash:  "abc123",
-		Valid:       true,
+		ID:         "ME.ZCL_TEST\\ME:METHOD",
+		ObjectType: "CLAS",
+		ObjectName: "ZCL_TEST",
+		Package:    "$TMP",
+		SourceHash: "abc123",
+		Valid:      true,
 	}
 
 	err := c.PutNode(ctx, node)
