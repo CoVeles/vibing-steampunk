@@ -1421,6 +1421,9 @@ func newInvariantEnv(t *testing.T, cfg func(base string) *Config) *invariantEnv 
 	// configuration out of it.
 	t.Setenv("HOME", t.TempDir())
 	t.Chdir(env.dir)
+	for _, k := range requestShapingEnv {
+		t.Setenv(k, "")
+	}
 	conf := fmt.Sprintf(`{"systems": {"own": {"url": %q, "client": "001",
 	  "rfc_host": "127.0.0.1", "rfc_sysnr": "00", "rfc_port": %d}}}`, env.sap.srv.URL, env.gateway.port)
 	if err := os.WriteFile(filepath.Join(env.dir, ".vsp.json"), []byte(conf), 0o600); err != nil {
@@ -1431,6 +1434,20 @@ func newInvariantEnv(t *testing.T, cfg func(base string) *Config) *invariantEnv 
 	}
 	env.cfg = func() *Config { return cfg(env.sap.srv.URL) }
 	return env
+}
+
+// requestShapingEnv are the environment variables the server or its client
+// read that change which requests are sent, or how: a response cache that
+// answers a GET without sending it, credentials and system settings taken
+// from the environment, per-system overrides of this test's .vsp.json entry
+// ("own"), and debug switches. All are cleared, so that a developer's shell
+// cannot change what the test sees.
+var requestShapingEnv = []string{
+	"VSP_CACHE", "VSP_CACHE_TTL", "VSP_CACHE_PATH",
+	"SAP_URL", "SAP_CLIENT", "SAP_USER", "SAP_PASSWORD", "SAP_LANGUAGE", "SAP_INSECURE",
+	"SAP_PROXY_CONTEXTID_GUARD", "VSP_TRANSPORT_ATTRIBUTE",
+	"VSP_OWN_PASSWORD", "VSP_OWN_RFC_PASSWORD", "VSP_OWN_TRANSPORT_ATTRIBUTE", "VSP_OWN_CACHE",
+	"VSP_DEBUG", "VSP_DEBUG_XML", "VSP_HTTP_TRACE", "VSP_TRACE_LOG", "DEBUG_LINE", "DEBUG_TARGET",
 }
 
 const probeTimeout = 2 * time.Second
