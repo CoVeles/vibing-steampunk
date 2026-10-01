@@ -1105,21 +1105,29 @@ func (c *Client) CheckGitDelete(pkg, transport string) error {
 
 // deleteGated deletes one object through DeleteObject's gate: PrepareDelete
 // (operation, package whitelist, transportable edit) before the lock, then
-// lock, DELETE, and the lock released again if the DELETE fails.
-func (c *Client) deleteGated(ctx context.Context, objectURL, transport string) error {
+// lock, DELETE, and UNLOCK -- after a failed DELETE, and after a successful
+// one too. A DELETE does not release the ENQUEUE its LOCK took: on a 7.58
+// the TRDIR entry of a deleted program stayed in SM12 for as long as the ADT
+// session lived, and abapGit refused to import the program again ("is
+// locked"); the UNLOCK after the DELETE releases it. The note says when it
+// could not.
+func (c *Client) deleteGated(ctx context.Context, objectURL, transport string) (string, error) {
 	gctx, err := c.PrepareDelete(ctx, objectURL, transport)
 	if err != nil {
-		return err
+		return "", err
 	}
 	lock, err := c.LockObject(gctx, objectURL, "MODIFY", transport)
 	if err != nil {
-		return fmt.Errorf("locking %s: %w", objectURL, err)
+		return "", fmt.Errorf("locking %s: %w", objectURL, err)
 	}
 	if err := c.DeleteObject(gctx, objectURL, lock.LockHandle, transport); err != nil {
 		_ = c.releaseLockAfterFailure(gctx, objectURL, lock.LockHandle)
-		return err
+		return "", err
 	}
-	return nil
+	if uerr := c.releaseLockAfterFailure(gctx, objectURL, lock.LockHandle); uerr != nil {
+		return "deleted; its lock entry may stay in SM12 until the ADT session ends: " + uerr.Error(), nil
+	}
+	return "", nil
 }
 
 // DeleteGitObjects deletes exactly the given objects of pkg, then the abapGit
@@ -1175,12 +1183,13 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 	for round := 0; round < 2 && len(queue) > 0; round++ {
 		var again []todo
 		for _, q := range queue {
-			if err := c.deleteGated(ctx, q.url, transport); err != nil {
+			note, err := c.deleteGated(ctx, q.url, transport)
+			if err != nil {
 				res.Objects[q.i].Status, res.Objects[q.i].Reason = "failed", err.Error()
 				again = append(again, q)
 				continue
 			}
-			res.Objects[q.i].Status, res.Objects[q.i].Reason = "deleted", ""
+			res.Objects[q.i].Status, res.Objects[q.i].Reason = "deleted", note
 		}
 		queue = again
 	}
@@ -1230,10 +1239,11 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 		res.PackageNote = "already gone"
 		return res, nil
 	}
-	if err := c.deleteGated(ctx, GetObjectURL(ObjectTypePackage, p, ""), transport); err != nil {
+	note, err := c.deleteGated(ctx, GetObjectURL(ObjectTypePackage, p, ""), transport)
+	if err != nil {
 		res.PackageNote = "not deleted: " + err.Error()
 		return res, err
 	}
-	res.PackageDeleted = true
+	res.PackageDeleted, res.PackageNote = true, note
 	return res, nil
 }

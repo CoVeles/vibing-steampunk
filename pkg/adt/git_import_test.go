@@ -603,6 +603,18 @@ func TestDeleteGitObjectsRemovesTheEmptyPackageLast(t *testing.T) {
 	if acts := strings.Join(ws.actions(), ","); acts != "package_objects,delete_repo,package_objects" {
 		t.Errorf("git actions %s", acts)
 	}
+	// Each DELETE is followed by an UNLOCK of the same object: a DELETE
+	// leaves its ENQUEUE behind, and abapGit then finds the object locked.
+	calls := rec.snapshot()
+	for i, c := range calls {
+		if c.method != http.MethodDelete {
+			continue
+		}
+		if i+1 >= len(calls) || !isUnlock(calls[i+1]) || calls[i+1].path != c.path {
+			dumpCalls(t, calls)
+			t.Errorf("DELETE %s is not followed by its UNLOCK", c.path)
+		}
+	}
 
 	// A subpackage keeps the package.
 	rec = &adtRecorder{}
