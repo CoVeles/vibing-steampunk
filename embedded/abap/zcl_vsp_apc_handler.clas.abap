@@ -79,6 +79,20 @@ CLASS zcl_vsp_apc_handler IMPLEMENTATION.
     ENDTRY.
     mv_session_id = lv_uuid.
 
+    " Push: bind this WebSocket to its own extension of AMC channel
+    " ZVSP_TRANSPORT /buffer, on which the transport service's background
+    " job publishes the outcome of an add. Without the AMC application the
+    " binding fails and outcomes are read with the status call instead.
+    DATA(lv_push) = abap_false.
+    TRY.
+        i_context->get_binding_manager( )->bind_amc_message_consumer(
+          i_application_id       = 'ZVSP_TRANSPORT'
+          i_channel_id           = '/buffer'
+          i_channel_extension_id = CONV #( mv_session_id ) ).
+        lv_push = abap_true.
+      CATCH cx_apc_error ##NO_HANDLER.
+    ENDTRY.
+
     DATA lt_domains TYPE string_table.
     LOOP AT gt_services INTO DATA(lo_service).
       APPEND |"{ lo_service->get_domain( ) }"| TO lt_domains.
@@ -88,6 +102,7 @@ CLASS zcl_vsp_apc_handler IMPLEMENTATION.
       ( zcl_vsp_utils=>json_str( iv_key = 'session' iv_value = mv_session_id ) )
       ( zcl_vsp_utils=>json_str( iv_key = 'version' iv_value = '2.4.0' ) )
       ( |"domains":{ zcl_vsp_utils=>json_arr( zcl_vsp_utils=>json_join( lt_domains ) ) }| )
+      ( zcl_vsp_utils=>json_bool( iv_key = 'push' iv_value = lv_push ) )
     ) ) ).
 
     send_response( VALUE #(

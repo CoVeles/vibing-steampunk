@@ -472,8 +472,52 @@ type TransportAddStatus struct {
 	CofilePresent bool     `json:"cofilePresent"`
 	DataPresent   bool     `json:"dataPresent"`
 	JobLog        []string `json:"jobLog,omitempty"`
-	Note          string   `json:"note,omitempty"`
+	// Push is what the job itself published when it finished, if it reached
+	// this connection.
+	Push *TransportPush `json:"push,omitempty"`
+	Note string         `json:"note,omitempty"`
 }
+
+// TransportPush is the outcome the background job publishes (AMC
+// ZVSP_TRANSPORT /buffer) to the WebSocket that started the upload.
+type TransportPush struct {
+	Request    string `json:"request"`
+	JobCount   string `json:"job_count"`
+	Outcome    string `json:"outcome"`
+	Code       string `json:"code,omitempty"`
+	Message    string `json:"message,omitempty"`
+	TPCommand  string `json:"tp_command,omitempty"`
+	TPRC       string `json:"tp_rc,omitempty"`
+	TPMessage  string `json:"tp_message,omitempty"`
+	InBuffer   bool   `json:"in_buffer"`
+	RolledBack bool   `json:"rolled_back"`
+}
+
+// TransportPusher is a WebSocket client that receives ZADT_VSP's pushes.
+// *DebugWebSocketClient and *AMDPWebSocketClient are.
+type TransportPusher interface {
+	PushEnabled() bool
+	AwaitPush(ctx context.Context, id string) (*WSResponse, error)
+	TakePush(id string) (*WSResponse, bool)
+}
+
+// transportPushID is the id of the push the job sends for jobCount.
+func transportPushID(jobCount string) string { return "push:transport:" + jobCount }
+
+func decodeTransportPush(r *WSResponse) *TransportPush {
+	if r == nil {
+		return nil
+	}
+	var p TransportPush
+	if err := json.Unmarshal(r.Data, &p); err != nil {
+		return nil
+	}
+	return &p
+}
+
+// transportSafetyPoll is how often a wait for the push also asks
+// add_status, in case the job ended without publishing (a dump, a kill).
+var transportSafetyPoll = 15 * time.Second
 
 // Terminal says the outcome will not change by waiting.
 func (s *TransportAddStatus) Terminal() bool {
@@ -526,18 +570,87 @@ func (c *Client) TransportAddStatus(ctx context.Context, ws TransportService, re
 	if st.Outcome == TransportQueued && !st.InBuffer {
 		st.Outcome = TransportUnknown
 	}
+	if p, ok := ws.(TransportPusher); ok && st.JobCount != "" {
+		if r, ok := p.TakePush(transportPushID(st.JobCount)); ok {
+			st.Push = decodeTransportPush(r)
+		}
+	}
 	st.Note = transportOutcomeNote(st.Request, st.System, st.Outcome, st.Job, st.JobCount)
 	return st, nil
 }
 
 // WaitTransportAdd waits until the add by job jobCount has a final outcome,
-// or ctx ends. It asks add_status every few seconds. When ctx ends first,
-// the last status is returned with the outcome unknown.
-func (c *Client) WaitTransportAdd(ctx context.Context, ws TransportService, request, jobCount string) (*TransportAddStatus, error) {
+// or ctx ends. When ws receives pushes, it waits for the one the job
+// publishes when it is done -- and asks add_status every so often in case
+// the job ended without publishing; otherwise it asks add_status every few
+// seconds. The outcome is always add_status's: a push alone does not make a
+// request "queued". If the connection drops while waiting, reconnect (when
+// given) supplies another for the status calls. When ctx ends first, the
+// last status is returned with the outcome unknown.
+func (c *Client) WaitTransportAdd(ctx context.Context, ws TransportService, request, jobCount string,
+	reconnect func(context.Context) (TransportService, error)) (*TransportAddStatus, error) {
+	p, ok := ws.(TransportPusher)
+	if !ok || !p.PushEnabled() || jobCount == "" {
+		return c.pollTransportAdd(ctx, ws, request, jobCount, nil, transportPollInterval)
+	}
+	type got struct {
+		r   *WSResponse
+		err error
+	}
+	pctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	pushed := make(chan got, 1)
+	go func() {
+		r, err := p.AwaitPush(pctx, transportPushID(jobCount))
+		pushed <- got{r, err}
+	}()
+	var last *TransportAddStatus
+	safety := time.NewTicker(transportSafetyPoll)
+	defer safety.Stop()
+	for {
+		select {
+		case g := <-pushed:
+			switch {
+			case g.err == nil:
+				// The job is done; the status call confirms (the job may
+				// still be ending, so ask until it says so).
+				return c.pollTransportAdd(ctx, ws, request, jobCount, decodeTransportPush(g.r), time.Second)
+			case errors.Is(g.err, ErrWebSocketClosed):
+				if reconnect == nil {
+					return unknownAfterWait(last, request, jobCount), g.err
+				}
+				ws2, err := reconnect(ctx)
+				if err != nil {
+					return unknownAfterWait(last, request, jobCount), fmt.Errorf("the connection dropped while waiting, and no new one: %w", err)
+				}
+				return c.pollTransportAdd(ctx, ws2, request, jobCount, nil, transportPollInterval)
+			default:
+				return unknownAfterWait(last, request, jobCount), g.err
+			}
+		case <-safety.C:
+			if st, err := c.TransportAddStatus(ctx, ws, request, jobCount); err == nil {
+				last = st
+				if st.Terminal() {
+					return st, nil
+				}
+			}
+		case <-ctx.Done():
+			return unknownAfterWait(last, request, jobCount), ctx.Err()
+		}
+	}
+}
+
+// pollTransportAdd asks add_status every interval until the outcome is final
+// or ctx ends.
+func (c *Client) pollTransportAdd(ctx context.Context, ws TransportService, request, jobCount string,
+	push *TransportPush, interval time.Duration) (*TransportAddStatus, error) {
 	var last *TransportAddStatus
 	for {
 		st, err := c.TransportAddStatus(ctx, ws, request, jobCount)
 		if err == nil {
+			if st.Push == nil {
+				st.Push = push
+			}
 			last = st
 			if st.Terminal() {
 				return st, nil
@@ -545,8 +658,12 @@ func (c *Client) WaitTransportAdd(ctx context.Context, ws TransportService, requ
 		}
 		select {
 		case <-ctx.Done():
-			return unknownAfterWait(last, request, jobCount), ctx.Err()
-		case <-time.After(transportPollInterval):
+			out := unknownAfterWait(last, request, jobCount)
+			if out.Push == nil {
+				out.Push = push
+			}
+			return out, ctx.Err()
+		case <-time.After(interval):
 		}
 	}
 }

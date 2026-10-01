@@ -89,7 +89,20 @@ and S_CTS_ADMI with EPS1 (files) and TADD (buffer) on the system.
 			wait, _ := cmd.Flags().GetDuration("wait")
 			if wait > 0 {
 				wctx, cancel := context.WithTimeout(ctx, wait)
-				st, _ := client.WaitTransportAdd(wctx, ws, res.Request, res.Job.Count)
+				// The job pushes its outcome to this connection when it is
+				// done; if the connection drops, a new one asks for it.
+				var extra []func()
+				reconnect := func(context.Context) (adt.TransportService, error) {
+					ws2, close2, err := transportServiceWS()
+					if err == nil {
+						extra = append(extra, close2)
+					}
+					return ws2, err
+				}
+				st, _ := client.WaitTransportAdd(wctx, ws, res.Request, res.Job.Count, reconnect)
+				for _, f := range extra {
+					f()
+				}
 				cancel()
 				out.Status = st
 			}
@@ -133,6 +146,9 @@ type uploadOutput struct {
 }
 
 func printAddStatus(st *adt.TransportAddStatus) {
+	if st.Push != nil {
+		fmt.Fprintf(os.Stderr, "  pushed by the job: %s (tp rc %s) %s\n", st.Push.Outcome, st.Push.TPRC, st.Push.Message)
+	}
 	fmt.Fprintf(os.Stderr, "  outcome: %s", st.Outcome)
 	if st.JobCount != "" {
 		fmt.Fprintf(os.Stderr, " (job %s %s, status %q)", st.Job, st.JobCount, st.JobStatus)

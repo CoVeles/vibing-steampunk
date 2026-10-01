@@ -3541,6 +3541,16 @@ func runInstallZadtVsp(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// The transport service's push channel. Without it uploads still work;
+	// their outcome is read with vsp transport status.
+	fmt.Fprintf(os.Stderr, "  AMC %s (transport push) ... ", embedded.AMCApplicationName)
+	if err := client.UpsertAMCApplication(ctx, embedded.AMCApplicationName, embedded.AMCApplicationDescription,
+		packageName, embedded.AMCApplicationDefinition); err != nil {
+		fmt.Fprintf(os.Stderr, "not set up (%v); upload outcomes are read with vsp transport status\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "OK\n")
+	}
+
 	fmt.Fprintf(os.Stderr, "\n")
 
 	// Summary

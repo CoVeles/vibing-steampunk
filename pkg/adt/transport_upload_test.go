@@ -566,7 +566,7 @@ func TestWaitTransportAdd(t *testing.T) {
 		{"outcome": "pending", "job_status": "R"},
 		{"outcome": "queued", "job_status": "F", "in_buffer": true, "system": "QAS"},
 	}
-	st, err := uploadClient(enabled()).WaitTransportAdd(context.Background(), ws, "XYZK900001", "47110001")
+	st, err := uploadClient(enabled()).WaitTransportAdd(context.Background(), ws, "XYZK900001", "47110001", nil)
 	if err != nil || st.Outcome != TransportQueued {
 		t.Fatalf("%+v %v", st, err)
 	}
@@ -576,7 +576,7 @@ func TestWaitTransportAdd(t *testing.T) {
 	ws.statuses = []map[string]any{{"outcome": "pending", "job_status": "R", "system": "QAS"}}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	st, err = uploadClient(enabled()).WaitTransportAdd(ctx, ws, "XYZK900001", "47110001")
+	st, err = uploadClient(enabled()).WaitTransportAdd(ctx, ws, "XYZK900001", "47110001", nil)
 	if err == nil || st.Outcome != TransportUnknown || !strings.Contains(st.Note, "STMS") || !strings.Contains(st.Note, "SM37") || !strings.Contains(st.Note, "47110001") {
 		t.Errorf("%+v %v", st, err)
 	}

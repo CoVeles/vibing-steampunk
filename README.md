@@ -493,7 +493,12 @@ that adds the request is released: status `pending` and the job's number.
 `transport_status` / `vsp transport status` then say `queued` only when the
 buffer file holds the request and the job is done, `pending` while it runs,
 `job_failed` when it ended without the request in the buffer, and `unknown`
-otherwise -- check STMS and the job in SM37 then. An upload committed but
+otherwise -- check STMS and the job in SM37 then. The job also pushes its
+outcome to the WebSocket that started the upload (AMC application
+`ZVSP_TRANSPORT`, channel `/buffer`, which `vsp install zadt-vsp` creates), so
+`vsp transport upload` learns it within a second or two instead of polling;
+the status call still decides, and without the AMC application the upload
+works the same, polling. An upload committed but
 never handed to a job (the session ends, or a new upload begins) has its files
 deleted again.
 

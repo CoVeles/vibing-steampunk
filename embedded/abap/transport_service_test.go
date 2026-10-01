@@ -382,8 +382,8 @@ func checkTransportJobProgram(src string) []string {
 	for _, st := range abapStatements(src) {
 		switch strings.ToUpper(st) {
 		case "", "REPORT ZVSP_TRANSPORT_BUFFER", "START-OF-SELECTION",
-			"PARAMETERS: P_REQ TYPE TRKORR, P_SHAC TYPE C LENGTH 44 LOWER CASE, P_SHAD TYPE C LENGTH 44 LOWER CASE",
-			"ZCL_VSP_TRANSPORT_SERVICE=>RUN_JOB( IV_REQUEST = P_REQ IV_COFILE_SHA = P_SHAC IV_DATA_SHA = P_SHAD )":
+			"PARAMETERS: P_REQ TYPE TRKORR, P_SHAC TYPE C LENGTH 44 LOWER CASE, P_SHAD TYPE C LENGTH 44 LOWER CASE, P_PUSH TYPE C LENGTH 60 LOWER CASE",
+			"ZCL_VSP_TRANSPORT_SERVICE=>RUN_JOB( IV_REQUEST = P_REQ IV_COFILE_SHA = P_SHAC IV_DATA_SHA = P_SHAD IV_PUSH_ID = P_PUSH )":
 		default:
 			bad = append(bad, "statement in ZVSP_TRANSPORT_BUFFER beyond calling run_job: "+st)
 		}
@@ -402,7 +402,7 @@ func TestTransportJobProgramIsAShim(t *testing.T) {
 	if len(checkTransportJobProgram(string(b)+"\nPARAMETERS p_sys TYPE sysysid.\n")) == 0 {
 		t.Error("the guard accepted another parameter in the job program")
 	}
-	if len(checkTransportJobProgram(strings.Replace(string(b), "iv_data_sha = p_shad ).", "iv_data_sha = p_shad ).\n  SUBMIT zother AND RETURN.", 1))) == 0 {
+	if len(checkTransportJobProgram(strings.Replace(string(b), "iv_push_id = p_push ).", "iv_push_id = p_push ).\n  SUBMIT zother AND RETURN.", 1))) == 0 {
 		t.Error("the guard accepted a SUBMIT in the job program")
 	}
 }
@@ -633,5 +633,53 @@ func TestTransportServiceLocksAndCheckedDeletes(t *testing.T) {
 				t.Errorf("%s deletes without the SHA-256 it wrote: %s", m, st)
 			}
 		}
+	}
+}
+
+// The push: each WebSocket binds to its own extension of AMC ZVSP_TRANSPORT
+// /buffer when it opens; the job publishes there, on that extension only,
+// after every outcome it logs.
+func TestTransportPush(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "src", "zcl_vsp_apc_handler.clas.abap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.ToUpper(strings.Join(methodStatements(abapStatements(string(b)), "IF_APC_WSP_EXTENSION~ON_START"), "\n"))
+	if !strings.Contains(start, "BIND_AMC_MESSAGE_CONSUMER( I_APPLICATION_ID = 'ZVSP_TRANSPORT' I_CHANNEL_ID = '/BUFFER' I_CHANNEL_EXTENSION_ID = CONV #( MV_SESSION_ID ) )") {
+		t.Error("on_start does not bind the WebSocket to its own extension of ZVSP_TRANSPORT /buffer")
+	}
+	if !strings.Contains(start, "CATCH CX_APC_ERROR") {
+		t.Error("on_start must survive a missing AMC application")
+	}
+
+	src := transportServiceSource(t)
+	stmts := abapStatements(src)
+	if n := strings.Count(strings.ToUpper(src), "CREATE_MESSAGE_PRODUCER("); n != 1 {
+		t.Errorf("%d AMC producers; want the one in publish", n)
+	}
+	pub := strings.ToUpper(strings.Join(methodStatements(stmts, "PUBLISH"), "\n"))
+	if !strings.Contains(pub, "I_APPLICATION_ID = C_AMC_APP I_CHANNEL_ID = C_AMC_CHANNEL I_CHANNEL_EXTENSION_ID = CONV #( IV_PUSH_ID )") {
+		t.Error("publish must send on ZVSP_TRANSPORT /buffer, on the uploading session's extension")
+	}
+	job := methodStatements(stmts, "RUN_JOB")
+	for i, st := range job {
+		if strings.ToUpper(st) == "JOB_LOG( LS_RES )" && (i+1 >= len(job) || !strings.HasPrefix(strings.ToUpper(job[i+1]), "PUBLISH( IS_RESULT = LS_RES")) {
+			t.Errorf("run_job logs an outcome at statement %d without publishing it", i)
+		}
+	}
+}
+
+// The AMC application lets the transport service send and the APC handler
+// bind, and no one else.
+func TestAMCApplicationDefinition(t *testing.T) {
+	d := AMCApplicationDefinition
+	for _, want := range []string{"<AMC_APPL>ZVSP_TRANSPORT</AMC_APPL>", "<CHANNEL_ID>/buffer</CHANNEL_ID>", "<MESSAGE_TYPE_ID>TEXT</MESSAGE_TYPE_ID>",
+		"<OBJ_NAME>ZCL_VSP_TRANSPORT_SERVICE</OBJ_NAME><ACTIVITY>S</ACTIVITY>", "<OBJ_NAME>ZCL_VSP_APC_HANDLER</OBJ_NAME><ACTIVITY>C</ACTIVITY>"} {
+		if !strings.Contains(d, want) {
+			t.Errorf("definition lacks %s", want)
+		}
+	}
+	if n := strings.Count(d, "<AMC_ADTCONTENTAUTHORITIES>"); n != 2 {
+		t.Errorf("%d authorities; want exactly two", n)
 	}
 }

@@ -45,6 +45,10 @@ CLASS zcl_vsp_transport_service DEFINITION
     CONSTANTS c_max_buffer_entries TYPE i VALUE 500.
     "! The background job (and its program) that runs the tp step.
     CONSTANTS c_job_name TYPE tbtcjob-jobname VALUE 'ZVSP_TRANSPORT_BUFFER'.
+    "! AMC application and channel the job publishes its outcome on; the
+    "! extension is the uploading WebSocket session's id.
+    CONSTANTS c_amc_app TYPE amc_application_id VALUE 'ZVSP_TRANSPORT'.
+    CONSTANTS c_amc_channel TYPE string VALUE `/buffer`.
 
     "! The background step: checks the request and that both files still have
     "! the SHA-256 the upload wrote, reads the buffer and adds the request;
@@ -53,7 +57,8 @@ CLASS zcl_vsp_transport_service DEFINITION
     CLASS-METHODS run_job
       IMPORTING iv_request    TYPE csequence
                 iv_cofile_sha TYPE csequence
-                iv_data_sha   TYPE csequence.
+                iv_data_sha   TYPE csequence
+                iv_push_id    TYPE csequence OPTIONAL.
 
     "! The request two file names belong to: ev_request is &lt;SID&gt;K&lt;nr&gt;.
     "! ev_error is set, and the rest initial, when they are not a pair.
@@ -147,7 +152,8 @@ CLASS zcl_vsp_transport_service DEFINITION
       RETURNING VALUE(rs_response) TYPE zif_vsp_service=>ty_response.
 
     METHODS handle_add_to_buffer
-      IMPORTING is_message         TYPE zif_vsp_service=>ty_message
+      IMPORTING iv_session_id      TYPE string
+                is_message         TYPE zif_vsp_service=>ty_message
       RETURNING VALUE(rs_response) TYPE zif_vsp_service=>ty_response.
 
     METHODS handle_show_buffer
@@ -167,7 +173,7 @@ CLASS zcl_vsp_transport_service DEFINITION
     "! a buffer job (abandoned: the session ended, or a new upload began).
     METHODS rollback_written.
 
-    "! The buffer file DIR_TRANS/buffer/<SID>, read through EPS. ev_exists is
+    "! The buffer file DIR_TRANS/buffer/&lt;SID&gt;, read through EPS. ev_exists is
     "! false only when a directory listing shows it absent.
     CLASS-METHODS read_buffer_file
       EXPORTING ev_exists TYPE abap_bool
@@ -185,12 +191,19 @@ CLASS zcl_vsp_transport_service DEFINITION
     CLASS-METHODS job_log
       IMPORTING is_result TYPE ty_job_result.
 
+    "! Publishes the job's outcome on AMC ZVSP_TRANSPORT /buffer, extension
+    "! iv_push_id: the uploading WebSocket gets it as a push message.
+    CLASS-METHODS publish
+      IMPORTING is_result  TYPE ty_job_result
+                iv_push_id TYPE csequence.
+
     "! Schedules ZVSP_TRANSPORT_BUFFER for one request, its step parameters
     "! being the request and the SHA-256 of its two files.
     CLASS-METHODS start_job
       IMPORTING iv_request    TYPE string
                 iv_cofile_sha TYPE string
                 iv_data_sha   TYPE string
+                iv_push_id    TYPE string OPTIONAL
       EXPORTING ev_jobcount   TYPE string
                 ev_error      TYPE string.
 
@@ -313,7 +326,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       WHEN 'upload_files'.
         rs_response = handle_upload_files( is_message ).
       WHEN 'add_to_buffer'.
-        rs_response = handle_add_to_buffer( is_message ).
+        rs_response = handle_add_to_buffer( iv_session_id = iv_session_id is_message = is_message ).
       WHEN 'show_buffer'.
         rs_response = handle_show_buffer( is_message ).
       WHEN 'download_files'.
@@ -659,6 +672,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     ENDLOOP.
 
     start_job( EXPORTING iv_request = lv_request iv_cofile_sha = ms_written-cofile_sha iv_data_sha = ms_written-data_sha
+                         iv_push_id = iv_session_id
                IMPORTING ev_jobcount = lv_jobcount ev_error = lv_error ).
     IF lv_error IS NOT INITIAL.
       " Nothing reached tp: the request is not in the buffer, so this
@@ -788,7 +802,8 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     lt_contents = VALUE #(
       ( selname = 'P_REQ'  kind = 'P' sign = 'I' option = 'EQ' low = iv_request )
       ( selname = 'P_SHAC' kind = 'P' sign = 'I' option = 'EQ' low = sha_b64( iv_cofile_sha ) )
-      ( selname = 'P_SHAD' kind = 'P' sign = 'I' option = 'EQ' low = sha_b64( iv_data_sha ) ) ).
+      ( selname = 'P_SHAD' kind = 'P' sign = 'I' option = 'EQ' low = sha_b64( iv_data_sha ) )
+      ( selname = 'P_PUSH' kind = 'P' sign = 'I' option = 'EQ' low = iv_push_id ) ).
     lt_text = VALUE #( ( langu = sy-langu report = 'ZVSP_TRANSPORT_BUFFER' variant = lv_variant vtext = |vsp upload { iv_request }| ) ).
     CALL FUNCTION 'RS_CREATE_VARIANT'
       EXPORTING
@@ -971,6 +986,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ls_res-code = `INVALID_PARAM`.
       ls_res-message = |'{ iv_request }' is not a request, or the SHA-256 values are not digests; nothing was done.|.
       job_log( ls_res ).
+    publish( is_result = ls_res iv_push_id = iv_push_id ).
       RETURN.
     ENDIF.
     lv_trkorr = ls_res-request.
@@ -989,6 +1005,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         ls_res-code = `FILES_CHANGED`.
         ls_res-message = |{ lv_error }; ADDTOBUFFER was not called, and no file was touched.|.
         job_log( ls_res ).
+    publish( is_result = ls_res iv_push_id = iv_push_id ).
         RETURN.
       ENDIF.
     ENDLOOP.
@@ -1001,6 +1018,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       ls_res-code = `LOCKED`.
       ls_res-message = |{ lv_error }; ADDTOBUFFER was not called.|.
       job_log( ls_res ).
+    publish( is_result = ls_res iv_push_id = iv_push_id ).
       RETURN.
     ENDIF.
 
@@ -1078,6 +1096,7 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     ENDIF.
     unlock_request( lv_trkorr ).
     job_log( ls_res ).
+    publish( is_result = ls_res iv_push_id = iv_push_id ).
   ENDMETHOD.
 
 
@@ -1296,6 +1315,47 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
         owner      = COND #( WHEN lines( lt_tok ) >= 3 THEN lt_tok[ 3 ] )
         raw        = lv_raw ) TO rt_lines.
     ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD publish.
+    IF iv_push_id IS INITIAL.
+      RETURN.
+    ENDIF.
+    DATA(lv_data) = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
+      ( zcl_vsp_utils=>json_str( iv_key = 'event' iv_value = `add_result` ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'request' iv_value = is_result-request ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'system' iv_value = is_result-system ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'job' iv_value = CONV #( c_job_name ) ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'job_count' iv_value = is_result-job ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'outcome' iv_value = is_result-outcome ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'code' iv_value = is_result-code ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'message' iv_value = is_result-message ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'tp_command' iv_value = is_result-tp_cmd ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'tp_rc' iv_value = is_result-tp_rc ) )
+      ( zcl_vsp_utils=>json_str( iv_key = 'tp_message' iv_value = is_result-tp_msg ) )
+      ( zcl_vsp_utils=>json_bool( iv_key = 'in_buffer' iv_value = is_result-in_buffer ) )
+      ( zcl_vsp_utils=>json_bool( iv_key = 'rolled_back' iv_value = is_result-rolled_back ) )
+    ) ) ).
+    " The frame the WebSocket client gets: a response-shaped message whose
+    " id names the job.
+    DATA(lv_message) = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
+      ( zcl_vsp_utils=>json_str( iv_key = 'id' iv_value = |push:transport:{ is_result-job }| ) )
+      ( zcl_vsp_utils=>json_bool( iv_key = 'success' iv_value = abap_true ) )
+      ( |"data":{ lv_data }| )
+    ) ) ).
+    TRY.
+        DATA(lo_producer) = CAST if_amc_message_producer_text(
+          cl_amc_channel_manager=>create_message_producer(
+            i_application_id       = c_amc_app
+            i_channel_id           = c_amc_channel
+            i_channel_extension_id = CONV #( iv_push_id ) ) ).
+        lo_producer->send( lv_message ).
+        COMMIT WORK.
+      CATCH cx_amc_error INTO DATA(lx_amc).
+        DATA(lv_line) = CONV char120( |VSP push not sent: { lx_amc->get_text( ) }| ).
+        MESSAGE lv_line TYPE 'S'.
+    ENDTRY.
   ENDMETHOD.
 
 
