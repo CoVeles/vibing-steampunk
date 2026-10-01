@@ -574,7 +574,10 @@ package (its row: URL, branch, settings) is kept unless `delete_repo: true`
 (`--delete-repo`) is given, and then it is unregistered only if it is offline
 and the package is empty after the deletes; ZADT_VSP checks both again. An
 online repository is never unregistered: `delete_repo` with one is refused
-before anything is deleted.
+before anything is deleted. A repository abapGit cannot open counts as
+online, and the package is never deleted while any repository is registered
+for it. Objects are deleted at their own ADT address (an include, a
+structure), looked up by name.
 
 A zip is refused above 20 MB, 50,000 entries or 200 MB unpacked (its
 declared sizes, checked by vsp and again by ZADT_VSP before abapGit unpacks

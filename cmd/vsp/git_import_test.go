@@ -3,6 +3,8 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,5 +76,26 @@ func TestGitCLI_RefusesBeforeContact(t *testing.T) {
 				t.Errorf("the system was contacted %d times before the refusal", n)
 			}
 		})
+	}
+}
+
+// Waiting that ends in a refusal, a lost connection or Ctrl-C fails with
+// the job number; --wait running out is a pending result.
+func TestGitWaitError(t *testing.T) {
+	if err := gitWaitError("ZVSP_GIT_IMPORT", "12345678", nil, nil); err != nil {
+		t.Errorf("no error: %v", err)
+	}
+	if err := gitWaitError("ZVSP_GIT_IMPORT", "12345678", context.DeadlineExceeded, nil); err != nil {
+		t.Errorf("--wait ran out: %v", err)
+	}
+	for _, c := range []struct{ werr, parent error }{
+		{context.Canceled, context.Canceled},
+		{context.DeadlineExceeded, context.Canceled},
+		{errors.New("git.import_status: NOT_YOUR_JOB: no"), nil},
+	} {
+		err := gitWaitError("ZVSP_GIT_IMPORT", "12345678", c.werr, c.parent)
+		if err == nil || !strings.Contains(err.Error(), "12345678") || !errors.Is(err, c.werr) {
+			t.Errorf("%v / %v: %v", c.werr, c.parent, err)
+		}
 	}
 }

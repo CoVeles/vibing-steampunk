@@ -85,7 +85,7 @@ func (s *Server) handleGitImportZip(ctx context.Context, request mcp.CallToolReq
 	if err != nil {
 		return newToolResultError(err.Error()), nil
 	}
-	if err := s.adtClient.CheckGitImportPlan(plan); err != nil {
+	if err = s.adtClient.CheckGitImportPlan(plan); err != nil {
 		return newToolResultError(err.Error()), nil
 	}
 

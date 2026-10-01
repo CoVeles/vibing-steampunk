@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -126,12 +127,14 @@ func AnalyzeGitZip(data []byte, pkg string) (*GitZipPlan, error) {
 	if len(zr.File) > gitZipMaxEntries {
 		return nil, fmt.Errorf("the zip has %d entries, over the %d limit", len(zr.File), gitZipMaxEntries)
 	}
+	// Checked before each addition, so a declared size near 2^64 cannot
+	// wrap the sum back under the limit.
 	var unzipped uint64
 	for _, f := range zr.File {
-		unzipped += f.UncompressedSize64
-		if unzipped > gitZipMaxUnzipped {
+		if f.UncompressedSize64 > gitZipMaxUnzipped-unzipped {
 			return nil, fmt.Errorf("the zip unpacks to more than %d bytes (200 MB), the limit", gitZipMaxUnzipped)
 		}
+		unzipped += f.UncompressedSize64
 	}
 
 	var dot *zip.File
@@ -518,7 +521,7 @@ func (c *Client) StartGitImport(ctx context.Context, ws GitService, zipData []by
 	if err != nil {
 		return nil, err
 	}
-	if err := c.CheckGitImportPlan(plan); err != nil {
+	if err = c.CheckGitImportPlan(plan); err != nil {
 		return nil, err
 	}
 	repoName := strings.TrimSpace(opts.RepoName)
@@ -532,6 +535,11 @@ func (c *Client) StartGitImport(ctx context.Context, ws GitService, zipData []by
 	if err != nil {
 		return nil, err
 	}
+
+	// One upload at a time per connection: ZADT_VSP holds one assembly per
+	// session, and an MCP server shares its WebSocket between calls.
+	unlock := lockGitUpload(ws)
+	defer unlock()
 
 	var begin gitBeginAnswer
 	if err := gitCall(ctx, ws, "import_zip", map[string]any{
@@ -597,6 +605,7 @@ func (c *Client) StartGitImport(ctx context.Context, ws GitService, zipData []by
 		started.Note = strings.TrimSpace(fmt.Sprintf("the import may be running: the commit got no answer (%v). Look for job %s%s in SM37, "+
 			"and read its outcome with git_import_status (vsp git import-status <job number>) before importing again. %s",
 			err, gitImportJobName, owner, started.Note))
+		c.InvalidateCache()
 		return started, &GitImportUnconfirmedError{Err: err, Started: started}
 	}
 	started.Job = orDefaultString(commit.Job, gitImportJobName)
@@ -614,6 +623,22 @@ type GitImportUnconfirmedError struct {
 
 func (e *GitImportUnconfirmedError) Error() string { return e.Started.Note }
 func (e *GitImportUnconfirmedError) Unwrap() error { return e.Err }
+
+// gitUploads serializes begin..commit per git service connection.
+var gitUploads sync.Map // GitService -> *sync.Mutex
+
+func lockGitUpload(ws GitService) func() {
+	if ws == nil {
+		return func() {}
+	}
+	m, _ := gitUploads.LoadOrStore(ws, &sync.Mutex{})
+	mu, ok := m.(*sync.Mutex)
+	if !ok {
+		return func() {}
+	}
+	mu.Lock()
+	return mu.Unlock
+}
 
 func orDefaultString(v, d string) string {
 	if v == "" {
@@ -799,6 +824,11 @@ func (c *Client) GitImportStatus(ctx context.Context, ws GitService, jobCount st
 		st.State = GitJobUnknown
 	}
 	st.Note = gitStatusNote(st)
+	if st.Terminal() {
+		// The job wrote through abapGit, not through this client's HTTP
+		// requests: whatever the response cache holds may be stale.
+		c.InvalidateCache()
+	}
 	return st, nil
 }
 
@@ -962,15 +992,22 @@ func ParseGitDeleteItems(raw any) ([]GitDeleteItem, error) {
 // second result is false for a type there is no ADT delete for here.
 func GitObjectURL(objType, name string) (string, bool) {
 	enc := url.PathEscape(strings.ToLower(name))
+	// Classic objects in a namespace are addressed in upper case: SAP does
+	// not recognize /demo/cl_x (see GetObjectURL); RAP and DDIC sources
+	// stay lower case.
+	classic := enc
+	if strings.HasPrefix(name, "/") {
+		classic = url.PathEscape(strings.ToUpper(name))
+	}
 	switch strings.ToUpper(objType) {
 	case "PROG":
-		return "/sap/bc/adt/programs/programs/" + enc, true
+		return "/sap/bc/adt/programs/programs/" + classic, true
 	case "CLAS":
-		return "/sap/bc/adt/oo/classes/" + enc, true
+		return "/sap/bc/adt/oo/classes/" + classic, true
 	case "INTF":
-		return "/sap/bc/adt/oo/interfaces/" + enc, true
+		return "/sap/bc/adt/oo/interfaces/" + classic, true
 	case "FUGR":
-		return "/sap/bc/adt/functions/groups/" + enc, true
+		return "/sap/bc/adt/functions/groups/" + classic, true
 	case "DEVC":
 		return GetObjectURL(ObjectTypePackage, name, ""), true
 	case "TABL":
@@ -1009,10 +1046,21 @@ type GitPackageObject struct {
 
 // GitRepoInfo is the abapGit repository registered for a package.
 type GitRepoInfo struct {
-	Key     string `json:"key"`
-	Name    string `json:"name"`
+	Key  string `json:"key"`
+	Name string `json:"name"`
+	// Offline is true only when abapGit said so; State is offline, online
+	// or unknown (the row is there, abapGit could not open the repository).
+	// Unknown is treated as online: never unregistered.
 	Offline bool   `json:"offline"`
+	State   string `json:"state"`
 }
+
+// Repository states.
+const (
+	GitRepoOffline = "offline"
+	GitRepoOnline  = "online"
+	GitRepoUnknown = "unknown"
+)
 
 // GitPackageContents is a package's TADIR rows, subpackages and repository.
 type GitPackageContents struct {
@@ -1066,6 +1114,7 @@ type gitPackageAnswer struct {
 		Key     string `json:"key"`
 		Name    string `json:"name"`
 		Offline bool   `json:"offline"`
+		State   string `json:"repo_state"`
 	} `json:"repo"`
 }
 
@@ -1089,7 +1138,19 @@ func (c *Client) GitPackageObjects(ctx context.Context, ws GitService, pkg strin
 		out.Subpackages = append(out.Subpackages, t(s))
 	}
 	if a.Repo != nil {
-		out.Repo = &GitRepoInfo{Key: t(a.Repo.Key), Name: t(a.Repo.Name), Offline: a.Repo.Offline}
+		// Fail closed: offline only when the state says so. An answer
+		// without a state (an older ZADT_VSP) falls back to its flag.
+		st := strings.ToLower(t(a.Repo.State))
+		switch {
+		case st == GitRepoOffline || st == GitRepoOnline:
+		case st == "" && a.Repo.Offline:
+			st = GitRepoOffline
+		case st == "":
+			st = GitRepoOnline
+		default:
+			st = GitRepoUnknown
+		}
+		out.Repo = &GitRepoInfo{Key: t(a.Repo.Key), Name: t(a.Repo.Name), Offline: st == GitRepoOffline, State: st}
 	}
 	return out, nil
 }
@@ -1159,24 +1220,56 @@ func (c *Client) CheckGitDelete(pkg, transport string) error {
 // the TRDIR entry of a deleted program stayed in SM12 for as long as the ADT
 // session lived, and abapGit refused to import the program again ("is
 // locked"); the UNLOCK after the DELETE releases it. The note says when it
-// could not.
-func (c *Client) deleteGated(ctx context.Context, objectURL, transport string) (string, error) {
+// could not. retry is false when a failed DELETE also left its lock behind:
+// the error carries the SM12 advice, and trying again would only hide it.
+func (c *Client) deleteGated(ctx context.Context, objectURL, transport string) (note string, retry bool, err error) {
 	gctx, err := c.PrepareDelete(ctx, objectURL, transport)
 	if err != nil {
-		return "", err
+		return "", true, err
 	}
 	lock, err := c.LockObject(gctx, objectURL, "MODIFY", transport)
 	if err != nil {
-		return "", fmt.Errorf("locking %s: %w", objectURL, err)
+		return "", true, fmt.Errorf("locking %s: %w", objectURL, err)
 	}
-	if err := c.DeleteObject(gctx, objectURL, lock.LockHandle, transport); err != nil {
-		_ = c.releaseLockAfterFailure(gctx, objectURL, lock.LockHandle)
-		return "", err
+	if derr := c.DeleteObject(gctx, objectURL, lock.LockHandle, transport); derr != nil {
+		if uerr := c.releaseLockAfterFailure(gctx, objectURL, lock.LockHandle); uerr != nil {
+			return "", false, fmt.Errorf("%w -- %s", derr, strandedLockAdvice(objectURL, uerr))
+		}
+		return "", true, derr
 	}
 	if uerr := c.releaseLockAfterFailure(gctx, objectURL, lock.LockHandle); uerr != nil {
-		return "deleted; its lock entry may stay in SM12 until the ADT session ends: " + uerr.Error(), nil
+		return "deleted; its lock entry may stay in SM12 until the ADT session ends: " + uerr.Error(), true, nil
 	}
-	return "", nil
+	return "", true, nil
+}
+
+// gitDeleteURL is the ADT URI of the object TADIR lists as type/name in
+// pkg. The TADIR type alone does not name the ADT collection -- a PROG may
+// be an include (/programs/includes), a TABL a structure or an append
+// (/ddic/structures) -- so the object is looked up by its exact name, and
+// the hit of that TADIR type in that package gives the URI. Without such a
+// hit, the collection the type usually lives in.
+func (c *Client) gitDeleteURL(ctx context.Context, objType, name, pkg string) (string, bool) {
+	fallback, ok := GitObjectURL(objType, name)
+	if !ok {
+		return "", false
+	}
+	hits, _, err := c.SearchObjectExact(ctx, name, objType, 0)
+	if err != nil {
+		return fallback, true
+	}
+	for _, h := range hits {
+		main, _, _ := strings.Cut(strings.ToUpper(strings.TrimSpace(h.Type)), "/")
+		u := strings.TrimSpace(h.URI)
+		if main != strings.ToUpper(objType) || !strings.HasPrefix(u, "/sap/bc/adt/") || strings.ContainsAny(u, "?#") {
+			continue
+		}
+		if h.PackageName != "" && !strings.EqualFold(strings.TrimSpace(h.PackageName), pkg) {
+			continue
+		}
+		return u, true
+	}
+	return fallback, true
 }
 
 // DeleteGitObjects deletes exactly the given objects of pkg, then -- only
@@ -1215,8 +1308,12 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 		return nil, fmt.Errorf("package %s has more TADIR rows than one read returns; delete in SE80", p)
 	}
 	if deleteRepo && contents.Repo != nil && !contents.Repo.Offline {
-		return nil, fmt.Errorf("package %s has online abapGit repository %s %q: vsp never unregisters an online repository (its URL, branch and settings); "+
-			"remove it in abapGit if that is wanted, and call again without delete_repo. Nothing was deleted", p, contents.Repo.Key, contents.Repo.Name)
+		what := "online abapGit repository"
+		if contents.Repo.State == GitRepoUnknown {
+			what = "an abapGit repository abapGit could not open (state unknown, treated as online),"
+		}
+		return nil, fmt.Errorf("package %s has %s %s %q: vsp never unregisters an online repository (its URL, branch and settings); "+
+			"remove it in abapGit if that is wanted, and call again without delete_repo. Nothing was deleted", p, what, contents.Repo.Key, contents.Repo.Name)
 	}
 	res := &GitDeleteResult{Package: p, Repo: contents.Repo}
 
@@ -1227,7 +1324,7 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 	var queue []todo
 	for _, it := range items {
 		o := GitDeleteOutcome{Type: it.Type, Name: it.Name}
-		u, ok := GitObjectURL(it.Type, it.Name)
+		_, ok := GitObjectURL(it.Type, it.Name)
 		switch {
 		case it.Type == "DEVC":
 			o.Status, o.Reason = "skipped", "a package is not deleted as an item: the package itself goes last, and only when empty; a subpackage never"
@@ -1236,6 +1333,8 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 		case !ok:
 			o.Status, o.Reason = "failed", fmt.Sprintf("no ADT delete for type %s here; delete it in SE80", it.Type)
 		default:
+			// In the package's TADIR: now its real ADT address.
+			u, _ := c.gitDeleteURL(ctx, it.Type, it.Name, p)
 			queue = append(queue, todo{len(res.Objects), u})
 		}
 		res.Objects = append(res.Objects, o)
@@ -1244,10 +1343,12 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 	for round := 0; round < 2 && len(queue) > 0; round++ {
 		var again []todo
 		for _, q := range queue {
-			note, err := c.deleteGated(ctx, q.url, transport)
-			if err != nil {
-				res.Objects[q.i].Status, res.Objects[q.i].Reason = "failed", err.Error()
-				again = append(again, q)
+			note, retry, derr := c.deleteGated(ctx, q.url, transport)
+			if derr != nil {
+				res.Objects[q.i].Status, res.Objects[q.i].Reason = "failed", derr.Error()
+				if retry {
+					again = append(again, q)
+				}
 				continue
 			}
 			res.Objects[q.i].Status, res.Objects[q.i].Reason = "deleted", note
@@ -1276,6 +1377,8 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 	switch {
 	case repo == nil:
 		res.RepoNote = "no abapGit repository is registered for " + p
+	case repo.State == GitRepoUnknown:
+		res.RepoNote = fmt.Sprintf("kept: abapGit could not open repository %s (state unknown, treated as online); vsp never unregisters one", repo.Key)
 	case !repo.Offline:
 		res.RepoNote = fmt.Sprintf("kept: %s is an online repository; vsp never unregisters one", repo.Key)
 	case !deleteRepo:
@@ -1316,7 +1419,21 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 		res.PackageNote = fmt.Sprintf("kept: abapGit repository %s is still registered for it", repo.Key)
 		return res, nil
 	}
-	note, err := c.deleteGated(ctx, GetObjectURL(ObjectTypePackage, p, ""), transport)
+	// Once more, just before: a package is never deleted while ZADT_VSP
+	// sees a repository row for it, or anything in it.
+	last, err := c.GitPackageObjects(ctx, ws, p)
+	if err != nil {
+		res.PackageNote = "kept: its contents could not be read again: " + err.Error()
+		return res, err
+	}
+	if last.Repo != nil || len(last.Remaining()) > 0 || last.Truncated || !last.Exists {
+		res.PackageNote = "kept: it is no longer empty, or an abapGit repository is registered for it"
+		if last.Repo != nil {
+			res.PackageNote = fmt.Sprintf("kept: abapGit repository %s is registered for it", last.Repo.Key)
+		}
+		return res, nil
+	}
+	note, _, err := c.deleteGated(ctx, GetObjectURL(ObjectTypePackage, p, ""), transport)
 	if err != nil {
 		res.PackageNote = "not deleted: " + err.Error()
 		return res, err

@@ -105,10 +105,13 @@ as for any write); a local ($) package takes none.
 			return err
 		}
 		out := gitImportOutput{Started: started}
+		var waitErr error
 		if wait, _ := cmd.Flags().GetDuration("wait"); wait > 0 {
 			wctx, cancel := context.WithTimeout(ctx, wait)
-			out.Status, _ = client.WaitGitImport(wctx, ws, started.JobCount)
+			var werr error
+			out.Status, werr = client.WaitGitImport(wctx, ws, started.JobCount)
 			cancel()
+			waitErr = gitWaitError(started.Job, started.JobCount, werr, ctx.Err())
 		}
 		if asJSON, _ := cmd.Flags().GetBool("json"); asJSON {
 			if err := printJSON(out); err != nil {
@@ -129,6 +132,9 @@ as for any write); a local ($) package takes none.
 				fmt.Fprintf(os.Stderr, "  outcome: vsp git import-status %s\n", started.JobCount)
 			}
 		}
+		if waitErr != nil {
+			return waitErr
+		}
 		return gitImportExit(out.Status)
 	},
 }
@@ -137,6 +143,17 @@ as for any write); a local ($) package takes none.
 type gitImportOutput struct {
 	Started *adt.GitImportStarted `json:"started"`
 	Status  *adt.GitImportStatus  `json:"status,omitempty"`
+}
+
+// gitWaitError is what waiting for the job ended with: nil when it ended
+// normally or --wait ran out (a pending result), else the error with the job
+// number -- a refusal, a lost connection, or Ctrl-C (parent is the
+// command's own context error).
+func gitWaitError(job, jobCount string, werr, parent error) error {
+	if werr == nil || (errors.Is(werr, context.DeadlineExceeded) && parent == nil) {
+		return nil
+	}
+	return fmt.Errorf("waiting for job %s %s: %w -- the import may still be running: vsp git import-status %s", job, jobCount, werr, jobCount)
 }
 
 // gitImportExit fails the command on anything but an import that ran.

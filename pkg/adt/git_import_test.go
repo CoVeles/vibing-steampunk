@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -90,7 +91,7 @@ func TestAnalyzeGitZipFolderLogics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got []string
+	got := make([]string, 0, len(plan.Objects))
 	for _, o := range plan.Objects {
 		got = append(got, o.Type+" "+o.Name+" "+o.Package)
 	}
@@ -150,6 +151,20 @@ func TestAnalyzeGitZipRefuses(t *testing.T) {
 	_ = w.Close()
 	if _, err := AnalyzeGitZip(bomb.Bytes(), "$ZDEMO"); err == nil || !strings.Contains(err.Error(), "200 MB") {
 		t.Errorf("300 MB unpacked: %v", err)
+	}
+
+	// A declared size near 2^64 must not wrap the sum back under the limit.
+	var wrap bytes.Buffer
+	w = zip.NewWriter(&wrap)
+	f, _ = w.Create(".abapgit.xml")
+	_, _ = f.Write([]byte(dotAbapgitXML("/src/", "PREFIX")))
+	f, _ = w.Create("src/zdemo_a.prog.abap")
+	_, _ = f.Write(bytes.Repeat([]byte("x"), 100))
+	raw, _ = w.CreateRaw(&zip.FileHeader{Name: "src/zdemo_b.prog.abap", Method: zip.Deflate, CompressedSize64: 2, UncompressedSize64: math.MaxUint64 - 49})
+	_, _ = raw.Write([]byte{3, 0})
+	_ = w.Close()
+	if _, err := AnalyzeGitZip(wrap.Bytes(), "$ZDEMO"); err == nil || !strings.Contains(err.Error(), "200 MB") {
+		t.Errorf("a size that wraps the sum: %v", err)
 	}
 
 	big := make([]byte, GitZipMaxBytes+1)
@@ -250,10 +265,9 @@ func TestCheckGitImportPlanRefusesALocalTransportableMix(t *testing.T) {
 // --- the git domain, faked ----------------------------------------------------
 
 type fakeGitWS struct {
-	mu      sync.Mutex
-	calls   []wsCall
-	client  string
-	pkgName string
+	mu     sync.Mutex
+	calls  []wsCall
+	client string
 	// assembled zip
 	got []byte
 	// package_objects answers, in turn (the last one repeats)
@@ -341,7 +355,7 @@ func (f *fakeGitWS) SendDomainRequest(_ context.Context, domain, action string, 
 func (f *fakeGitWS) actions() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []string
+	out := make([]string, 0, len(f.calls))
 	for _, c := range f.calls {
 		a := c.Action
 		if s, ok := c.Params["step"].(string); ok {
@@ -582,7 +596,7 @@ func TestCheckGitDelete(t *testing.T) {
 }
 
 func pkgContents(pkg string, objs [][2]string, subs []string, repo bool) map[string]any {
-	var o []map[string]any
+	o := make([]map[string]any, 0, len(objs))
 	for _, x := range objs {
 		dev := pkg
 		if strings.HasPrefix(x[1], "@") { // in another package
@@ -594,6 +608,19 @@ func pkgContents(pkg string, objs [][2]string, subs []string, repo bool) map[str
 	if repo {
 		m["repo"] = map[string]any{"key": "000000000001", "name": "demo", "offline": true}
 	}
+	return m
+}
+
+// unknownRepo gives package contents a repository abapGit could not open.
+func unknownRepo(m map[string]any) map[string]any {
+	m["repo"] = map[string]any{"key": "000000000003", "name": "000000000003", "offline": false, "repo_state": "unknown"}
+	return m
+}
+
+// noState gives package contents a repository as an older ZADT_VSP reports
+// it: no repo_state.
+func noState(m map[string]any, offline bool) map[string]any {
+	m["repo"] = map[string]any{"key": "000000000004", "name": "old", "offline": offline}
 	return m
 }
 
@@ -714,10 +741,21 @@ func TestDeleteGitObjectsRepositoryRules(t *testing.T) {
 			"", 1, "package_objects,package_objects", false, false, "online"},
 		{"offline repository, no delete_repo: kept, and the package with it", []map[string]any{full(), empty()}, false,
 			"", 1, "package_objects,package_objects", false, false, "delete_repo"},
-		{"offline repository, delete_repo, package empty: unregistered, then the package", []map[string]any{full(), empty()}, true,
-			"", 2, "package_objects,package_objects,delete_repo", true, true, ""},
+		{"offline repository, delete_repo, package empty: unregistered, then the package", []map[string]any{full(), empty(), pkgContents("$ZDEMO", nil, nil, false)}, true,
+			"", 2, "package_objects,package_objects,delete_repo,package_objects", true, true, ""},
 		{"no repository: the package goes", []map[string]any{pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}}, nil, false), pkgContents("$ZDEMO", nil, nil, false)}, false,
-			"", 2, "package_objects,package_objects", false, true, "no abapGit repository"},
+			"", 2, "package_objects,package_objects,package_objects", false, true, "no abapGit repository"},
+		// abapGit could not open the repository: its state is unknown, and
+		// unknown is online -- never unregistered, the package never deleted.
+		{"unknown repository, delete_repo: refused before anything", []map[string]any{unknownRepo(full())}, true,
+			"state unknown", 0, "package_objects", false, false, ""},
+		{"unknown repository, no delete_repo: kept, and the package with it", []map[string]any{unknownRepo(full()), unknownRepo(empty())}, false,
+			"", 1, "package_objects,package_objects", false, false, "state unknown"},
+		{"an older ZADT_VSP without a state, offline false: online", []map[string]any{noState(full(), false)}, true,
+			"never unregisters", 0, "package_objects", false, false, ""},
+		// A repository registered between the reads keeps the package.
+		{"a repository appears before the package delete", []map[string]any{pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}}, nil, false), pkgContents("$ZDEMO", nil, nil, false), unknownRepo(empty())}, false,
+			"", 1, "package_objects,package_objects,package_objects", false, false, "no abapGit repository"},
 	}
 	for _, c := range cases {
 		rec := &adtRecorder{}
@@ -756,6 +794,7 @@ func TestDeleteGitObjectsRemovesTheEmptyPackageLast(t *testing.T) {
 	ws := &fakeGitWS{contents: []map[string]any{
 		pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}}, nil, true),
 		pkgContents("$ZDEMO", nil, nil, true),
+		pkgContents("$ZDEMO", nil, nil, false),
 	}}
 	res, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "", true)
 	if err != nil {
@@ -765,7 +804,7 @@ func TestDeleteGitObjectsRemovesTheEmptyPackageLast(t *testing.T) {
 	if len(d) != 2 || d[0] != uris["ZDEMO_REPORT"] || d[1] != "/sap/bc/adt/packages/$ZDEMO" || !res.PackageDeleted {
 		t.Errorf("DELETEs %v, package deleted %t", d, res.PackageDeleted)
 	}
-	if acts := strings.Join(ws.actions(), ","); acts != "package_objects,package_objects,delete_repo" {
+	if acts := strings.Join(ws.actions(), ","); acts != "package_objects,package_objects,delete_repo,package_objects" {
 		t.Errorf("git actions %s", acts)
 	}
 	// Each DELETE is followed by an UNLOCK of the same object: a DELETE
@@ -840,10 +879,139 @@ func TestGitObjectURL(t *testing.T) {
 			t.Errorf("%s: %q", typ, got)
 		}
 	}
-	if u, _ := GitObjectURL("CLAS", "/DEMO/CL_X"); u != "/sap/bc/adt/oo/classes/%2Fdemo%2Fcl_x" {
-		t.Errorf("namespaced: %s", u)
+	// SAP addresses classic objects in a namespace in upper case; RAP and
+	// DDIC sources stay lower case.
+	for typ, want := range map[string]string{
+		"CLAS": "/sap/bc/adt/oo/classes/%2FDEMO%2FCL_X",
+		"PROG": "/sap/bc/adt/programs/programs/%2FDEMO%2FCL_X",
+		"INTF": "/sap/bc/adt/oo/interfaces/%2FDEMO%2FCL_X",
+		"FUGR": "/sap/bc/adt/functions/groups/%2FDEMO%2FCL_X",
+		"DDLS": "/sap/bc/adt/ddic/ddl/sources/%2Fdemo%2Fcl_x",
+	} {
+		if u, _ := GitObjectURL(typ, "/DEMO/CL_X"); u != want {
+			t.Errorf("namespaced %s: %s, want %s", typ, u, want)
+		}
 	}
 	if _, ok := GitObjectURL("SUSC", "ZDEMO"); ok {
 		t.Error("a type with no ADT delete here claimed one")
+	}
+}
+
+// A DELETE that fails and leaves its lock behind is not tried again: the
+// error keeps the SM12 advice.
+func TestDeleteGitObjectsKeepsAStrandedLock(t *testing.T) {
+	uris := map[string]string{"ZDEMO_REPORT": "/sap/bc/adt/programs/programs/zdemo_report"}
+	pkgOf := map[string]string{"ZDEMO_REPORT": "$ZDEMO"}
+	base := gitDeleteRoute(pkgOf, uris, map[string]bool{"ZDEMO_REPORT": true})
+	route := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Get("_action") == "UNLOCK" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		base(w, r)
+	}
+	rec := &adtRecorder{}
+	cl := newStubbedClient(t, rec, route, WithAllowedPackages("$ZDEMO"))
+	ws := &fakeGitWS{contents: []map[string]any{pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_REPORT"}}, nil, false)}}
+	res, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_REPORT"}}, "", false)
+	if err == nil || res == nil || !strings.Contains(err.Error(), "LOCKED") || !strings.Contains(res.Objects[0].Reason, "LOCKED") {
+		t.Fatalf("got %+v, %v", res, err)
+	}
+	if n := len(deletedPaths(rec.snapshot())); n != 1 {
+		t.Errorf("%d DELETEs; a delete that stranded its lock must not be tried again", n)
+	}
+}
+
+// The ADT address comes from the object itself, not from its TADIR type:
+// a PROG that is an include and a TABL that is a structure are deleted at
+// their own collections.
+func TestDeleteGitObjectsResolvesTheADTAddress(t *testing.T) {
+	type obj struct{ typ, adtType, uri string }
+	objs := map[string]obj{
+		"ZDEMO_INCL":   {"PROG", "PROG/I", "/sap/bc/adt/programs/includes/zdemo_incl"},
+		"ZDEMO_STRUCT": {"TABL", "TABL/DS", "/sap/bc/adt/ddic/structures/zdemo_struct"},
+	}
+	route := func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "informationsystem/search"):
+			q := strings.ToUpper(strings.Trim(r.URL.Query().Get("query"), "*"))
+			var b strings.Builder
+			b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">`)
+			if o, ok := objs[q]; ok {
+				fmt.Fprintf(&b, `<adtcore:objectReference adtcore:uri="%s" adtcore:type="%s" adtcore:name="%s" adtcore:packageName="$ZDEMO"/>`, o.uri, o.adtType, q)
+			}
+			b.WriteString(`</adtcore:objectReferences>`)
+			_, _ = io.WriteString(w, b.String())
+		case r.Method == http.MethodPost && r.URL.Query().Get("_action") == "LOCK":
+			w.Header().Set("Content-Type", "application/vnd.sap.as+xml")
+			_, _ = io.WriteString(w, testLockXML)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}
+	rec := &adtRecorder{}
+	cl := newStubbedClient(t, rec, route, WithAllowedPackages("$ZDEMO"))
+	ws := &fakeGitWS{contents: []map[string]any{
+		pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_INCL"}, {"TABL", "ZDEMO_STRUCT"}}, nil, false),
+		pkgContents("$ZDEMO", [][2]string{{"PROG", "ZDEMO_KEEP"}}, nil, false),
+	}}
+	if _, err := cl.DeleteGitObjects(context.Background(), ws, "$ZDEMO", []GitDeleteItem{{"PROG", "ZDEMO_INCL"}, {"TABL", "ZDEMO_STRUCT"}}, "", false); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(deletedPaths(rec.snapshot()), ",")
+	if want := objs["ZDEMO_INCL"].uri + "," + objs["ZDEMO_STRUCT"].uri; got != want {
+		t.Errorf("DELETEs %s, want %s", got, want)
+	}
+}
+
+// An import's writes do not pass this client's HTTP cache: a terminal
+// status empties it, a pending one does not.
+func TestGitImportStatusInvalidatesTheCache(t *testing.T) {
+	store := NewMemoryResponseStore()
+	cl := NewClient("http://sap.invalid", "TESTUSER", "pw", WithCacheStore(store, time.Hour))
+	for _, c := range []struct {
+		outcome string
+		left    int
+	}{{"pending", 1}, {"failed", 0}, {"done", 0}} {
+		store.Put("GET /sap/bc/adt/programs/programs/zdemo/source/main", &CachedResponse{StatusCode: 200, Expires: time.Now().Add(time.Hour)})
+		st := map[string]any{"outcome": c.outcome, "job_found": true}
+		if c.outcome == "done" {
+			st["result"] = map[string]any{"outcome": "imported", "package": "$ZDEMO"}
+		}
+		if _, err := cl.GitImportStatus(context.Background(), &fakeGitWS{status: []map[string]any{st}}, "12345678"); err != nil {
+			t.Fatal(err)
+		}
+		if n := store.Len(); n != c.left {
+			t.Errorf("%s: %d cache entries left, want %d", c.outcome, n, c.left)
+		}
+		store.Clear()
+	}
+}
+
+// Two imports on one connection do not interleave: ZADT_VSP holds one
+// upload per session.
+func TestStartGitImportOneUploadAtATime(t *testing.T) {
+	ws := &fakeGitWS{}
+	cl := NewClient("http://sap.invalid", "TESTUSER", "pw")
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = cl.StartGitImport(context.Background(), ws, demoZip(t, "PREFIX"), GitImportOptions{Package: "$ZDEMO"})
+		}()
+	}
+	wg.Wait()
+	open := false
+	for _, a := range ws.actions() {
+		switch a {
+		case "import_zip:begin":
+			if open {
+				t.Fatalf("a begin inside another upload: %v", ws.actions())
+			}
+			open = true
+		case "import_zip:commit", "import_zip:abort":
+			open = false
+		}
 	}
 }
