@@ -284,20 +284,6 @@ func TestLockContext_AStuckStatefulRequestHoldsUpNobody(t *testing.T) {
 	}
 }
 
-// waitQueued returns once a writer is queued for (or holds) g: from then on
-// tryShared fails.
-func waitQueued(t *testing.T, g contextGate) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for g.tryShared() {
-		g.releaseShared()
-		if time.Now().After(deadline) {
-			t.Fatal("the writer never queued for the gate")
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
 // lockAsync starts g.lock(ctx) and returns its result channel.
 func lockAsync(g contextGate, ctx context.Context) <-chan error {
 	done := make(chan error, 1)
@@ -412,80 +398,86 @@ func TestContextGate_WritersAreServedInArrivalOrder(t *testing.T) {
 // A stateless request that arrives while a request into the context waits
 // for the gate does not wait behind it: it goes isolated, without the
 // context's sap-contextid.
+//
+// The server is served in-process so the test can run in a synctest bubble:
+// synctest.Wait shows the writer parked on the gate, and the stateless
+// request finishing without the gate being released shows it never queued.
 func TestLockContext_AStatelessRequestWhileAWriterWaitsGoesIsolated(t *testing.T) {
-	var mu sync.Mutex
-	var presented []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("x-csrf-token", "TOKEN")
-		if r.Header.Get("X-sap-adt-sessiontype") == "stateful" {
-			http.SetCookie(w, &http.Cookie{Name: "sap-contextid", Value: "CTX-1", Path: "/"})
-		}
-		if r.Header.Get("X-sap-adt-sessiontype") == "stateless" {
-			v := ""
-			if c, err := r.Cookie("sap-contextid"); err == nil {
-				v = c.Value
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var presented []string
+		c := newInMemoryClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("x-csrf-token", "TOKEN")
+			if r.Header.Get("X-sap-adt-sessiontype") == "stateful" {
+				http.SetCookie(w, &http.Cookie{Name: "sap-contextid", Value: "CTX-1", Path: "/"})
 			}
-			mu.Lock()
-			presented = append(presented, v)
-			mu.Unlock()
+			if r.Header.Get("X-sap-adt-sessiontype") == "stateless" {
+				v := ""
+				if c, err := r.Cookie("sap-contextid"); err == nil {
+					v = c.Value
+				}
+				mu.Lock()
+				presented = append(presented, v)
+				mu.Unlock()
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		tr := c.transport
+
+		// Open the context: the jar learns sap-contextid.
+		if _, err := tr.Request(context.Background(), "/open", &RequestOptions{Stateful: true}); err != nil {
+			t.Fatalf("stateful request: %v", err)
 		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(srv.Close)
-	c := NewClient(srv.URL, "TESTUSER", "pw")
-	tr := c.transport
 
-	// Open the context: the jar learns sap-contextid.
-	if _, err := tr.Request(context.Background(), "/open", &RequestOptions{Stateful: true}); err != nil {
-		t.Fatalf("stateful request: %v", err)
-	}
-
-	// An earlier stateless request holds the gate shared, and a request into
-	// the context -- unmarked, so the in-flight count stays at zero -- queues.
-	if !tr.contextGate.tryShared() {
-		t.Fatal("the gate is not free")
-	}
-	writer := make(chan error, 1)
-	go func() {
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/probe", nil)
-		resp, err := tr.do(req)
-		if err == nil {
-			resp.Body.Close()
+		// An earlier stateless request holds the gate shared, and a request into
+		// the context -- unmarked, so the in-flight count stays at zero -- queues.
+		if !tr.contextGate.tryShared() {
+			t.Fatal("the gate is not free")
 		}
-		writer <- err
-	}()
-	waitQueued(t, tr.contextGate)
-	if n := tr.contextInFlight.Load(); n != 0 {
-		t.Fatalf("in-flight count %d: the test would not exercise the gate", n)
-	}
+		writer := make(chan error, 1)
+		go func() {
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, c.config.BaseURL+"/probe", nil)
+			resp, err := tr.do(req)
+			if err == nil {
+				resp.Body.Close()
+			}
+			writer <- err
+		}()
+		synctest.Wait()
+		if tr.contextGate.tryShared() {
+			t.Fatal("a reader got in past the writer: the writer never queued for the gate")
+		}
+		select {
+		case err := <-writer:
+			t.Fatalf("the writer got past a gate held shared: %v", err)
+		default:
+		}
+		if n := tr.contextInFlight.Load(); n != 0 {
+			t.Fatalf("in-flight count %d: the test would not exercise the gate", n)
+		}
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := tr.Request(context.Background(), "/sap/bc/adt/repository/informationsystem/search", nil)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
+		// The gate is still held shared and the writer still queued: the
+		// stateless request has to finish without either changing. Were it
+		// to wait behind the writer, every goroutine in the bubble would be
+		// blocked and synctest would fail the test with a deadlock at once.
+		if _, err := tr.Request(context.Background(), "/sap/bc/adt/repository/informationsystem/search", nil); err != nil {
 			t.Fatalf("stateless request: %v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the stateless request waited behind the queued writer")
-	}
 
-	tr.contextGate.releaseShared()
-	if err := <-writer; err != nil {
-		t.Fatalf("queued writer: %v", err)
-	}
+		tr.contextGate.releaseShared()
+		if err := <-writer; err != nil {
+			t.Fatalf("queued writer: %v", err)
+		}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(presented) == 0 {
-		t.Fatal("the stateless request never reached the server")
-	}
-	if v := presented[len(presented)-1]; v != "" {
-		t.Errorf("the stateless request carried sap-contextid=%q; it should have gone isolated", v)
-	}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(presented) == 0 {
+			t.Fatal("the stateless request never reached the server")
+		}
+		if v := presented[len(presented)-1]; v != "" {
+			t.Errorf("the stateless request carried sap-contextid=%q; it should have gone isolated", v)
+		}
+	})
 }
 
 // Readers and writers with short deadlines hammer the gate: a writer is never
