@@ -207,6 +207,10 @@ func checkGitService(src string) []string {
 				}
 			}
 		}
+		// A variant is only ever the job's own, VSP<job number>.
+		if strings.HasPrefix(up, "LV_VARIANT =") && up != "LV_VARIANT = |VSP{ LV_JOBCOUNT }|" {
+			bad = append(bad, "lv_variant may only be VSP<job number>: "+st)
+		}
 		if m := assignRe.FindStringSubmatch(up); m != nil && m[2] != "C_JOB_NAME" {
 			bad = append(bad, strings.ToLower(m[1])+" may only be c_job_name: "+st)
 		}
@@ -276,6 +280,7 @@ var (
 		"IF SY-SUBRC <> 0", "EV_CODE = `INVALID_ZIP`", "EV_MESSAGE = *", "RETURN", "ENDIF",
 		"IF LINES( LO_ZIP->FILES ) > C_MAX_ENTRIES", "EV_CODE = `TOO_LARGE`", "EV_MESSAGE = *", "RETURN", "ENDIF",
 		"LOOP AT LO_ZIP->FILES INTO DATA(LS_FILE)",
+		"IF LS_FILE-SIZE < 0", "EV_CODE = `TOO_LARGE`", "EV_MESSAGE = *", "RETURN", "ENDIF",
 		"LV_TOTAL = LV_TOTAL + LS_FILE-SIZE",
 		"IF LS_FILE-NAME = '.ABAPGIT.XML'", "LV_DOTS = LV_DOTS + 1", "ENDIF",
 		"ENDLOOP",
@@ -328,6 +333,12 @@ var (
 		"IF VALID_PACKAGE( CONV #( LV_LISTED ) ) = ABAP_FALSE", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'INVALID_PARAM' *", "RETURN", "ENDIF",
 		"ENDLOOP",
 	}
+	// import_begin: a second begin never discards an upload in progress.
+	gitBeginOne = []string{
+		"DATA: LV_UUID TYPE SYSUUID_C32, LS_PARAMS TYPE TY_IMPORT_PARAMS",
+		"IF MS_UPLOAD-ID IS NOT INITIAL", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'UPLOAD_IN_PROGRESS' *", "RETURN", "ENDIF",
+		"DATA(LV_PARAMS) = IS_MESSAGE-PARAMS",
+	}
 	gitBeginParams = []string{
 		"LS_PARAMS = VALUE #( PACKAGE = LV_PACKAGE REPO_NAME = LV_REPO_NAME OVERWRITE = XSDBOOL( LV_OVERWRITE = 'TRUE' ) TRANSPORT = LV_TRANSPORT PACKAGES = LV_PACKAGES )",
 	}
@@ -375,6 +386,8 @@ var (
 		"DATA(LV_FOUND) = XSDBOOL( SY-SUBRC = 0 )",
 		"IF LV_FOUND = ABAP_TRUE AND LS_JOB-SDLUNAME <> SY-UNAME", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'NOT_YOUR_JOB' *", "RETURN", "ENDIF",
 		"LV_KEY = |VSPGITR{ LV_JOB }|",
+		"SELECT SINGLE USERA FROM INDX INTO @DATA(LV_RESULT_OWNER) WHERE RELID = 'ZV' AND SRTFD = @LV_KEY AND SRTF2 = 0",
+		"IF SY-SUBRC = 0 AND LV_RESULT_OWNER <> SY-UNAME", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'NOT_YOUR_JOB' *", "RETURN", "ENDIF",
 		"IMPORT RESULT = LV_JSON FROM DATABASE INDX(ZV) TO LS_INDX ID LV_KEY",
 		"DATA(LV_HAS_RESULT) = XSDBOOL( SY-SUBRC = 0 AND LV_JSON IS NOT INITIAL )",
 		"IF LV_HAS_RESULT = ABAP_TRUE AND LS_INDX-USERA <> SY-UNAME", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'NOT_YOUR_JOB' *", "RETURN", "ENDIF",
@@ -391,7 +404,7 @@ var (
 		"DATA(LT_REPOS) = ZCL_ABAPGIT_PERSIST_FACTORY=>GET_REPO( )->LIST( )",
 		"READ TABLE LT_REPOS INTO DATA(LS_REPO) WITH KEY PACKAGE = LV_PACKAGE",
 		"IF SY-SUBRC <> 0", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'REPO_NOT_FOUND' *", "RETURN", "ENDIF",
-		"IF LV_KEY IS NOT INITIAL AND LV_KEY <> LS_REPO-KEY", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'REPO_KEY_MISMATCH' *", "RETURN", "ENDIF",
+		"IF LV_REPO_KEY IS NOT INITIAL AND LV_REPO_KEY <> LS_REPO-KEY", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'REPO_KEY_MISMATCH' *", "RETURN", "ENDIF",
 		"LI_REPO = ZCL_ABAPGIT_REPO_SRV=>GET_INSTANCE( )->GET( LS_REPO-KEY )",
 		"IF LI_REPO->IS_OFFLINE( ) = ABAP_FALSE", "RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'REPO_ONLINE' *", "RETURN", "ENDIF",
 		"SELECT SINGLE OBJ_NAME FROM TADIR INTO @DATA(LV_LEFT) WHERE DEVCLASS = @LV_DEVCLASS AND DELFLAG = @SPACE AND NOT ( PGMID = 'R3TR' AND OBJECT = 'DEVC' AND OBJ_NAME = @LV_OBJ_NAME )",
@@ -401,6 +414,74 @@ var (
 		"DATA(LV_NAME) = LI_REPO->GET_NAME( )",
 		"ZCL_ABAPGIT_REPO_SRV=>GET_INSTANCE( )->DELETE( LI_REPO )",
 	}
+	// package_objects reports the repository of every row it finds, its
+	// state unknown when abapGit cannot open it, and fails when the list
+	// cannot be read: Go must never miss a registration.
+	gitPackageObjectsRepo = []string{
+		"TRY",
+		"DATA(LT_REPOS) = ZCL_ABAPGIT_PERSIST_FACTORY=>GET_REPO( )->LIST( )",
+		"CATCH ZCX_ABAPGIT_EXCEPTION INTO DATA(LX_LIST)",
+		"RS_RESPONSE = ERR( IV_ID = IS_MESSAGE-ID IV_CODE = 'REPO_LIST_FAILED' *", "RETURN",
+		"ENDTRY",
+		"READ TABLE LT_REPOS INTO DATA(LS_REPO) WITH KEY PACKAGE = LV_PACKAGE",
+		"IF SY-SUBRC = 0",
+		"LV_REPO_STATE = `UNKNOWN`",
+		"LV_REPO_NAME = LS_REPO-KEY",
+		"TRY",
+		"DATA(LI_REPO) = ZCL_ABAPGIT_REPO_SRV=>GET_INSTANCE( )->GET( LS_REPO-KEY )",
+		"LV_REPO_NAME = LI_REPO->GET_NAME( )",
+		"LV_REPO_STATE = COND #( WHEN LI_REPO->IS_OFFLINE( ) = ABAP_TRUE THEN `OFFLINE` ELSE `ONLINE` )",
+		"CATCH ZCX_ABAPGIT_EXCEPTION ##NO_HANDLER",
+		"ENDTRY",
+		"LV_REPO = ZCL_VSP_UTILS=>JSON_OBJ( ZCL_VSP_UTILS=>JSON_JOIN( VALUE #( ( ZCL_VSP_UTILS=>JSON_STR( IV_KEY = 'KEY' IV_VALUE = CONV #( LS_REPO-KEY ) ) ) " +
+			"( ZCL_VSP_UTILS=>JSON_STR( IV_KEY = 'NAME' IV_VALUE = LV_REPO_NAME ) ) ( ZCL_VSP_UTILS=>JSON_BOOL( IV_KEY = 'OFFLINE' IV_VALUE = XSDBOOL( LV_REPO_STATE = `OFFLINE` ) ) ) " +
+			"( ZCL_VSP_UTILS=>JSON_STR( IV_KEY = 'REPO_STATE' IV_VALUE = LV_REPO_STATE ) ) ) ) )",
+		"ENDIF",
+		"RS_RESPONSE = ZCL_VSP_UTILS=>BUILD_SUCCESS( *",
+	}
+
+	// housekeeping, whole: variants and zips of ended (or vanished) jobs,
+	// results older than a week, and this user's never-released jobs a day on.
+	gitHousekeeping = []string{
+		"DATA: LV_JOBNAME TYPE TBTCJOB-JOBNAME, LV_JOBCOUNT TYPE TBTCJOB-JOBCOUNT, LV_KEY TYPE INDX-SRTFD, LV_REPORT TYPE SYREPID",
+		"LV_JOBNAME = C_JOB_NAME",
+		"LV_REPORT = C_JOB_NAME",
+		"SELECT VARIANT FROM VARID INTO TABLE @DATA(LT_OLD) WHERE REPORT = @C_JOB_NAME AND VARIANT LIKE 'VSP%'",
+		"LOOP AT LT_OLD INTO DATA(LS_OLD)",
+		"LV_JOBCOUNT = LS_OLD-VARIANT+3",
+		"SELECT SINGLE STATUS FROM TBTCO INTO @DATA(LV_STATUS) WHERE JOBNAME = @LV_JOBNAME AND JOBCOUNT = @LV_JOBCOUNT",
+		"IF SY-SUBRC <> 0 OR LV_STATUS = 'F' OR LV_STATUS = 'A'",
+		"CALL FUNCTION 'RS_VARIANT_DELETE' EXPORTING REPORT = LV_REPORT VARIANT = LS_OLD-VARIANT FLAG_CONFIRMSCREEN = 'X' SUPPRESS_MESSAGE = 'X' SUPPRESS_INPUT_DIALOG = 'X' EXCEPTIONS OTHERS = 1",
+		"LV_KEY = |VSPGITZ{ LV_JOBCOUNT }|",
+		"DELETE FROM DATABASE INDX(ZV) ID LV_KEY",
+		"ENDIF",
+		"ENDLOOP",
+		"DATA(LV_CUTOFF) = CONV D( SY-DATUM - 7 )",
+		"DELETE FROM INDX WHERE RELID = 'ZV' AND SRTFD LIKE 'VSPGITR%' AND AEDAT < @LV_CUTOFF",
+		"DATA(LV_STALE) = CONV D( SY-DATUM - 1 )",
+		"SELECT JOBCOUNT FROM TBTCO INTO TABLE @DATA(LT_STALE) WHERE JOBNAME = @LV_JOBNAME AND STATUS = 'P' AND SDLUNAME = @SY-UNAME AND SDLDATE < @LV_STALE",
+		"LOOP AT LT_STALE INTO DATA(LS_STALE)",
+		"DROP_JOB( LS_STALE-JOBCOUNT )",
+		"ENDLOOP",
+	}
+
+	// drop_job, whole: only a ZVSP_GIT_IMPORT job of this user, its own
+	// variant and its own zip.
+	gitDropJob = []string{
+		"DATA: LV_JOBNAME TYPE TBTCJOB-JOBNAME, LV_JOBCOUNT TYPE TBTCJOB-JOBCOUNT, LV_VARIANT TYPE RSVAR-VARIANT, LV_KEY TYPE INDX-SRTFD, LV_REPORT TYPE SYREPID",
+		"LV_JOBNAME = C_JOB_NAME",
+		"LV_REPORT = C_JOB_NAME",
+		"LV_JOBCOUNT = IV_JOBCOUNT",
+		"SELECT SINGLE SDLUNAME FROM TBTCO INTO @DATA(LV_OWNER) WHERE JOBNAME = @LV_JOBNAME AND JOBCOUNT = @LV_JOBCOUNT",
+		"IF SY-SUBRC = 0 AND LV_OWNER <> SY-UNAME", "RETURN", "ENDIF",
+		"CALL FUNCTION 'BP_JOB_DELETE' EXPORTING JOBCOUNT = LV_JOBCOUNT JOBNAME = LV_JOBNAME FORCEDMODE = 'X' EXCEPTIONS OTHERS = 1",
+		"LV_VARIANT = |VSP{ LV_JOBCOUNT }|",
+		"CALL FUNCTION 'RS_VARIANT_DELETE' EXPORTING REPORT = LV_REPORT VARIANT = LV_VARIANT FLAG_CONFIRMSCREEN = 'X' SUPPRESS_MESSAGE = 'X' SUPPRESS_INPUT_DIALOG = 'X' EXCEPTIONS OTHERS = 1",
+		"LV_KEY = |VSPGITZ{ LV_JOBCOUNT }|",
+		"DELETE FROM DATABASE INDX(ZV) ID LV_KEY",
+		"COMMIT WORK",
+	}
+
 	gitPackageObjectsAuth = []string{
 		"LV_DEVCLASS = LV_PACKAGE",
 		"AUTHORITY-CHECK OBJECT 'S_DEVELOP' ID 'DEVCLASS' FIELD LV_DEVCLASS ID 'OBJTYPE' DUMMY ID 'OBJNAME' DUMMY ID 'P_GROUP' DUMMY ID 'ACTVT' FIELD '03'",
@@ -519,6 +600,9 @@ func checkGitPolicy(stmts []string) []string {
 
 	need("IMPORT_BEGIN", gitBeginPackages, "the target must be among the packages listed, each a package name")
 	need("IMPORT_BEGIN", gitBeginParams, "overwrite only on \"true\"")
+	if i := seqAt(methodStatements(stmts, "IMPORT_BEGIN"), gitBeginOne...); i != 0 || countExact(methodStatements(stmts, "IMPORT_BEGIN"), "CLEAR MS_UPLOAD") != 0 {
+		bad = append(bad, "import_begin must refuse while an upload is in progress, and never clear it (UPLOAD_IN_PROGRESS)")
+	}
 	need("IMPORT_COMMIT", gitCommitChecks, "the size, the SHA-256 and the zip's limits must be checked before the job starts")
 
 	need("RUN_JOB", gitRunJob, "run_job must do nothing outside its own job, check its own unchanged variant, then the zip's and the parameters' SHA-256, before it imports")
@@ -546,8 +630,49 @@ func checkGitPolicy(stmts []string) []string {
 		bad = append(bad, "delete_repo must not purge (delete objects)")
 	}
 	need("HANDLE_PACKAGE_OBJECTS", gitPackageObjectsAuth, "package_objects must check S_DEVELOP display on the package")
+	po := methodStatements(stmts, "HANDLE_PACKAGE_OBJECTS")
+	if i := seqAt(po, gitPackageObjectsRepo...); i < 0 || !strings.Contains(normStmt(po[len(po)-1]), `( COND #( WHEN LV_REPO IS NOT INITIAL THEN |"REPO":{ LV_REPO }| ) )`) {
+		bad = append(bad, "package_objects must report every registered repository (state unknown when abapGit cannot open it) and fail when the list cannot be read")
+	}
+	for _, w := range []struct {
+		method string
+		want   []string
+	}{{"HOUSEKEEPING", gitHousekeeping}, {"DROP_JOB", gitDropJob}} {
+		if m := methodStatements(stmts, w.method); len(m) != len(w.want) || seqAt(m, w.want...) != 0 {
+			bad = append(bad, strings.ToLower(w.method)+" must remove only ZVSP_GIT_IMPORT jobs of this user, their own variants and VSPGIT keys (as pinned)")
+		}
+	}
+
+	// INDX(ZV) is shared (VSPFIX* rows live there too): every key this
+	// service reads, writes or deletes is a VSPGITZ/VSPGITR key.
+	for _, st := range stmts {
+		u := normStmt(st)
+		if !lvKeyRe.MatchString(u) {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(u, "DATA: ") && regexp.MustCompile(`\bLV_KEY TYPE INDX-SRTFD(,|$)`).MatchString(u):
+		case u == "SELECT SINGLE USERA FROM INDX INTO @DATA(LV_RESULT_OWNER) WHERE RELID = 'ZV' AND SRTFD = @LV_KEY AND SRTF2 = 0":
+		case lvKeyAssign.MatchString(u):
+		case lvKeyUse.MatchString(u):
+		default:
+			bad = append(bad, "lv_key may only be a VSPGITZ/VSPGITR key of INDX(ZV): "+st)
+		}
+	}
+	for _, st := range stmts {
+		u := normStmt(st)
+		if strings.HasPrefix(u, "EXPORT") && strings.Contains(u, "DATABASE") && !lvKeyUse.MatchString(u) {
+			bad = append(bad, "EXPORT TO DATABASE only under lv_key: "+st)
+		}
+	}
 	return bad
 }
+
+var (
+	lvKeyRe     = regexp.MustCompile(`\bLV_KEY\b`)
+	lvKeyAssign = regexp.MustCompile(`^LV_KEY = \|VSPGIT[ZR]\{ [A-Z_]+ \}\|$`)
+	lvKeyUse    = regexp.MustCompile(`^(EXPORT [A-Z_]+ = [A-Z_]+( [A-Z_]+ = [A-Z_]+)* TO|IMPORT [A-Z_]+ = [A-Z_]+( [A-Z_]+ = [A-Z_]+)* FROM|DELETE FROM) DATABASE INDX\(ZV\)( FROM LS_INDX| TO LS_INDX)? ID LV_KEY$`)
+)
 
 func TestGitServiceOnlyImports(t *testing.T) {
 	if bad := checkGitService(gitServiceSource(t)); len(bad) > 0 {
@@ -683,6 +808,49 @@ func TestGitServiceGuardBites(t *testing.T) {
 		"delete_repo: own entry check widened": {"AND NOT ( pgmid = 'R3TR' AND object = 'DEVC' AND obj_name = @lv_obj_name ).",
 			"AND NOT ( pgmid = 'R3TR' )."},
 		"package_objects: no authority check": {"    IF sy-subrc <> 0.\n      rs_response = err( iv_id = is_message-id iv_code = 'NOT_AUTHORIZED'\n                         iv_message = |No authorization to display package { lv_package } (S_DEVELOP, activity 03)| ).\n      RETURN.\n    ENDIF.\n",
+			""},
+		// Review round 3: user scoping of the cleanup, VSPGIT keys only in the
+		// shared INDX(ZV), package_objects failing closed, and statements the
+		// tokenizer used to miss.
+		"housekeeping: any user's stale jobs": {" AND sdluname = @sy-uname AND sdldate < @lv_stale.",
+			" AND sdldate < @lv_stale."},
+		"housekeeping: stale filter dropped": {" AND sdluname = @sy-uname AND sdldate < @lv_stale.",
+			" AND sdluname = @sy-uname."},
+		"housekeeping: running jobs' variants too": {"      IF sy-subrc <> 0 OR lv_status = 'F' OR lv_status = 'A'.",
+			"      IF 1 = 1."},
+		"drop_job: variant from outside": {"        jobname    = lv_jobname\n        forcedmode = 'X'\n      EXCEPTIONS\n        OTHERS     = 1.\n    lv_variant = |VSP{ lv_jobcount }|.",
+			"        jobname    = lv_jobname\n        forcedmode = 'X'\n      EXCEPTIONS\n        OTHERS     = 1.\n    lv_variant = iv_jobcount."},
+		"start_job: another variant": {"\n    \" not SUBMIT, so SUBMIT ... VIA JOB is not an option.\n    lv_variant = |VSP{ lv_jobcount }|.",
+			"\n    \" not SUBMIT, so SUBMIT ... VIA JOB is not an option.\n    lv_variant = |SAP&{ lv_jobcount }|."},
+		"drop_job: key from outside": {"    lv_key = |VSPGITZ{ lv_jobcount }|.\n    DELETE FROM DATABASE indx(zv) ID lv_key.\n    COMMIT WORK.\n  ENDMETHOD.",
+			"    lv_key = iv_jobcount.\n    DELETE FROM DATABASE indx(zv) ID lv_key.\n    COMMIT WORK.\n  ENDMETHOD."},
+		"drop_job: another user's job": {"    IF sy-subrc = 0 AND lv_owner <> sy-uname.",
+			"    IF 1 = 2."},
+		"INDX key VSPFIX": {"    lv_key = |VSPGITZ{ lv_jobcount }|.\n    IMPORT zip",
+			"    lv_key = 'VSPFIX'.\n    IMPORT zip"},
+		"INDX key prefix changed": {"    lv_key = |VSPGITR{ iv_jobcount }|.",
+			"    lv_key = |VSPFIX{ iv_jobcount }|."},
+		"EXPORT under a literal key": {"EXPORT result = lv_json TO DATABASE indx(zv) FROM ls_indx ID lv_key.",
+			"EXPORT result = lv_json TO DATABASE indx(zv) FROM ls_indx ID 'VSPFIX'."},
+		"lv_key concatenated": {"    lv_key = |VSPGITR{ lv_job }|.",
+			"    CONCATENATE 'VSPFIX' lv_job INTO lv_key."},
+		"package_objects: list failure swallowed": {"      CATCH zcx_abapgit_exception INTO DATA(lx_list).\n        rs_response = err( iv_id = is_message-id iv_code = 'REPO_LIST_FAILED'\n                           iv_message = |abapGit's repository list cannot be read: { clean( lx_list->get_text( ) ) }| ).\n        RETURN.\n    ENDTRY.\n",
+			"      CATCH zcx_abapgit_exception ##NO_HANDLER.\n    ENDTRY.\n"},
+		"package_objects: unknown reads as offline": {"      lv_repo_state = `unknown`.",
+			"      lv_repo_state = `offline`."},
+		"package_objects: row dropped when abapGit throws": {"        CATCH zcx_abapgit_exception ##NO_HANDLER.\n      ENDTRY.\n      lv_repo = ",
+			"        CATCH zcx_abapgit_exception.\n          RETURN.\n      ENDTRY.\n      lv_repo = "},
+		"zip limits: negative size accepted": {"      IF ls_file-size < 0.",
+			"      IF ls_file-size < -1."},
+		"statement glued after a period": {"\n    DELETE FROM DATABASE indx(zv) ID lv_key.\n    COMMIT WORK.\n  ENDMETHOD.",
+			"\n    DELETE FROM DATABASE indx(zv) ID lv_key.\n    COMMIT WORK.DELETE FROM tadir WHERE devclass = @lv_package.\n  ENDMETHOD."},
+		"statement hidden by an escaped template bar": {"\n    DELETE FROM DATABASE indx(zv) ID lv_key.\n    COMMIT WORK.\n  ENDMETHOD.",
+			"\n    DELETE FROM DATABASE indx(zv) ID lv_key.\n    COMMIT WORK.\n    DATA(lv_x) = |a\\\\| \". |. DELETE FROM tadir WHERE devclass = @lv_package.\n  ENDMETHOD."},
+		"import_begin: second begin discards the upload": {"    IF ms_upload-id IS NOT INITIAL.\n      rs_response = err( iv_id = is_message-id iv_code = 'UPLOAD_IN_PROGRESS'\n                         iv_message = |Upload { ms_upload-id } is in progress in this session; commit or abort it first. Nothing was imported.| ).\n      RETURN.\n    ENDIF.\n",
+			"    CLEAR ms_upload.\n"},
+		"import_begin: in-progress check removed": {"    IF ms_upload-id IS NOT INITIAL.\n      rs_response = err( iv_id = is_message-id iv_code = 'UPLOAD_IN_PROGRESS'\n                         iv_message = |Upload { ms_upload-id } is in progress in this session; commit or abort it first. Nothing was imported.| ).\n      RETURN.\n    ENDIF.\n",
+			""},
+		"import_status: owner checked only after IMPORT": {"    SELECT SINGLE usera FROM indx INTO @DATA(lv_result_owner)\n      WHERE relid = 'ZV' AND srtfd = @lv_key AND srtf2 = 0.\n    IF sy-subrc = 0 AND lv_result_owner <> sy-uname.\n      rs_response = err( iv_id = is_message-id iv_code = 'NOT_YOUR_JOB'\n                         iv_message = |The result of job { lv_job } belongs to another user| ).\n      RETURN.\n    ENDIF.\n",
 			""},
 	}
 	for name, m := range mutations {

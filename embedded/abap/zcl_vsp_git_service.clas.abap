@@ -551,7 +551,14 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
     DATA: lv_uuid   TYPE sysuuid_c32,
           ls_params TYPE ty_import_params.
 
-    CLEAR ms_upload.
+    " One upload per session at a time: a second begin must not throw away
+    " an upload that is still being sent (an MCP server shares its
+    " WebSocket between calls). It ends with commit, abort or disconnect.
+    IF ms_upload-id IS NOT INITIAL.
+      rs_response = err( iv_id = is_message-id iv_code = 'UPLOAD_IN_PROGRESS'
+                         iv_message = |Upload { ms_upload-id } is in progress in this session; commit or abort it first. Nothing was imported.| ).
+      RETURN.
+    ENDIF.
     DATA(lv_params) = is_message-params.
     DATA(lv_size) = zcl_vsp_utils=>extract_param_int( iv_params = lv_params iv_name = 'size' ).
     DATA(lv_sha) = to_upper( zcl_vsp_utils=>extract_param( iv_params = lv_params iv_name = 'sha256' ) ).
@@ -936,6 +943,13 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
     lv_jobname = c_job_name.
     lv_report = c_job_name.
     lv_jobcount = iv_jobcount.
+    " Only a job of this user: another user's job, its variant and its zip
+    " are not this session's to remove.
+    SELECT SINGLE sdluname FROM tbtco INTO @DATA(lv_owner)
+      WHERE jobname = @lv_jobname AND jobcount = @lv_jobcount.
+    IF sy-subrc = 0 AND lv_owner <> sy-uname.
+      RETURN.
+    ENDIF.
     CALL FUNCTION 'BP_JOB_DELETE'
       EXPORTING
         jobcount   = lv_jobcount
@@ -979,6 +993,13 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
       RETURN.
     ENDIF.
     LOOP AT lo_zip->files INTO DATA(ls_file).
+      " The size is a 4-byte integer read from the zip: past 2 GB it comes
+      " back negative.
+      IF ls_file-size < 0.
+        ev_code = `TOO_LARGE`.
+        ev_message = |{ ls_file-name } declares a size over 2 GB.|.
+        RETURN.
+      ENDIF.
       lv_total = lv_total + ls_file-size.
       IF ls_file-name = '.abapgit.xml'.
         lv_dots = lv_dots + 1.
@@ -1582,6 +1603,13 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
     " which is the user who started it): once SM37's history of the job is
     " gone, that is the only proof, and it is checked either way.
     lv_key = |VSPGITR{ lv_job }|.
+    SELECT SINGLE usera FROM indx INTO @DATA(lv_result_owner)
+      WHERE relid = 'ZV' AND srtfd = @lv_key AND srtf2 = 0.
+    IF sy-subrc = 0 AND lv_result_owner <> sy-uname.
+      rs_response = err( iv_id = is_message-id iv_code = 'NOT_YOUR_JOB'
+                         iv_message = |The result of job { lv_job } belongs to another user| ).
+      RETURN.
+    ENDIF.
     IMPORT result = lv_json FROM DATABASE indx(zv) TO ls_indx ID lv_key.
     DATA(lv_has_result) = xsdbool( sy-subrc = 0 AND lv_json IS NOT INITIAL ).
     IF lv_has_result = abap_true AND ls_indx-usera <> sy-uname.
@@ -1643,7 +1671,7 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
           lv_obj_name TYPE sobj_name.
 
     DATA(lv_package) = to_upper( condense( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'package' ) ) ).
-    DATA(lv_key) = condense( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'key' ) ).
+    DATA(lv_repo_key) = condense( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'key' ) ).
     IF valid_package( lv_package ) = abap_false.
       rs_response = err( iv_id = is_message-id iv_code = 'INVALID_PARAM'
                          iv_message = |package '{ lv_package }' is not a package name| ).
@@ -1672,9 +1700,9 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
                              iv_message = |No abapGit repository is registered for package { lv_package }| ).
           RETURN.
         ENDIF.
-        IF lv_key IS NOT INITIAL AND lv_key <> ls_repo-key.
+        IF lv_repo_key IS NOT INITIAL AND lv_repo_key <> ls_repo-key.
           rs_response = err( iv_id = is_message-id iv_code = 'REPO_KEY_MISMATCH'
-                             iv_message = |The repository of { lv_package } is { ls_repo-key }, not { lv_key }; nothing was deleted| ).
+                             iv_message = |The repository of { lv_package } is { ls_repo-key }, not { lv_repo_key }; nothing was deleted| ).
           RETURN.
         ENDIF.
         li_repo = zcl_abapgit_repo_srv=>get_instance( )->get( ls_repo-key ).
@@ -1718,10 +1746,12 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
 
 
   METHOD handle_package_objects.
-    DATA: lt_items    TYPE string_table,
-          lt_subs     TYPE string_table,
-          lv_repo     TYPE string,
-          lv_devclass TYPE devclass.
+    DATA: lt_items      TYPE string_table,
+          lt_subs       TYPE string_table,
+          lv_repo       TYPE string,
+          lv_repo_state TYPE string,
+          lv_repo_name  TYPE string,
+          lv_devclass   TYPE devclass.
 
     DATA(lv_package) = to_upper( condense( zcl_vsp_utils=>extract_param( iv_params = is_message-params iv_name = 'package' ) ) ).
     IF valid_package( lv_package ) = abap_false.
@@ -1760,19 +1790,34 @@ CLASS zcl_vsp_git_service IMPLEMENTATION.
     LOOP AT lt_children INTO DATA(lv_child).
       APPEND |"{ zcl_vsp_utils=>escape_json( CONV #( lv_child ) ) }"| TO lt_subs.
     ENDLOOP.
+    " The repository registered for the package. Fail closed: when the list
+    " cannot be read the answer is an error, and a row whose repository
+    " abapGit cannot open is still reported, its state unknown (vsp treats
+    " that as online: never unregistered, the package never deleted).
     TRY.
         DATA(lt_repos) = zcl_abapgit_persist_factory=>get_repo( )->list( ).
-        READ TABLE lt_repos INTO DATA(ls_repo) WITH KEY package = lv_package.
-        IF sy-subrc = 0.
-          DATA(li_repo) = zcl_abapgit_repo_srv=>get_instance( )->get( ls_repo-key ).
-          lv_repo = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
-            ( zcl_vsp_utils=>json_str( iv_key = 'key' iv_value = CONV #( ls_repo-key ) ) )
-            ( zcl_vsp_utils=>json_str( iv_key = 'name' iv_value = li_repo->get_name( ) ) )
-            ( zcl_vsp_utils=>json_bool( iv_key = 'offline' iv_value = li_repo->is_offline( ) ) )
-          ) ) ).
-        ENDIF.
-      CATCH zcx_abapgit_exception ##NO_HANDLER.
+      CATCH zcx_abapgit_exception INTO DATA(lx_list).
+        rs_response = err( iv_id = is_message-id iv_code = 'REPO_LIST_FAILED'
+                           iv_message = |abapGit's repository list cannot be read: { clean( lx_list->get_text( ) ) }| ).
+        RETURN.
     ENDTRY.
+    READ TABLE lt_repos INTO DATA(ls_repo) WITH KEY package = lv_package.
+    IF sy-subrc = 0.
+      lv_repo_state = `unknown`.
+      lv_repo_name = ls_repo-key.
+      TRY.
+          DATA(li_repo) = zcl_abapgit_repo_srv=>get_instance( )->get( ls_repo-key ).
+          lv_repo_name = li_repo->get_name( ).
+          lv_repo_state = COND #( WHEN li_repo->is_offline( ) = abap_true THEN `offline` ELSE `online` ).
+        CATCH zcx_abapgit_exception ##NO_HANDLER.
+      ENDTRY.
+      lv_repo = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
+        ( zcl_vsp_utils=>json_str( iv_key = 'key' iv_value = CONV #( ls_repo-key ) ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'name' iv_value = lv_repo_name ) )
+        ( zcl_vsp_utils=>json_bool( iv_key = 'offline' iv_value = xsdbool( lv_repo_state = `offline` ) ) )
+        ( zcl_vsp_utils=>json_str( iv_key = 'repo_state' iv_value = lv_repo_state ) )
+      ) ) ).
+    ENDIF.
     rs_response = zcl_vsp_utils=>build_success( iv_id = is_message-id iv_data = zcl_vsp_utils=>json_obj( zcl_vsp_utils=>json_join( VALUE #(
       ( zcl_vsp_utils=>json_str( iv_key = 'package' iv_value = lv_package ) )
       ( zcl_vsp_utils=>json_bool( iv_key = 'exists' iv_value = lv_found ) )
