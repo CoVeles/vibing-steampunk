@@ -290,10 +290,13 @@ func (s *Server) registerReadTools(shouldRegister func(string) bool) {
 
 	if shouldRegister("GetPackage") {
 		s.mcpServer.AddTool(mcp.NewTool("GetPackage",
-			mcp.WithDescription("Retrieve ABAP package details"),
+			mcp.WithDescription("Retrieve ABAP package details. With inventory=true: every TADIR object (type, name, author, created on), the subpackages (TDEVC) and any abapGit repository registered for the package, in one read-only call."),
 			mcp.WithString("package_name",
 				mcp.Required(),
 				mcp.Description("Name of the ABAP package"),
+			),
+			mcp.WithBoolean("inventory",
+				mcp.Description("Return the package inventory: TADIR objects with author and created on, subpackages, abapGit repository. Reads TADIR/TDEVC/ZABAPGIT through the data preview; with --block-free-sql only the ADT package contents, and the result names what was skipped."),
 			),
 		), s.handleGetPackage)
 	}

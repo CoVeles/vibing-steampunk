@@ -42,6 +42,10 @@ Read metadata:
   SAP(action="read", target="TABL ZTABLE")          - Table definition
   SAP(action="read", target="TABL_CONTENTS ZTABLE") - Table data
   SAP(action="read", target="DEVC $TMP")             - Package info
+  SAP(action="read", target="DEVC $ZDEMO", params={"inventory": true})
+      - inventory in one call: TADIR objects (type, name, author, created_on), subpackages (TDEVC),
+        abapGit repository registered for the package (if abapGit is installed). Read-only.
+        With --block-free-sql: ADT package contents only; "skipped" says what that leaves out.
   SAP(action="read", target="MSAG ZMSG_CLASS")       - Message class
   SAP(action="read", target="TRAN SM30")              - Transaction info
   SAP(action="read", target="TYPE_INFO ZTYPE")        - Type info
