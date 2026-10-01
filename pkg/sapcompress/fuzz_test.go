@@ -1,6 +1,10 @@
 package sapcompress
 
 import (
+	"bytes"
+	"compress/flate"
+	"encoding/binary"
+	"math/rand/v2"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -55,5 +59,47 @@ func TestHeaderLengthDoesNotReserveMemory(t *testing.T) {
 		if got := after.TotalAlloc - before.TotalAlloc; got > 64<<20 {
 			t.Fatalf("% x: allocated %d MiB for a %d-byte input", in, got>>20, len(in))
 		}
+	}
+}
+
+// TestDecompressPastPreallocCap: maxPrealloc bounds only what the header may
+// reserve up front; a stream that really holds more must still come back
+// whole. Nothing here writes LZH, so the stream is built from the parts the
+// decoder takes apart: compress/flate's raw DEFLATE, shifted left by the
+// two-bit noise count (0, so no noise bits follow), behind a SAP header.
+func TestDecompressPastPreallocCap(t *testing.T) {
+	const size = 5 << 20
+	want := make([]byte, size)
+	rng := rand.New(rand.NewPCG(1, 2))
+	for i := range want {
+		want[i] = "ABAP cluster INDX BALDAT 0123456789\n"[rng.IntN(36)]
+	}
+	var d bytes.Buffer
+	w, err := flate.NewWriter(&d, flate.BestSpeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw := d.Bytes()
+	body := make([]byte, len(raw)+1)
+	for i, b := range raw {
+		body[i] |= b << 2
+		body[i+1] = b >> 6
+	}
+	stream := binary.LittleEndian.AppendUint32(nil, size)
+	stream = append(stream, byte(LZH)|0x10, 0x1f, 0x9d, 0x00)
+	stream = append(stream, body...)
+
+	got, err := Decompress(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) <= maxPrealloc || !bytes.Equal(got, want) {
+		t.Fatalf("got %d bytes, want the %d written (cap %d)", len(got), size, maxPrealloc)
 	}
 }
