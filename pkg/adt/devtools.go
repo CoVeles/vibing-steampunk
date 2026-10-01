@@ -842,6 +842,12 @@ func (c *Client) RunUnitTests(ctx context.Context, objectURL string, flags *Unit
 		defaultFlags := DefaultUnitTestFlags()
 		flags = &defaultFlags
 	}
+	// A test class declared RISK LEVEL DANGEROUS or CRITICAL may change
+	// persistent data or system settings; that is what the level says. Under
+	// --read-only only harmless tests run. Ordinary runs are unchanged.
+	if (flags.Dangerous || flags.Critical) && c.config.Safety.ReadOnly && !c.config.Safety.DryRun {
+		return nil, fmt.Errorf("operation 'RunUnitTests' with dangerous or critical tests is blocked: read-only mode enabled (run without include_dangerous)")
+	}
 
 	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <aunit:runConfiguration xmlns:aunit="http://www.sap.com/adt/aunit">

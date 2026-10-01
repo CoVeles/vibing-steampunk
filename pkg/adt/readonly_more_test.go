@@ -58,3 +58,44 @@ func TestSetPrettyPrinterSettings_RefusedUnderReadOnly(t *testing.T) {
 		return c.SetPrettyPrinterSettings(context.Background(), &PrettyPrinterSettings{Indentation: true, Style: "keywordUpper"})
 	})
 }
+
+// Under --read-only a unit test run is still allowed, but not one that
+// includes tests declared RISK LEVEL DANGEROUS or CRITICAL.
+func TestRunUnitTests_DangerousRefusedUnderReadOnly(t *testing.T) {
+	ctx := context.Background()
+	for name, flags := range map[string]UnitTestRunFlags{
+		"dangerous": {Harmless: true, Dangerous: true, Short: true},
+		"critical":  {Harmless: true, Critical: true, Short: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, mock := readOnlyMockClient(true)
+			_, err := c.RunUnitTests(ctx, "/sap/bc/adt/oo/classes/zcl_demo", &flags)
+			if err == nil || !strings.Contains(err.Error(), "is blocked: read-only mode enabled") {
+				t.Fatalf("want a read-only refusal, got %v", err)
+			}
+			if len(mock.requests) != 0 {
+				t.Errorf("a refused test run sent %d request(s)", len(mock.requests))
+			}
+		})
+	}
+	t.Run("harmless still runs", func(t *testing.T) {
+		c, mock := readOnlyMockClient(true)
+		_, err := c.RunUnitTests(ctx, "/sap/bc/adt/oo/classes/zcl_demo", nil)
+		if err != nil && strings.Contains(err.Error(), "blocked") {
+			t.Fatalf("an ordinary run was refused: %v", err)
+		}
+		if len(mock.requests) == 0 {
+			t.Error("an ordinary run never reached SAP")
+		}
+	})
+	t.Run("dangerous without read-only", func(t *testing.T) {
+		c, mock := readOnlyMockClient(false)
+		flags := UnitTestRunFlags{Harmless: true, Dangerous: true, Short: true}
+		if _, err := c.RunUnitTests(ctx, "/sap/bc/adt/oo/classes/zcl_demo", &flags); err != nil && strings.Contains(err.Error(), "blocked") {
+			t.Fatalf("refused without --read-only: %v", err)
+		}
+		if len(mock.requests) == 0 {
+			t.Error("never reached SAP")
+		}
+	})
+}
