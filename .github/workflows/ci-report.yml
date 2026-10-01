@@ -56,6 +56,17 @@ jobs:
             }
             core.setOutput('pr', String(pr.number));
             core.setOutput('base_ref', pr.base.ref);
+            // The pull request's own artifacts are only downloaded when they are
+            // small: a fork controls them, and a zip bomb would fill the disk.
+            // Real sizes: test-summary about 1 KB, metrics about 15 KB, zipped.
+            const caps = { 'test-summary': 256 * 1024, metrics: 1024 * 1024 };
+            const arts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, { owner, repo, run_id: run.id })
+              .catch(() => []);
+            for (const [name, cap] of Object.entries(caps)) {
+              const a = arts.find((x) => x.name === name && !x.expired);
+              if (a && a.size_in_bytes <= cap) core.setOutput(`head_${name.replace('-', '_')}`, 'ok');
+              else if (a) core.warning(`${name}: ${a.size_in_bytes} bytes zipped, over the ${cap}-byte cap; not downloaded`);
+            }
             const base = await github.rest.actions.listWorkflowRuns({
               owner, repo, workflow_id: 'ci.yml', branch: pr.base.ref, event: 'push', status: 'success', per_page: 1,
             }).then((r) => r.data.workflow_runs[0]).catch(() => undefined);
@@ -65,7 +76,7 @@ jobs:
             }
 
       - name: Download this run's test summary
-        if: steps.find.outputs.pr != ''
+        if: steps.find.outputs.head_test_summary == 'ok'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -85,7 +96,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download this run's metrics
-        if: steps.find.outputs.pr != ''
+        if: steps.find.outputs.head_metrics == 'ok'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -120,17 +131,30 @@ jobs:
             const fs = require('fs');
             const { execFileSync } = require('child_process');
             const { owner, repo } = context.repo;
-            const MAX_BYTES = 8 * 1024 * 1024;
+            const MAX_BYTES = 8 * 1024 * 1024; // unzipped metrics.json
+            const MAX_ZIP = 1024 * 1024;       // zipped artifact
             const TREND_RUNS = 10;
 
             // The head metrics come from the pull request's own workflow, so
             // they are data: only finite non-negative numbers and short strings
             // survive, and every string is escaped before it reaches markdown.
+            // Escaped for markdown, and defused: a zero-width space after `@`
+            // stops a fork from pinging users or teams through the bot, and one
+            // inside `://`, `www.` and `#<digit>` stops autolinks and issue
+            // cross-references.
             const clean = (s, max = 120) => String(s ?? '')
-              .replace(/[\r\n]+/g, ' ').replace(/[|<>`[\]*_]/g, (c) => '\\' + c).slice(0, max);
-            // Inside a code span only a backtick, a newline or a table pipe can
-            // break out; backslash escapes would show literally there.
-            const code = (s, max = 100) => '`' + String(s ?? '').replace(/[\r\n`]+/g, ' ').slice(0, max).replace(/\|/g, '\\|') + '`';
+              .replace(/[\r\n]+/g, ' ').slice(0, max)
+              .replace(/[|<>`[\]*_\\]/g, (c) => '\\' + c)
+              .replace(/@/g, '@\u200B').replace(/:\/\//g, ':\u200B//')
+              .replace(/\bwww\./gi, (w) => w.slice(0, 3) + '\u200B.').replace(/#(?=\d)/g, '#\u200B');
+            // Inside a code span only a backtick, a newline or (in a table) a
+            // pipe can break out. Backslash escapes would show literally, so a
+            // pipe is escaped only in a table cell, where GFM needs it. Code
+            // spans neither mention nor autolink.
+            const code = (s, max = 100, cell = false) => {
+              const t = String(s ?? '').replace(/[\r\n`]+/g, ' ').slice(0, max);
+              return '`' + (cell ? t.replace(/\|/g, '\\|') : t) + '`';
+            };
             const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1e12) ? Math.round(v) : 0;
             const str = (v) => (typeof v === 'string' && v.length > 0 && v.length <= 300) ? v : null;
             const list = (v, n) => Array.isArray(v) ? v.slice(0, n) : [];
@@ -190,7 +214,7 @@ jobs:
                   if (out.length >= TREND_RUNS) break;
                   try {
                     const arts = (await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: r.id, name: 'metrics' })).data.artifacts;
-                    const a = arts.find((x) => x.name === 'metrics' && !x.expired && x.size_in_bytes < MAX_BYTES);
+                    const a = arts.find((x) => x.name === 'metrics' && !x.expired && x.size_in_bytes <= MAX_ZIP);
                     if (!a) continue;
                     const zip = await github.rest.actions.downloadArtifact({ owner, repo, artifact_id: a.id, archive_format: 'zip' });
                     const file = `trend-${num(r.id)}.zip`;
@@ -245,7 +269,7 @@ jobs:
                 + `${c25.length} files crossed ${k(th.file_tokens)} tokens (${c15.length} crossed ${k(th.file_tokens_warn)}), `
                 + `${c1000.length} crossed ${n(th.file_lines)} lines**`);
               const row = (label, key, fmt = String) => `| ${label} | ${fmt(bt[key])} | ${fmt(ht[key])} | ${signed(d(key), fmt)} |`;
-              out.push('', `| Non-test Go, research packages excluded | base ${code(base.commit.slice(0, 8), 8)} | head | Δ |`,
+              out.push('', `| Non-test Go, research packages excluded | base ${code(base.commit.slice(0, 8), 8, true)} | head | Δ |`,
                 '| --- | --- | --- | --- |',
                 row('Read tokens (bytes/4)', 'tokens', k),
                 row('Lines', 'lines', k),
@@ -299,7 +323,7 @@ jobs:
               const table = (title, rows) => {
                 if (!rows.length) return;
                 out.push('', title, '', '| | Tokens | Δ tokens | Δ cognitive |', '| --- | --- | --- | --- |',
-                  ...rows.map((r) => `| ${code(r.name, 90)}${r.added ? ' (new)' : r.removed ? ' (removed)' : ''} | ${k(r.b.tokens)} → ${k(r.h.tokens)} | ${signed(r.dt, k)} | ${signed(r.dc)} |`));
+                  ...rows.map((r) => `| ${code(r.name, 90, true)}${r.added ? ' (new)' : r.removed ? ' (removed)' : ''} | ${k(r.b.tokens)} → ${k(r.h.tokens)} | ${signed(r.dt, k)} | ${signed(r.dc)} |`));
               };
               const grew = (rows) => rows.filter((r) => r.dt > 0 || (r.dt === 0 && r.dc > 0))
                 .sort((a, b) => b.dt - a.dt || b.dc - a.dc).slice(0, 8);
@@ -340,9 +364,11 @@ jobs:
                 else if (f.lines > limit) warn.push(`- grew: ${code(f.path)}, ${limit} → ${f.lines} lines (${signed(f.lines - limit)})`);
               }
               for (const p of head.ratchet.packages) {
+                // The same rule as files: the smaller of the baseline and main.
                 const onMain = base?.packages.get(p.path)?.lines;
-                if (p.lines > p.baseline && touched(base?.packages, p.path, p.lines)) {
-                  warn.push(`- package grew past its baseline: ${code(p.path)}, ${p.baseline} → ${p.lines} lines${onMain != null ? ` (${signed(p.lines - onMain)} in this PR)` : ''}`);
+                const limit = Math.min(p.baseline, onMain ?? Infinity);
+                if (p.lines > limit && touched(base?.packages, p.path, p.lines)) {
+                  warn.push(`- package grew: ${code(p.path)}, ${limit} → ${p.lines} lines (${signed(p.lines - limit)})`);
                 }
               }
               out.push('', warn.length
@@ -370,7 +396,7 @@ jobs:
             if (head.top.length) {
               out.push('', '<details><summary>Top 10 functions by cognitive complexity</summary>', '',
                 '| Function | Where | Cognitive | Cyclomatic | Lines |', '| --- | --- | --- | --- | --- |',
-                ...head.top.map((f) => `| ${code(f.key, 90)} | ${where(f)} | ${f.cognitive} | ${f.cyclomatic} | ${f.lines} |`),
+                ...head.top.map((f) => `| ${code(f.key, 90, true)} | ${where(f)} | ${f.cognitive} | ${f.cyclomatic} | ${f.lines} |`),
                 '', '</details>');
             }
             if (head.research) out.push('', `_Research packages, kept out of every number above: ${k(head.research)} read tokens._`);
@@ -393,8 +419,15 @@ jobs:
             const run = context.payload.workflow_run;
             const prNumber = Number(process.env.PR);
 
+            // Escaped for markdown, and defused: a zero-width space after `@`
+            // stops a fork from pinging users or teams through the bot, and one
+            // inside `://`, `www.` and `#<digit>` stops autolinks and issue
+            // cross-references.
             const clean = (s, max = 120) => String(s ?? '')
-              .replace(/[\r\n]+/g, ' ').replace(/[|<>`[\]*_]/g, (c) => '\\' + c).slice(0, max);
+              .replace(/[\r\n]+/g, ' ').slice(0, max)
+              .replace(/[|<>`[\]*_\\]/g, (c) => '\\' + c)
+              .replace(/@/g, '@\u200B').replace(/:\/\//g, ':\u200B//')
+              .replace(/\bwww\./gi, (w) => w.slice(0, 3) + '\u200B.').replace(/#(?=\d)/g, '#\u200B');
             const icon = (v) => ({
               success: '🟢 pass', failure: '🔴 fail', cancelled: '⚫ cancelled',
               skipped: '⚪ skipped', timed_out: '🔴 timed out',
@@ -428,6 +461,7 @@ jobs:
             // keep only well-formed numbers and short package names.
             const load = (dir) => {
               try {
+                if (fs.statSync(`${dir}/test-summary.json`).size > 1024 * 1024) return null;
                 const raw = JSON.parse(fs.readFileSync(`${dir}/test-summary.json`, 'utf8'));
                 const out = new Map();
                 for (const p of (raw.packages || []).slice(0, 500)) {

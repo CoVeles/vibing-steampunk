@@ -3,7 +3,9 @@
 #
 #   ./.github/ci/lint.sh gate [base]   # blocking: new issues since the merge base
 #                                      # with <base> (default origin/main)
-#   ./.github/ci/lint.sh full          # advisory: the whole tree, a debt count
+#   ./.github/ci/lint.sh full [base]   # advisory: the whole tree, a debt count;
+#                                      # with a base, new code over a complexity
+#                                      # threshold also becomes a warning annotation
 #
 # "Fail closed" means a run that did not demonstrably lint is red, never
 # "0 issues". In gate mode:
@@ -60,6 +62,13 @@ case "$mode" in
 gate)
   [ -e "$canary_dir" ] && die "$canary_dir already exists; it is reserved for the lint canary"
   git rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "base $base is not a commit here (fetch it first)"
+  mb=$(git merge-base "$base" HEAD) || die "no merge base between $base and HEAD (shallow clone?)"
+  # On a pull request the merge base must be behind HEAD. If it is HEAD itself
+  # (a wrong base, or a checkout of the base instead of the PR), "new since the
+  # merge base" is empty and the gate would pass having checked nothing.
+  if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] && [ "$mb" = "$(git rev-parse HEAD)" ]; then
+    die "merge base with $base is HEAD itself: nothing would count as new, so the gate would check nothing"
+  fi
   wrote_canary=1
   mkdir -p "$canary_dir" && cp .github/ci/lint-canary.go.txt "$canary_dir/canary.go" || die "cannot write the canary"
 
@@ -115,7 +124,26 @@ full)
   by=$(jq -r '[(.Issues // [])[].FromLinter] | group_by(.) | map({l: .[0], n: length}) | sort_by(-.n)
     | map("\(.l) \(.n)") | join(", ")' "$out/lint.json")
   echo
-  report "${n} issues in ${files} files${by:+: ${by}}"
+  summary="${n} issues in ${files} files${by:+: ${by}}"
+
+  # Quality is advisory in CI, as annotations: new code over a complexity
+  # threshold becomes a warning on the pull request's diff, never an error.
+  if [ -n "${2:-}" ] && git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+    cstatus=0
+    golangci-lint run -c .github/ci/golangci-full.yml --enable-only=gocyclo,gocognit,funlen \
+      --new-from-merge-base="$base" --output.text.path=stdout --output.json.path="$out/complexity.json" \
+      --show-stats=false ./... || cstatus=$?
+    if [ "$cstatus" -le 1 ] && jq -e . "$out/complexity.json" >/dev/null 2>&1; then
+      cn=$(jq '.Issues // [] | length' "$out/complexity.json")
+      if in_ci; then
+        jq -r '(.Issues // [])[] | "::warning file=\(.Pos.Filename),line=\(.Pos.Line),title=\(.FromLinter)::\(.Text | gsub("\n"; " "))"' "$out/complexity.json"
+      fi
+      summary="${summary} · new code over a complexity threshold: ${cn}"
+    else
+      echo "lint: the new-code complexity check could not run (exit $cstatus); advisory, ignored" >&2
+    fi
+  fi
+  report "$summary"
   ;;
 
 *)

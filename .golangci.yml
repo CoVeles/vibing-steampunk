@@ -2,6 +2,12 @@
 #
 #   golangci-lint run ./...        # what the `lint` CI job runs, locally
 #
+# Policy: in CI only correctness and safety are red. Quality and style
+# (complexity, size, formatting, simplifications) are advisory annotations in CI
+# and can be red only at the interactive moment, the opt-in pre-push hook
+# (.githooks/pre-push). Every linter in this file is a bug class, so this file
+# may block; anything that is a matter of taste goes in golangci-full.yml.
+#
 # Schema version. golangci-lint v2 refuses a v1 config outright — "unsupported
 # version of the configuration" — before it reads a line of Go. That is what
 # happened here once: the action asked for `latest`, v2 shipped, this file stayed

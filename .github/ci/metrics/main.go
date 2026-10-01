@@ -15,11 +15,15 @@
 //     and files that are never built (//go:build ignore, i.e. go:generate
 //     helpers such as embedded/abap/sync_from_src.go) are left out entirely.
 //   - The headline is non-test code. _test.go files are measured too, and kept
-//     apart as test_* numbers.
+//     apart under "test". That includes the `integration`-tagged live-SAP
+//     tests: they are read like any other test. (So per-package test lines
+//     run higher than `go list` counts, e.g. pkg/adt 33,096 vs 30,214; the
+//     test threshold counts, 7/14/13 and 4 files over 1,000 lines, match the
+//     complexity map, which counted them too.)
 //   - The research packages (researchPrefixes) are measured into
 //     research_totals and kept out of the headline: experiments, not product.
 //
-// Read-token cost is bytes/4, the usual rule of thumb for code: an estimate of
+// Read-token cost is bytes/4 (integer division), the usual rule of thumb for code: an estimate of
 // what it costs a model, or a person, to read the file, not a tokenizer count.
 package main
 
@@ -268,25 +272,28 @@ func skipped(p string) bool {
 	return false
 }
 
-// neverBuilt reports a `//go:build ignore` file: a go:generate helper or a
-// scratch program, not part of any package.
-func neverBuilt(f *ast.File) bool {
+// buildExpr is the file's //go:build constraint, or nil.
+func buildExpr(f *ast.File) constraint.Expr {
 	for _, g := range f.Comments {
 		if g.Pos() >= f.Package {
 			break
 		}
 		for _, c := range g.List {
-			if !constraint.IsGoBuild(c.Text) {
-				continue
-			}
-			if expr, err := constraint.Parse(c.Text); err == nil {
-				if tag, ok := expr.(*constraint.TagExpr); ok && tag.Tag == "ignore" {
-					return true
+			if constraint.IsGoBuild(c.Text) {
+				if expr, err := constraint.Parse(c.Text); err == nil {
+					return expr
 				}
 			}
 		}
 	}
-	return false
+	return nil
+}
+
+// neverBuilt reports a `//go:build ignore` file: a go:generate helper or a
+// scratch program, not part of any package.
+func neverBuilt(f *ast.File) bool {
+	tag, ok := buildExpr(f).(*constraint.TagExpr)
+	return ok && tag.Tag == "ignore"
 }
 
 func measure(root string) (*Metrics, error) {
@@ -298,6 +305,11 @@ func measure(root string) (*Metrics, error) {
 	if b, err := git(root, "rev-parse", "HEAD"); err == nil {
 		commit = strings.TrimSpace(string(b))
 	}
+	return measureFiles(root, strings.Split(strings.TrimRight(string(ls), "\x00"), "\x00"), commit)
+}
+
+// measureFiles measures the given repository-relative Go files under root.
+func measureFiles(root string, rels []string, commit string) (*Metrics, error) {
 
 	m := &Metrics{
 		Schema:      1,
@@ -312,7 +324,7 @@ func measure(root string) (*Metrics, error) {
 	var headline []Func
 	seen := map[string]int{} // key -> index in headline, for clash detection
 
-	for _, rel := range strings.Split(strings.TrimRight(string(ls), "\x00"), "\x00") {
+	for _, rel := range rels {
 		if rel == "" || skipped(rel) {
 			continue
 		}
@@ -328,12 +340,13 @@ func measure(root string) (*Metrics, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", rel, err)
 		}
+		test := strings.HasSuffix(rel, "_test.go")
 		if ast.IsGenerated(f) || neverBuilt(f) {
 			continue
 		}
 		dir := path.Dir(rel)
 		fr := File{
-			Path: rel, Pkg: dir, Research: isResearch(dir), Test: strings.HasSuffix(rel, "_test.go"),
+			Path: rel, Pkg: dir, Research: isResearch(dir), Test: test,
 			Lines: bytes.Count(src, []byte("\n")), Tokens: len(src) / 4,
 		}
 		if len(src) > 0 && src[len(src)-1] != '\n' {

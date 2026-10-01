@@ -194,6 +194,10 @@ jobs:
           path: pkg/**/testdata/fuzz/
           if-no-files-found: ignore
 
+  # Policy: in CI only correctness and safety gates are red. Quality and style
+  # (complexity, size, formatting) are advisory here, and can block only in the
+  # opt-in pre-push hook (.githooks/pre-push).
+  #
   # Blocking: red on any finding in code the change adds or touches, from five
   # correctness linters (errcheck, govet, ineffassign, staticcheck SA, unused;
   # config in .golangci.yml). The ~50 files with findings older than the gate
@@ -228,7 +232,8 @@ jobs:
         run: ./.github/ci/lint.sh gate "$BASE_REF"
 
   # Advisory: every linter in .github/ci/golangci-full.yml over the whole tree,
-  # so the debt stays visible as one number per linter. A crash or config error
+  # so the debt stays visible as one number per linter. New code over a
+  # complexity threshold becomes a warning annotation, never an error. A crash or config error
   # still fails the job (it is advisory, so that is grey, not red).
   lint-full:
     name: lint (advisory, full)
@@ -237,6 +242,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The merge base, for the new-code complexity warnings.
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -248,7 +256,9 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Lint everything
-        run: ./.github/ci/lint.sh full
+        env:
+          BASE_REF: origin/${{ github.base_ref || github.ref_name }}
+        run: ./.github/ci/lint.sh full "$BASE_REF"
 
   # Advisory, observation only: size and complexity per package, file and
   # function (.github/ci/metrics). ci-report.yml compares the artifact with the
@@ -267,6 +277,10 @@ jobs:
           go-version-file: go.mod
           cache: true
           cache-dependency-path: .github/ci/metrics/go.sum
+
+      - name: Test the metrics tool
+        working-directory: .github/ci/metrics
+        run: go test ./...
 
       - name: Measure
         working-directory: .github/ci/metrics
