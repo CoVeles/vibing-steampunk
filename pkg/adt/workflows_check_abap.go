@@ -86,8 +86,8 @@ func (c *Client) CheckABAP(ctx context.Context, code string) (result *CheckABAPR
 		op   OperationType
 		name string
 	}{{OpCreate, "CheckABAP (create the temporary program)"}, {OpLock, "CheckABAP (lock the temporary program for deletion)"}, {OpDelete, "CheckABAP (delete the temporary program)"}} {
-		if err := c.checkMutation(ctx, MutationContext{Op: op.op, OpName: op.name, Package: "$TMP"}); err != nil {
-			return nil, err
+		if gateErr := c.checkMutation(ctx, MutationContext{Op: op.op, OpName: op.name, Package: "$TMP"}); gateErr != nil {
+			return nil, gateErr
 		}
 	}
 
@@ -98,7 +98,7 @@ func (c *Client) CheckABAP(ctx context.Context, code string) (result *CheckABAPR
 	objectURL := "/sap/bc/adt/programs/programs/" + url.PathEscape(programName)
 	source := executeWrapperSource(programName, "RISK LEVEL HARMLESS", "lv_result", code)
 
-	if err := c.CreateObject(ctx, CreateObjectOptions{
+	if createErr := c.CreateObject(ctx, CreateObjectOptions{
 		ObjectType:  ObjectTypeProgram,
 		Name:        programName,
 		Description: "Temp program for CheckABAP",
@@ -106,8 +106,8 @@ func (c *Client) CheckABAP(ctx context.Context, code string) (result *CheckABAPR
 		// A failed create whose object then turns out to exist is reported,
 		// not deleted: nothing shows this call created it.
 		leavePartialObject: true,
-	}); err != nil {
-		return nil, fmt.Errorf("creating the temporary program %s in $TMP: %w", programName, err)
+	}); createErr != nil {
+		return nil, fmt.Errorf("creating the temporary program %s in $TMP: %w", programName, createErr)
 	}
 	// Created in $TMP, which the gate above approved: the delete need not look
 	// the package up again (see ExecuteABAP).
@@ -129,8 +129,8 @@ func (c *Client) CheckABAP(ctx context.Context, code string) (result *CheckABAPR
 	if err != nil {
 		return result, fmt.Errorf("syntax check failed: %w", err)
 	}
-	if err := checkRunProcessed(body); err != nil {
-		return result, err
+	if procErr := checkRunProcessed(body); procErr != nil {
+		return result, procErr
 	}
 	messages, err := parseSyntaxCheckResults(body)
 	if err != nil {

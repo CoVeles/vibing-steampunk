@@ -492,6 +492,11 @@ func (e *PartialCreateError) Error() string {
 	case e.LeftInPlace:
 		status = "object left in place, not deleted"
 	}
+	if e.LeftInPlace {
+		// The object exists, but nothing shows this request created it.
+		return fmt.Sprintf("create failed and its outcome is unknown: the object exists, but it may not be this request's (%s): %s [object=%s package=%s transport=%s]",
+			status, e.OriginalErr, e.ObjectURL, e.Package, e.Transport)
+	}
 	return fmt.Sprintf("create failed after partial persistence (%s): %s [object=%s package=%s transport=%s]",
 		status, e.OriginalErr, e.ObjectURL, e.Package, e.Transport)
 }

@@ -9,8 +9,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/oisee/vibing-steampunk/pkg/adt"
 	"github.com/spf13/cobra"
+
+	"github.com/oisee/vibing-steampunk/pkg/adt"
 )
 
 var checkABAPCmd = &cobra.Command{
@@ -30,7 +31,10 @@ in $TMP and deleted afterwards, whatever the check's outcome. For that reason
 it is refused under --read-only.
 
 Exit status: 0 when SAP found no error (warnings allowed) and the temporary
-program was deleted, 1 otherwise. Ctrl-C still deletes the program.
+program was deleted, 1 otherwise. Ctrl-C once the program exists still
+deletes it; Ctrl-C while SAP is still creating it leaves the outcome unknown,
+so the program is not deleted but named in the error, to remove by hand
+(vsp recover-failed-create PROG <name> --package '$TMP').
 
 Examples:
   vsp check-abap "DATA ls TYPE t000. DATA(s) = |{ ls }|."
@@ -53,6 +57,16 @@ func runCheckABAP(cmd *cobra.Command, args []string) error {
 	file, _ := cmd.Flags().GetString("file")
 	stdin, _ := cmd.Flags().GetBool("stdin")
 	asJSON, _ := cmd.Flags().GetBool("json")
+
+	sources := 0
+	for _, given := range []bool{stdin, file != "", len(args) > 0} {
+		if given {
+			sources++
+		}
+	}
+	if sources > 1 {
+		return fmt.Errorf("give the snippet one way only: as an argument, --file or --stdin")
+	}
 
 	var code string
 	switch {
