@@ -1762,7 +1762,8 @@ var packageGated = map[string]string{
 	"tool EditSource":               "",
 	"tool ExecuteABAP":              "", // its temporary program goes to $TMP
 	"tool ImportFromFile":           "",
-	"tool MoveObject":               "", // the target package; the current one is not checked yet
+	"tool MoveObject":               "", // into $TMP: refused for the target package
+	"tool MoveObject out of $TMP":   "", // into ZDEMO_PKG: refused for the package the object is in now
 	"tool RecoverFailedCreate":      "",
 	"tool RenameObject":             "",
 	"tool UI5CreateApp":             "",
@@ -1797,6 +1798,12 @@ const gapActivationPackage = "activation is checked as an operation (A) but not 
 // packageRefusal is the package gate's own wording: CheckPackage's refusal
 // of $TMP, or the UI5 surface's fail-closed refusal (no app→package
 // resolution yet). A lookup error that merely mentions a package is not it.
+// packageGateArgs overrides the synthetic arguments of a packageGated entry
+// named "tool <Tool> <variant>".
+var packageGateArgs = map[string]map[string]any{
+	"tool MoveObject out of $TMP": {"object_type": "PROG", "object_name": "ZDEMO_REPORT", "new_package": "ZDEMO_PKG"},
+}
+
 var packageRefusal = regexp.MustCompile(`operations on package '\$TMP' are blocked by safety configuration|` +
 	`on UI5 surface is blocked: UI5 app→package resolution not yet implemented`)
 
@@ -1829,14 +1836,15 @@ func testPackageGate(t *testing.T) {
 	for _, name := range names {
 		var call func(ctx context.Context, s *Server) (*mcp.CallToolResult, error)
 		mode := "expert"
-		if tool, ok := strings.CutPrefix(name, "tool "); ok {
+		if rest, ok := strings.CutPrefix(name, "tool "); ok {
+			tool := strings.Fields(rest)[0]
 			if _, registered := tools[tool]; !registered {
 				t.Errorf("%s is listed in packageGated and is not a registered tool", name)
 				continue
 			}
 			// No transport: the transportable-edit check would refuse first,
 			// and it is the package gate under test.
-			args := synthArgs(tools[tool], env.dir)
+			args := mergeArgs(synthArgs(tools[tool], env.dir), packageGateArgs[name])
 			delete(args, "transport")
 			call = func(ctx context.Context, s *Server) (*mcp.CallToolResult, error) {
 				return s.mcpServer.ListTools()[tool].Handler(ctx, newRequest(mergeArgs(nil, args)))
