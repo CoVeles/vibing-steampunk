@@ -95,7 +95,12 @@ Create object:
   SAP(action="create", target="OBJECT", params={"object_type": "FUGR/FF", "name": "ZVSP_DEMO_FM", "parent_name": "ZVSP_DEMO", "description": "RFC demo", "package_name": "$TMP", "rfc_enabled": true, "source": "FUNCTION zvsp_demo_fm\n  IMPORTING VALUE(iv_n) TYPE i\n  EXPORTING VALUE(ev_result) TYPE i.\n  ev_result = iv_n * 2.\nENDFUNCTION."})
   SAP(action="create", target="DEVC", params={"name": "$ZNEW", "description": "New package"})
   SAP(action="create", target="OBJECT", params={"object_type": "MSAG/N", "name": "ZDEMO", "description": "Demo messages", "package_name": "$TMP", "language": "DE", "messages": {"001": "Auftrag & nicht gefunden"}})
-  SAP(action="create", target="TABL", params={"name": "ZTABLE", "description": "New table", "fields": "[...]", "package": "$TMP"})
+  SAP(action="create", target="TABL", params={"name": "ZTABLE", "description": "New table", "package": "$TMP",
+      "fields": "[{\"name\":\"MANDT\",\"type\":\"MANDT\",\"key\":true},{\"name\":\"ID\",\"type\":\"CHAR10\",\"key\":true},{\"name\":\"VAL\",\"type\":\"INT4\",\"notNull\":true}]"})
+      Field attributes: name, type, length, decimals, description, key, notNull (others are refused).
+      Client field: a first key field of type MANDT/CLNT is the client field. Without one, a
+      "key client : abap.clnt" is added in front. "client_dependent": false creates a
+      client-independent table with no client field.
   SAP(action="create", target="CLONE", params={"object_type": "CLAS", "source_name": "ZCL_OLD", "target_name": "ZCL_NEW", "package": "$TMP"})
   SAP(action="create", target="STRUCT", params={"description": "Demo", "package": "$TMP",
       "source": "@AbapCatalog.enhancement.category : #EXTENSIBLE_ANY

@@ -3,11 +3,13 @@ package adt
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -1494,6 +1496,14 @@ type CreateTableOptions struct {
 	Transport     string       `json:"transport,omitempty"`     // Transport request (optional for $TMP)
 	DeliveryClass string       `json:"deliveryClass,omitempty"` // A=Application, C=Customizing, L=Temp, etc. (default: A)
 	TableCategory string       `json:"tableCategory,omitempty"` // TRANSPARENT (default), STRUCTURE, etc.
+	// ClientDependent decides the client field (issue #254). nil, the default,
+	// keeps the old behaviour for a field list without a client field: a
+	// `key client : abap.clnt` is put in front. When the list already starts
+	// with a client-typed key field (MANDT, CLIENT, CLNT, abap.clnt), that field
+	// is the client field and none is added. true asks for a client-dependent
+	// table explicitly (same rules), false for a client-independent one: nothing
+	// is added, and a client-typed first key field is refused as contradictory.
+	ClientDependent *bool `json:"clientDependent,omitempty"`
 }
 
 // CreateTable creates a new DDIC transparent table from JSON-like options.
@@ -1531,8 +1541,12 @@ func (c *Client) CreateTable(ctx context.Context, opts CreateTableOptions) error
 		return err
 	}
 
-	// Generate DDL source
-	ddlSource := generateTableDDL(opts)
+	// Generate DDL source. A field list that contradicts the client setting
+	// is refused here, before anything reaches SAP.
+	ddlSource, err := generateTableDDL(opts)
+	if err != nil {
+		return err
+	}
 
 	// Step 1: Create table object
 	createBody := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -1549,7 +1563,7 @@ func (c *Client) CreateTable(ctx context.Context, opts CreateTableOptions) error
 		params.Set("corrNr", opts.Transport)
 	}
 
-	_, err := c.transport.Request(ctx, "/sap/bc/adt/ddic/tables", &RequestOptions{
+	_, err = c.transport.Request(ctx, "/sap/bc/adt/ddic/tables", &RequestOptions{
 		Method:      http.MethodPost,
 		Query:       params,
 		Body:        []byte(createBody),
@@ -1607,8 +1621,71 @@ func (c *Client) CreateTable(ctx context.Context, opts CreateTableOptions) error
 	return nil
 }
 
+// isClientFieldType reports whether a field spec types the field as an SAP
+// client (data element MANDT, built-in CLNT).
+func isClientFieldType(f TableField) bool {
+	switch strings.ToUpper(strings.TrimSpace(f.Type)) {
+	case "MANDT", "CLIENT", "CLNT", "ABAP.CLNT":
+		return true
+	}
+	return false
+}
+
+// tableNeedsClientField decides whether generateTableDDL puts its own
+// `key client` in front of the caller's fields (issue #254). It used to do
+// that unconditionally, so a field list that already began with MANDT came
+// out with two client key fields.
+func tableNeedsClientField(opts CreateTableOptions) (bool, error) {
+	firstIsClient := len(opts.Fields) > 0 && opts.Fields[0].IsKey && isClientFieldType(opts.Fields[0])
+
+	if opts.ClientDependent != nil && !*opts.ClientDependent {
+		if firstIsClient {
+			return false, fmt.Errorf("client_dependent is false, but the first key field %s has client type %s, which makes the table client-dependent; drop the field or leave client_dependent out",
+				strings.ToUpper(opts.Fields[0].Name), opts.Fields[0].Type)
+		}
+		return false, nil
+	}
+	if firstIsClient {
+		return false, nil
+	}
+	for i, f := range opts.Fields {
+		if isClientFieldType(f) {
+			return false, fmt.Errorf("field %d (%s) has client type %s but is not the first key field; a client field must come first with \"key\": true, or set client_dependent to false for a client-independent table",
+				i+1, strings.ToUpper(f.Name), f.Type)
+		}
+		if strings.EqualFold(f.Name, "CLIENT") {
+			return false, fmt.Errorf("field %d is named CLIENT, which collides with the client key field vsp adds; give it client type (MANDT) as the first key field, rename it, or set client_dependent to false",
+				i+1)
+		}
+	}
+	return true, nil
+}
+
+// TableClientField says which field CreateTable makes the client field for
+// these options: "CLIENT" with added=true when it puts one in front, the
+// caller's first field when that is the client field, "" for a
+// client-independent table. The error is the one CreateTable would refuse the
+// options with.
+func TableClientField(opts CreateTableOptions) (name string, added bool, err error) {
+	add, err := tableNeedsClientField(opts)
+	switch {
+	case err != nil:
+		return "", false, err
+	case add:
+		return "CLIENT", true, nil
+	case len(opts.Fields) > 0 && opts.Fields[0].IsKey && isClientFieldType(opts.Fields[0]):
+		return strings.ToUpper(opts.Fields[0].Name), false, nil
+	}
+	return "", false, nil
+}
+
 // generateTableDDL converts CreateTableOptions to CDS-style DDL source.
-func generateTableDDL(opts CreateTableOptions) string {
+func generateTableDDL(opts CreateTableOptions) (string, error) {
+	addClient, err := tableNeedsClientField(opts)
+	if err != nil {
+		return "", err
+	}
+
 	var sb strings.Builder
 
 	// Annotations - must match SAP's expected format
@@ -1619,8 +1696,11 @@ func generateTableDDL(opts CreateTableOptions) string {
 	sb.WriteString("@AbapCatalog.dataMaintenance : #ALLOWED\n")
 	sb.WriteString(fmt.Sprintf("define table %s {\n\n", strings.ToLower(opts.Name)))
 
-	// Auto-add MANDT as first key field (standard SAP practice)
-	sb.WriteString("  key client : abap.clnt not null;\n")
+	// The client key field, only when the caller's list has none of its own
+	// and did not ask for a client-independent table.
+	if addClient {
+		sb.WriteString("  key client : abap.clnt not null;\n")
+	}
 
 	// User-defined fields
 	for _, f := range opts.Fields {
@@ -1637,7 +1717,7 @@ func generateTableDDL(opts CreateTableOptions) string {
 	}
 
 	sb.WriteString("\n}\n")
-	return sb.String()
+	return sb.String(), nil
 }
 
 // mapFieldType converts a simple type spec to ABAP DDL type.
@@ -1694,6 +1774,8 @@ func mapFieldType(f TableField) string {
 		return "sysuuid_x16"
 	case "MANDT", "CLIENT":
 		return "mandt"
+	case "CLNT":
+		return "abap.clnt"
 	}
 
 	// Check for CHARnn, NUMCnn shorthand (e.g., CHAR32, NUMC10)
@@ -1710,4 +1792,76 @@ func mapFieldType(f TableField) string {
 
 func escapeQuote(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
+}
+
+// tableFieldJSONKeys are the attributes a CreateTable field spec takes, as
+// spelled in JSON. ParseTableFields refuses every other key.
+var tableFieldJSONKeys = []string{"name", "type", "length", "decimals", "description", "key", "notNull"}
+
+// ParseTableFields decodes a CreateTable field list from JSON. An attribute
+// it does not know is an error, not a silently different table (issue #254:
+// "not_null" was dropped by json.Unmarshal and the field came out nullable).
+func ParseTableFields(fieldsJSON string) ([]TableField, error) {
+	var raw []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(fieldsJSON), &raw); err != nil {
+		return nil, fmt.Errorf("fields must be a JSON array of objects: %w", err)
+	}
+
+	known := make(map[string]bool, len(tableFieldJSONKeys))
+	for _, k := range tableFieldJSONKeys {
+		known[k] = true
+	}
+
+	fields := make([]TableField, 0, len(raw))
+	for i, obj := range raw {
+		var unknown []string
+		for k := range obj {
+			if !known[k] {
+				unknown = append(unknown, k)
+			}
+		}
+		if len(unknown) > 0 {
+			sort.Strings(unknown)
+			label := fmt.Sprintf("field %d", i+1)
+			var name string
+			if json.Unmarshal(obj["name"], &name) == nil && name != "" {
+				label += " (" + strings.ToUpper(name) + ")"
+			}
+			parts := make([]string, len(unknown))
+			for j, k := range unknown {
+				parts[j] = fmt.Sprintf("%q", k)
+				if s := suggestTableFieldKey(k); s != "" {
+					parts[j] += fmt.Sprintf(" (did you mean %q?)", s)
+				}
+			}
+			return nil, fmt.Errorf("%s: unknown attribute %s; a field takes only %s",
+				label, strings.Join(parts, ", "), strings.Join(tableFieldJSONKeys, ", "))
+		}
+
+		var f TableField
+		buf, _ := json.Marshal(obj)
+		if err := json.Unmarshal(buf, &f); err != nil {
+			return nil, fmt.Errorf("field %d: %w", i+1, err)
+		}
+		if f.Name == "" || f.Type == "" {
+			return nil, fmt.Errorf("field %d: \"name\" and \"type\" are required", i+1)
+		}
+		fields = append(fields, f)
+	}
+	return fields, nil
+}
+
+// suggestTableFieldKey maps a near miss (not_null, notnull, NOTNULL, is_key)
+// to the attribute it most likely meant.
+func suggestTableFieldKey(k string) string {
+	norm := strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(k))
+	if norm == "iskey" {
+		return "key"
+	}
+	for _, known := range tableFieldJSONKeys {
+		if norm == strings.ToLower(known) {
+			return known
+		}
+	}
+	return ""
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -355,10 +356,11 @@ func (s *Server) handleCreateTable(ctx context.Context, request mcp.CallToolRequ
 		return newToolResultError("fields is required (JSON array)"), nil
 	}
 
-	// Parse fields JSON
-	var fields []adt.TableField
-	if err := json.Unmarshal([]byte(fieldsJSON), &fields); err != nil {
-		return newToolResultError(fmt.Sprintf("Invalid fields JSON: %v", err)), nil
+	// Parse fields JSON. An unknown attribute (say "not_null" for "notNull")
+	// is refused rather than dropped (issue #254).
+	fields, err := adt.ParseTableFields(fieldsJSON)
+	if err != nil {
+		return newToolResultError(fmt.Sprintf("Invalid fields: %v", err)), nil
 	}
 
 	if len(fields) == 0 {
@@ -390,10 +392,31 @@ func (s *Server) handleCreateTable(ctx context.Context, request mcp.CallToolRequ
 		DeliveryClass: deliveryClass,
 	}
 
-	err := s.adtClient.CreateTable(ctx, opts)
-	if err != nil {
+	// client_dependent: true/false (or "true"/"false"); left out, a client key
+	// field is added unless the first key field already is one.
+	if v, present := request.GetArguments()["client_dependent"]; present && v != nil {
+		var b bool
+		switch t := v.(type) {
+		case bool:
+			b = t
+		case string:
+			parsed, perr := strconv.ParseBool(strings.TrimSpace(t))
+			if perr != nil {
+				return newToolResultError(fmt.Sprintf("client_dependent must be true or false, got %q", t)), nil
+			}
+			b = parsed
+		default:
+			return newToolResultError(fmt.Sprintf("client_dependent must be true or false, got %v", v)), nil
+		}
+		opts.ClientDependent = &b
+	}
+
+	// CreateTable checks the field list against the client setting after its
+	// mutation gate, so --read-only answers first.
+	if err := s.adtClient.CreateTable(ctx, opts); err != nil {
 		return newToolResultError(fmt.Sprintf("Failed to create table: %v", err)), nil
 	}
+	clientField, clientAdded, _ := adt.TableClientField(opts) // accepted by CreateTable above
 
 	result := map[string]interface{}{
 		"status":      "created",
@@ -401,6 +424,15 @@ func (s *Server) handleCreateTable(ctx context.Context, request mcp.CallToolRequ
 		"package":     pkg,
 		"description": description,
 		"fields":      len(fields),
+	}
+	if clientField == "" {
+		result["client_dependent"] = false
+	} else {
+		result["client_dependent"] = true
+		result["client_field"] = clientField
+		if clientAdded {
+			result["client_field_added"] = true
+		}
 	}
 	output, _ := json.MarshalIndent(result, "", "  ")
 	return mcp.NewToolResultText(string(output)), nil
