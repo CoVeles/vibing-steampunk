@@ -159,6 +159,19 @@ of a client-specific table cannot be in the WHERE condition.`)
 Unit tests:
   SAP(action="test", target="CLAS ZCL_TEST", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test"})
   SAP(action="test", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test", "include_dangerous": true})
+  SAP(action="test", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test", "only_failures": true})
+
+  Answers JSON:
+    ok        true when a test method ran and nothing failed (a run with no test
+              method is not ok; "note" says why)
+    counts    {classes, methods, passed, failed, classFailures, warnings} for the whole run
+    classes   name, parentName, alerts filed on the class (CLASS_SETUP/TEARDOWN, or
+              a class not run for its risk level), testMethods: name, alerts
+              (kind, severity, title, details, ...)
+  only_failures: true lists only failed methods, and classes with alerts of their
+  own, without URIs or stacks (an alert's "at" is where it was raised). The
+  counts still cover the whole run, so an all-green run is just ok + counts.
+  include_dangerous runs RISK LEVEL DANGEROUS/CRITICAL tests; --read-only refuses it.
 
 ATC check:
   SAP(action="test", params={"type": "atc", "object_url": "/sap/bc/adt/oo/classes/zcl_test"})`)

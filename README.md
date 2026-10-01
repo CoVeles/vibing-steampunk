@@ -1935,6 +1935,34 @@ prints the same object as the MCP tool.
 
 See [ExecuteABAP Report](reports/2025-12-05-004-execute-abap-implementation.md) for details.
 
+## ABAP Unit results
+
+`RunUnitTests` / `SAP(action="test")` answers JSON:
+
+```json
+{
+  "ok": false,
+  "counts": { "classes": 2, "methods": 3, "passed": 2, "failed": 1, "classFailures": 1, "warnings": 1 },
+  "classes": [ { "name": "LTC_CALC", "parentName": "ZCL_DEMO_CALC", "testMethods": [ ... ], ... } ]
+}
+```
+
+- `ok` is true when at least one test method ran and nothing failed; a run in
+  which no test method ran is not ok, and `note` says why.
+- A method fails on a failed assertion or an exception (or any critical/fatal
+  alert). Warnings, such as a class not run for its risk level, are counted but
+  do not fail it.
+- `classes` keeps the fields it always had (name, parentName, testMethods with
+  name and alerts: kind, severity, title, details, stack; alerts filed on the
+  class itself, as CLASS_SETUP/CLASS_TEARDOWN failures are).
+- `"only_failures": true` lists only failed methods and classes with alerts of
+  their own, without URIs or stacks (`at` is where the alert was raised); the
+  counts still cover the whole run, so a green run is just `ok` + `counts`.
+- `include_dangerous` runs RISK LEVEL DANGEROUS/CRITICAL tests and is refused
+  under `--read-only`.
+
+CLI: `vsp test CLAS ZCL_X --only-failures`, `vsp test CLAS ZCL_X --json`.
+
 ## AI-Powered Root Cause Analysis
 
 vsp enables AI assistants to investigate production issues autonomously:

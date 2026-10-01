@@ -855,7 +855,7 @@ func (s *Server) registerDevTools(shouldRegister func(string) bool) {
 
 	if shouldRegister("RunUnitTests") {
 		s.mcpServer.AddTool(mcp.NewTool("RunUnitTests",
-			mcp.WithDescription("Run ABAP Unit tests for an object"),
+			mcp.WithDescription("Run ABAP Unit tests for an object. Answers JSON: ok (a test method ran and nothing failed), counts {classes, methods, passed, failed, classFailures, warnings}, and classes (each with name, parentName, alerts filed on the class, and testMethods with name and alerts: kind, severity, title, details). only_failures lists just the failed methods and classes with alerts, without URIs or stacks."),
 			mcp.WithString("object_url",
 				mcp.Required(),
 				mcp.Description("ADT URL of the object (e.g., /sap/bc/adt/oo/classes/ZCL_TEST)"),
@@ -865,6 +865,9 @@ func (s *Server) registerDevTools(shouldRegister func(string) bool) {
 			),
 			mcp.WithBoolean("include_long",
 				mcp.Description("Include long duration tests (default: false)"),
+			),
+			mcp.WithBoolean("only_failures",
+				mcp.Description("List only failed test methods (and classes with alerts of their own), plus the counts for the whole run (default: false)"),
 			),
 		), s.handleRunUnitTests)
 	}
