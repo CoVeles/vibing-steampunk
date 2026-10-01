@@ -78,9 +78,10 @@ type fakeSAP struct {
 	mu   sync.Mutex
 	reqs []sentRequest
 	srv  *httptest.Server
-	// absent makes every object read a 404, so a handler that checks for an
-	// object before writing takes its create path. The run is made in both
-	// worlds: a write can hide behind either answer.
+	// absent makes every object read a 404 and every repository search
+	// empty, so a handler that checks for an object before writing — by
+	// reading it or by searching for it — takes its create path. The run is
+	// made in both worlds: a write can hide behind either answer.
 	absent atomic.Bool
 }
 
@@ -132,6 +133,10 @@ func (f *fakeSAP) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(fakeLockResult))
 	case strings.Contains(r.URL.Path, "/informationsystem/search"):
 		w.Header().Set("Content-Type", "application/xml")
+		if f.absent.Load() {
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"/>`))
+			return
+		}
 		_, _ = w.Write([]byte(fakeSearchHits(q.Get("query"))))
 	case strings.Contains(r.URL.Path, "/source/"):
 		w.Header().Set("Content-Type", "text/plain")
