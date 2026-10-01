@@ -81,8 +81,10 @@ CLASS zcl_vsp_apc_handler IMPLEMENTATION.
 
     " Push: bind this WebSocket to its own extension of AMC channel
     " ZVSP_TRANSPORT /buffer, on which the transport service's background
-    " job publishes the outcome of an add. Without the AMC application the
-    " binding fails and outcomes are read with the status call instead.
+    " job publishes the outcome of an add. Whatever goes wrong here -- the
+    " AMC application missing (an abapGit deploy, a failed install step) or
+    " anything else -- must not take the WebSocket down with it: the session
+    " goes on without push, and outcomes are read with the status call.
     DATA(lv_push) = abap_false.
     TRY.
         i_context->get_binding_manager( )->bind_amc_message_consumer(
@@ -90,7 +92,8 @@ CLASS zcl_vsp_apc_handler IMPLEMENTATION.
           i_channel_id           = '/buffer'
           i_channel_extension_id = CONV #( mv_session_id ) ).
         lv_push = abap_true.
-      CATCH cx_apc_error ##NO_HANDLER.
+      CATCH cx_root ##CATCH_ALL.
+        lv_push = abap_false.
     ENDTRY.
 
     DATA lt_domains TYPE string_table.

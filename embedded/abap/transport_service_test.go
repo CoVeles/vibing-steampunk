@@ -648,8 +648,10 @@ func TestTransportPush(t *testing.T) {
 	if !strings.Contains(start, "BIND_AMC_MESSAGE_CONSUMER( I_APPLICATION_ID = 'ZVSP_TRANSPORT' I_CHANNEL_ID = '/BUFFER' I_CHANNEL_EXTENSION_ID = CONV #( MV_SESSION_ID ) )") {
 		t.Error("on_start does not bind the WebSocket to its own extension of ZVSP_TRANSPORT /buffer")
 	}
-	if !strings.Contains(start, "CATCH CX_APC_ERROR") {
-		t.Error("on_start must survive a missing AMC application")
+	// Any failure of the bind -- not only cx_apc_error -- leaves the session
+	// up without push (critic, round 3 #1).
+	if !regexp.MustCompile(`BIND_AMC_MESSAGE_CONSUMER\([^\n]*\)\nLV_PUSH = ABAP_TRUE\nCATCH CX_ROOT( ##CATCH_ALL)?\nLV_PUSH = ABAP_FALSE\nENDTRY`).MatchString(start) {
+		t.Errorf("on_start must catch cx_root around the AMC bind and go on without push:\n%s", start)
 	}
 
 	src := transportServiceSource(t)
