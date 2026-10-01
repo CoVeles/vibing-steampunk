@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/oisee/vibing-steampunk/pkg/sapcompress"
 )
 
 // FuzzParse decodes arbitrary cluster blobs. A cluster is read out of a table
@@ -96,5 +98,39 @@ func TestRowLengthOutOfRange(t *testing.T) {
 	copy(bad[at+1:], []byte{0xFF, 0xFF, 0xFF, 0xFF})
 	if _, err := Parse(bad); err == nil {
 		t.Fatal("a row of 0xFFFFFFFF bytes parsed")
+	}
+}
+
+// TestTableCountReadErrorIsNotAnEmptyTable: tableRows used to drop the
+// errors from u32(). Once u32 refused lengths past 2 GiB, a block missing its
+// row count — BE, line length, then straight to BF — read "BF 03 0E 00" as
+// the count, had it refused, carried on with zero rows and took the BF as
+// the table's end, so a corrupt cluster parsed cleanly. The blob here is the
+// BALDAT fixture, decompressed, with the first empty table's count removed.
+func TestTableCountReadErrorIsNotAnEmptyTable(t *testing.T) {
+	blob := loadHex(t, "baldat_a4h.hex")
+	body, err := sapcompress.Decompress(blob[HeaderSize:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := append(append([]byte{}, blob[:HeaderSize]...), body...)
+	plain[4] = 1 // body format: uncompressed
+	if _, err := Parse(plain); err != nil {
+		t.Fatalf("the decompressed fixture itself does not parse: %v", err)
+	}
+	// BE, line length, count 0, BF: an empty nested table.
+	at := -1
+	for i := HeaderSize; i+10 <= len(plain); i++ {
+		if plain[i] == 0xBE && bytes.Equal(plain[i+5:i+10], []byte{0, 0, 0, 0, 0xBF}) {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		t.Fatal("fixture has no empty nested table")
+	}
+	bad := append(append([]byte{}, plain[:at+5]...), plain[at+9:]...)
+	if _, err := Parse(bad); err == nil {
+		t.Fatal("a nested table without its row count parsed")
 	}
 }

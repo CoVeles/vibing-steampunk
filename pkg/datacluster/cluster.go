@@ -567,8 +567,14 @@ func (p *parser) tableRows(table *Node) ([][]any, error) {
 	if err := p.need(8); err != nil {
 		return nil, err
 	}
-	lineLen, _ := p.u32()
-	count, _ := p.u32()
+	lineLen, err := p.u32()
+	if err != nil {
+		return nil, fmt.Errorf("nested table line length: %w", err)
+	}
+	count, err := p.u32()
+	if err != nil {
+		return nil, fmt.Errorf("nested table row count: %w", err)
+	}
 	if lineLen != table.Length {
 		return nil, fmt.Errorf("nested table data has line length %d, its descriptor %d", lineLen, table.Length)
 	}
