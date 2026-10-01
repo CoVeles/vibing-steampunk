@@ -426,8 +426,8 @@ CLASS ltc_executor DEFINITION FOR TESTING %[2]s DURATION SHORT.
   PUBLIC SECTION.
     METHODS execute_payload FOR TESTING.
   PRIVATE SECTION.
-    DATA mt_vsp_exec_results TYPE string_table.
-    METHODS return_value IMPORTING value TYPE simple.
+    DATA mv_vsp_returned TYPE abap_bool.
+    METHODS return_value IMPORTING value TYPE any.
 ENDCLASS.
 
 CLASS ltc_executor IMPLEMENTATION.
@@ -438,19 +438,62 @@ CLASS ltc_executor IMPLEMENTATION.
 %[5]s
     " === USER CODE END ===
 
-    " Return results via assertion messages: one per RETURN_VALUE( ), without
-    " leaving the method, then the return variable.
-    LOOP AT mt_vsp_exec_results INTO DATA(lv_vsp_exec_value).
-      cl_abap_unit_assert=>fail( msg = |%[6]s{ lv_vsp_exec_value }| quit = if_aunit_constants=>no ).
-    ENDLOOP.
-    IF mt_vsp_exec_results IS INITIAL OR %[3]s IS NOT INITIAL.
+    " Hand back the return variable: always when RETURN_VALUE( ) was never
+    " called, and otherwise only when it was set.
+    IF mv_vsp_returned = abap_false OR %[3]s IS NOT INITIAL.
       cl_abap_unit_assert=>fail( msg = |%[6]s{ %[3]s }| ).
     ENDIF.
   ENDMETHOD.
 
-  " RETURN_VALUE( x ) hands one more value back; call it as often as needed.
+  " RETURN_VALUE( x ) hands one value back at once, without leaving the
+  " method, so a RETURN, CHECK or exception after it cannot lose it.
   METHOD return_value.
-    APPEND |{ value }| TO mt_vsp_exec_results.
+    DATA lv_vsp_text TYPE string.
+    DATA lr_vsp_data TYPE REF TO data.
+    DATA lo_vsp_object TYPE REF TO object.
+    FIELD-SYMBOLS <lv_vsp_elem> TYPE simple.
+    FIELD-SYMBOLS <lv_vsp_any> TYPE any.
+    mv_vsp_returned = abap_true.
+    DATA(lo_vsp_type) = cl_abap_typedescr=>describe_by_data( value ).
+    CASE lo_vsp_type->kind.
+      WHEN cl_abap_typedescr=>kind_elem.
+        ASSIGN value TO <lv_vsp_elem>.
+        lv_vsp_text = |{ <lv_vsp_elem> }|.
+      WHEN cl_abap_typedescr=>kind_ref.
+        CASE CAST cl_abap_refdescr( lo_vsp_type )->get_referenced_type( )->kind.
+          WHEN cl_abap_typedescr=>kind_class OR cl_abap_typedescr=>kind_intf.
+            lo_vsp_object = value.
+            IF lo_vsp_object IS BOUND.
+              lv_vsp_text = |<object { cl_abap_typedescr=>describe_by_object_ref( lo_vsp_object )->get_relative_name( ) }>|.
+            ELSE.
+              lv_vsp_text = '<initial reference>'.
+            ENDIF.
+          WHEN OTHERS.
+            lr_vsp_data = value.
+            IF lr_vsp_data IS NOT BOUND.
+              lv_vsp_text = '<initial reference>'.
+            ELSE.
+              " A data reference hands back what it points to.
+              ASSIGN lr_vsp_data->* TO <lv_vsp_any>.
+              return_value( <lv_vsp_any> ).
+              RETURN.
+            ENDIF.
+        ENDCASE.
+      WHEN OTHERS.
+        " Structures and tables come back as JSON.
+        TRY.
+            DATA(lo_vsp_json) = cl_sxml_string_writer=>create( type = if_sxml=>co_xt_json ).
+            CALL TRANSFORMATION id SOURCE value = value RESULT XML lo_vsp_json.
+            lv_vsp_text = cl_abap_codepage=>convert_from( lo_vsp_json->get_output( ) ).
+            " id wraps the value as {"VALUE":...}; hand back only the value.
+            IF strlen( lv_vsp_text ) > 10 AND lv_vsp_text(9) = '{"VALUE":'.
+              lv_vsp_text = substring( val = lv_vsp_text off = 9 len = strlen( lv_vsp_text ) - 10 ).
+            ENDIF.
+          CATCH cx_root INTO DATA(lx_vsp_json).
+            lv_vsp_text = |<not serializable: { lx_vsp_json->get_text( ) }>|.
+        ENDTRY.
+    ENDCASE.
+    cl_abap_unit_assert=>fail( msg = |%[6]s{ lv_vsp_text }| quit = if_aunit_constants=>no ).
   ENDMETHOD.
 ENDCLASS.
 `, programName, riskLevel, returnVariable, payloadStartMarker, code, execResultMarker)

@@ -1740,6 +1740,9 @@ func runTest(cmd *cobra.Command, args []string) error {
 // (only the failed ones with onlyFailures); --json prints the MCP tool's
 // object. Both end on the same counts.
 func printUnitTestReport(w io.Writer, result *adt.UnitTestResult, onlyFailures, asJSON bool) error {
+	if result == nil {
+		result = &adt.UnitTestResult{}
+	}
 	report := adt.NewUnitTestReport(result, onlyFailures)
 	counts := report.Counts
 
@@ -1752,7 +1755,6 @@ func printUnitTestReport(w io.Writer, result *adt.UnitTestResult, onlyFailures, 
 	} else {
 		if counts.Classes == 0 {
 			fmt.Fprintln(w, "No test classes found.")
-			return nil
 		}
 		for _, class := range result.Classes {
 			var lines []string
@@ -1791,26 +1793,40 @@ func printUnitTestReport(w io.Writer, result *adt.UnitTestResult, onlyFailures, 
 				fmt.Fprintln(w, line)
 			}
 		}
-		summary := fmt.Sprintf("\nTotal: %d passed, %d failed", counts.Passed, counts.Failed)
-		if counts.ClassFailures > 0 {
-			summary += fmt.Sprintf(", %d class-level failure(s)", counts.ClassFailures)
+		if counts.Classes > 0 {
+			summary := fmt.Sprintf("\nTotal: %d passed, %d failed", counts.Passed, counts.Failed)
+			if counts.ClassFailures > 0 {
+				summary += fmt.Sprintf(", %d class-level failure(s)", counts.ClassFailures)
+			}
+			if counts.Warnings > 0 {
+				summary += fmt.Sprintf(", %d warning(s)", counts.Warnings)
+			}
+			if counts.NotRun > 0 {
+				summary += fmt.Sprintf(", %d class(es) not run", counts.NotRun)
+			}
+			fmt.Fprintln(w, summary)
 		}
-		if counts.Warnings > 0 {
-			summary += fmt.Sprintf(", %d warning(s)", counts.Warnings)
-		}
-		fmt.Fprintln(w, summary)
 		if report.Note != "" {
 			fmt.Fprintln(w, report.Note)
 		}
 	}
 
+	// The exit code follows report.OK in both forms: a run that is not ok,
+	// including one with no test class or a class ABAP Unit did not run,
+	// exits non-zero.
 	switch {
+	case report.OK:
+		return nil
 	case counts.Failed > 0 || counts.ClassFailures > 0:
 		return fmt.Errorf("%d test(s) failed", counts.Failed+counts.ClassFailures)
-	case counts.Classes > 0 && counts.Methods == 0:
+	case counts.Classes == 0:
+		return fmt.Errorf("no test class found, nothing ran")
+	case counts.Methods == 0:
 		return fmt.Errorf("no test method ran")
+	case counts.NotRun > 0:
+		return fmt.Errorf("%d test class(es) not run: %s", counts.NotRun, strings.Join(report.NotRunClasses, ", "))
 	}
-	return nil
+	return fmt.Errorf("test run is not ok")
 }
 
 func runATC(cmd *cobra.Command, args []string) error {

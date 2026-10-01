@@ -109,14 +109,30 @@ func TestExecuteABAPResultLeanKeepsAlertsOnlyWithoutAValue(t *testing.T) {
 func TestWrapperReturnsEveryValueWithoutLeavingTheMethod(t *testing.T) {
 	source := executeWrapperSource("ZTEMP_EXEC_00000000", "RISK LEVEL HARMLESS", "lv_result", "RETURN_VALUE( 1 ).")
 	for _, want := range []string{
-		"METHODS return_value IMPORTING value TYPE simple.",
+		"METHODS return_value IMPORTING value TYPE any.",
 		"METHOD return_value.",
-		"quit = if_aunit_constants=>no",
-		"IF mt_vsp_exec_results IS INITIAL OR lv_result IS NOT INITIAL.",
+		"IF mv_vsp_returned = abap_false OR lv_result IS NOT INITIAL.",
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("the wrapper does not contain %q:\n%s", want, source)
 		}
+	}
+	// Each value is emitted inside return_value itself, not collected and
+	// emitted after the payload: code after the payload never runs when the
+	// payload leaves early (RETURN, CHECK, an exception), and every value
+	// collected so far was lost with it.
+	_, body, found := strings.Cut(source, "METHOD return_value.")
+	if !found {
+		t.Fatalf("no return_value method:\n%s", source)
+	}
+	body, _, _ = strings.Cut(body, "ENDMETHOD.")
+	if !strings.Contains(body, "cl_abap_unit_assert=>fail( msg = |"+execResultMarker+"{ lv_vsp_text }| quit = if_aunit_constants=>no )") {
+		t.Errorf("return_value does not hand its value back at once:\n%s", body)
+	}
+	_, afterPayload, _ := strings.Cut(source, "=== USER CODE END ===")
+	afterPayload, _, _ = strings.Cut(afterPayload, "ENDMETHOD.")
+	if strings.Contains(afterPayload, "LOOP AT") {
+		t.Errorf("values are still emitted after the payload:\n%s", afterPayload)
 	}
 	// The payload still starts on line 18, which the live fixtures elsewhere in
 	// these tests were recorded against.

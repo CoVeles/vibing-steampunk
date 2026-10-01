@@ -146,6 +146,47 @@ func TestUnitTestReportNothingRanIsNotOK(t *testing.T) {
 	}
 }
 
+// partialRefusalXML is a run in which ABAP Unit ran one test class and refused
+// the other for its risk level: the refused class comes back with no test
+// method and only a tolerable warning on the class.
+const partialRefusalXML = `<?xml version="1.0" encoding="utf-8"?>` +
+	`<aunit:runResult xmlns:aunit="http://www.sap.com/adt/aunit" xmlns:adtcore="http://www.sap.com/adt/core">` +
+	`<program adtcore:uri="/sap/bc/adt/oo/classes/zcl_demo_calc" adtcore:type="CLAS/OC" adtcore:name="ZCL_DEMO_CALC">` +
+	`<testClasses>` +
+	`<testClass adtcore:uri="/sap/bc/adt/oo/classes/zcl_demo_calc/includes/testclasses#type=CLAS%2FOLD;name=LTC_CALC" adtcore:type="CLAS/OLD" adtcore:name="LTC_CALC" durationCategory="short" riskLevel="harmless">` +
+	`<testMethods>` +
+	`<testMethod adtcore:uri="/sap/bc/adt/oo/classes/zcl_demo_calc/includes/testclasses#type=CLAS%2FOLI;name=LTC_CALC%20%20ADDS" adtcore:type="CLAS/OLI" adtcore:name="ADDS" executionTime="0.001" unit="s"/>` +
+	`</testMethods></testClass>` +
+	`<testClass adtcore:uri="/sap/bc/adt/oo/classes/zcl_demo_calc/includes/testclasses#type=CLAS%2FOLD;name=LTC_DB" adtcore:type="CLAS/OLD" adtcore:name="LTC_DB" durationCategory="short" riskLevel="dangerous">` +
+	`<alerts><alert kind="warning" severity="tolerable"><title>No execution, risk level of test class exceeds upper limit</title></alert></alerts>` +
+	`<testMethods/></testClass>` +
+	`</testClasses></program></aunit:runResult>`
+
+// One class passed and one was refused: the run is not ok, and the note names
+// the refused class. Main used to exit non-zero here.
+func TestUnitTestReportPartialRefusalIsNotOK(t *testing.T) {
+	result, err := parseUnitTestResult([]byte(partialRefusalXML))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, onlyFailures := range []bool{false, true} {
+		report := NewUnitTestReport(result, onlyFailures)
+		want := UnitTestCounts{Classes: 2, Methods: 1, Passed: 1, Warnings: 1, NotRun: 1}
+		if report.Counts != want {
+			t.Fatalf("counts = %+v, want %+v", report.Counts, want)
+		}
+		if report.OK {
+			t.Fatalf("onlyFailures=%v: a run with a refused test class is ok", onlyFailures)
+		}
+		if len(report.NotRunClasses) != 1 || report.NotRunClasses[0] != "LTC_DB" {
+			t.Fatalf("notRunClasses = %v", report.NotRunClasses)
+		}
+		if !strings.Contains(report.Note, "LTC_DB") {
+			t.Fatalf("the note does not name the refused class: %q", report.Note)
+		}
+	}
+}
+
 // SAP's titles are full of angle brackets; the JSON keeps them as they are.
 func TestIndentJSONKeepsAngleBrackets(t *testing.T) {
 	out, err := IndentJSON(map[string]string{"title": "Exception Error <CX_SY_ZERODIVIDE> & more"})

@@ -65,3 +65,45 @@ func TestPrintUnitTestReportJSONKeepsAngleBrackets(t *testing.T) {
 		t.Fatalf("SAP's title was escaped:\n%s", buf.String())
 	}
 }
+
+// One class passed and the other was refused for its risk level: not a pass,
+// in text and in JSON.
+func TestPrintUnitTestReportPartialRefusalFails(t *testing.T) {
+	run := &adt.UnitTestResult{Classes: []adt.UnitTestClass{
+		{Name: "LTC_CALC", TestMethods: []adt.UnitTestMethod{{Name: "ADDS"}}},
+		{Name: "LTC_DB", Alerts: []adt.UnitTestAlert{{Kind: "warning", Severity: "tolerable", Title: "No execution, risk level of test class exceeds upper limit"}}},
+	}}
+	for _, asJSON := range []bool{false, true} {
+		var buf bytes.Buffer
+		err := printUnitTestReport(&buf, run, false, asJSON)
+		if err == nil {
+			t.Fatalf("json=%v: a run with a refused class exited zero:\n%s", asJSON, buf.String())
+		}
+		if !strings.Contains(err.Error(), "LTC_DB") || !strings.Contains(buf.String(), "LTC_DB") {
+			t.Errorf("json=%v: the refused class is not named: %v\n%s", asJSON, err, buf.String())
+		}
+	}
+}
+
+// A run with no test class at all is not ok, so it exits non-zero in both forms.
+func TestPrintUnitTestReportNoClassesFails(t *testing.T) {
+	for _, run := range []*adt.UnitTestResult{nil, {}, {Classes: []adt.UnitTestClass{}}} {
+		for _, asJSON := range []bool{false, true} {
+			var buf bytes.Buffer
+			if err := printUnitTestReport(&buf, run, false, asJSON); err == nil {
+				t.Fatalf("json=%v: an empty run exited zero:\n%s", asJSON, buf.String())
+			}
+		}
+	}
+}
+
+// An all-green run still exits zero.
+func TestPrintUnitTestReportGreenRunPasses(t *testing.T) {
+	run := &adt.UnitTestResult{Classes: []adt.UnitTestClass{{Name: "LTC_A", TestMethods: []adt.UnitTestMethod{{Name: "M1"}}}}}
+	for _, asJSON := range []bool{false, true} {
+		var buf bytes.Buffer
+		if err := printUnitTestReport(&buf, run, false, asJSON); err != nil {
+			t.Fatalf("json=%v: a green run failed: %v", asJSON, err)
+		}
+	}
+}

@@ -1,6 +1,9 @@
 package adt
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // --- ABAP Unit report: a stable, lean answer for the test tool ---
 
@@ -22,6 +25,11 @@ type UnitTestCounts struct {
 	// The most common one is a class ABAP Unit refused to run because its risk
 	// level or duration is above what the run allowed.
 	Warnings int `json:"warnings"`
+	// NotRun counts test classes that ran no test method and have no failure
+	// of their own: ABAP Unit listed them but refused or skipped them, most
+	// often because their risk level or duration is above what the run
+	// allowed. Such a class is not a pass, so a run with one is not OK.
+	NotRun int `json:"notRun"`
 }
 
 // UnitTestReport is what the test tool answers.
@@ -39,6 +47,8 @@ type UnitTestReport struct {
 	Counts UnitTestCounts `json:"counts"`
 	// Note says why OK is false when nothing failed.
 	Note string `json:"note,omitempty"`
+	// NotRunClasses names the test classes counted in Counts.NotRun.
+	NotRunClasses []string `json:"notRunClasses,omitempty"`
 	// OnlyFailures marks the failures-only form.
 	OnlyFailures bool `json:"onlyFailures,omitempty"`
 	// Classes is []UnitTestClass in the full form and []UnitTestFailureClass
@@ -119,6 +129,8 @@ func CountUnitTests(result *UnitTestResult) UnitTestCounts {
 		}
 		if classFailed {
 			c.ClassFailures++
+		} else if len(class.TestMethods) == 0 {
+			c.NotRun++
 		}
 		for _, m := range class.TestMethods {
 			c.Methods++
@@ -137,6 +149,34 @@ func CountUnitTests(result *UnitTestResult) UnitTestCounts {
 	return c
 }
 
+// UnitTestClassNotRun reports whether a test class ran no test method and has
+// no failure of its own, i.e. ABAP Unit listed it but did not run it.
+func UnitTestClassNotRun(class UnitTestClass) bool {
+	if len(class.TestMethods) > 0 {
+		return false
+	}
+	for _, a := range class.Alerts {
+		if UnitTestAlertFails(a) {
+			return false
+		}
+	}
+	return true
+}
+
+// UnitTestNotRunClasses names the classes UnitTestClassNotRun reports.
+func UnitTestNotRunClasses(result *UnitTestResult) []string {
+	if result == nil {
+		return nil
+	}
+	var names []string
+	for _, class := range result.Classes {
+		if UnitTestClassNotRun(class) {
+			names = append(names, class.Name)
+		}
+	}
+	return names
+}
+
 // NewUnitTestReport builds the test tool's answer. With onlyFailures it lists
 // only failed methods and classes with alerts of their own, in the lean shape;
 // the counts always cover the whole run.
@@ -149,13 +189,18 @@ func NewUnitTestReport(result *UnitTestResult, onlyFailures bool) UnitTestReport
 		Counts:       counts,
 		OnlyFailures: onlyFailures,
 	}
+	report.NotRunClasses = UnitTestNotRunClasses(result)
 	failed := counts.Failed > 0 || counts.ClassFailures > 0
-	report.OK = !failed && counts.Methods > 0
-	if !failed && counts.Methods == 0 {
-		if counts.Classes == 0 {
+	report.OK = !failed && counts.Methods > 0 && counts.NotRun == 0
+	if !failed {
+		switch {
+		case counts.Classes == 0:
 			report.Note = "ABAP Unit reported no test class for this object, so nothing ran"
-		} else {
+		case counts.Methods == 0:
 			report.Note = "ABAP Unit listed test classes but ran no test method; see the class alerts"
+		case counts.NotRun > 0:
+			report.Note = fmt.Sprintf("ABAP Unit did not run %d test class(es): %s; see their class alerts (often a risk level or duration above what the run allowed)",
+				counts.NotRun, strings.Join(report.NotRunClasses, ", "))
 		}
 	}
 

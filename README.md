@@ -1913,7 +1913,11 @@ ExecuteABAP:
 ```
 
 Several values: call `RETURN_VALUE( x )` once per value (in addition to, or
-instead of, `lv_result`).
+instead of, `lv_result`). Each value is handed back the moment it is returned,
+so a later `RETURN`, `CHECK` or exception does not lose it. `x` can be any data
+object: an elementary value comes back as text, a structure or table as JSON,
+a data reference as what it points to, and an object reference as
+`<object CLASS_NAME>`.
 
 The MCP tool (`execute_abap`) answers JSON. `result_text` is the returned value
 in full, unwrapped from SAP's `Critical Assertion Error: '…'`: a string for one
@@ -1942,16 +1946,19 @@ See [ExecuteABAP Report](reports/2025-12-05-004-execute-abap-implementation.md) 
 ```json
 {
   "ok": false,
-  "counts": { "classes": 2, "methods": 3, "passed": 2, "failed": 1, "classFailures": 1, "warnings": 1 },
+  "counts": { "classes": 2, "methods": 3, "passed": 2, "failed": 1, "classFailures": 1, "warnings": 1, "notRun": 0 },
   "classes": [ { "name": "LTC_CALC", "parentName": "ZCL_DEMO_CALC", "testMethods": [ ... ], ... } ]
 }
 ```
 
-- `ok` is true when at least one test method ran and nothing failed; a run in
-  which no test method ran is not ok, and `note` says why.
+- `ok` is true when at least one test method ran, nothing failed and every test
+  class ran; a run in which no test method ran is not ok, and `note` says why.
 - A method fails on a failed assertion or an exception (or any critical/fatal
-  alert). Warnings, such as a class not run for its risk level, are counted but
-  do not fail it.
+  alert). Warnings are counted but do not fail it.
+- A test class with no test method and no failure of its own was not run (most
+  often ABAP Unit refused it for its risk level or duration). It is counted in
+  `notRun`, named in `notRunClasses`, and makes the run not ok, even when
+  another class passed. `vsp test` exits non-zero whenever `ok` is false.
 - `classes` keeps the fields it always had (name, parentName, testMethods with
   name and alerts: kind, severity, title, details, stack; alerts filed on the
   class itself, as CLASS_SETUP/CLASS_TEARDOWN failures are).

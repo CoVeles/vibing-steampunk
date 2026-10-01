@@ -162,9 +162,11 @@ Unit tests:
   SAP(action="test", params={"object_url": "/sap/bc/adt/oo/classes/zcl_test", "only_failures": true})
 
   Answers JSON:
-    ok        true when a test method ran and nothing failed (a run with no test
-              method is not ok; "note" says why)
-    counts    {classes, methods, passed, failed, classFailures, warnings} for the whole run
+    ok        true when a test method ran, nothing failed and every test class
+              ran (a run with no test method, or with a class ABAP Unit did not
+              run, is not ok; "note" says why)
+    counts    {classes, methods, passed, failed, classFailures, warnings, notRun}
+              for the whole run; notRunClasses names the classes not run
     classes   name, parentName, alerts filed on the class (CLASS_SETUP/TEARDOWN, or
               a class not run for its risk level), testMethods: name, alerts
               (kind, severity, title, details, ...)
@@ -445,6 +447,8 @@ Execute ABAP:
       in full, unwrapped from SAP's "Critical Assertion Error: '...'": a string for one value,
       an array when RETURN_VALUE( ) was called more than once), failure when the code did not
       finish, rawAlerts only when no value came back. SAP turns a line break in a value into #.
+      RETURN_VALUE( x ) hands x back at once (a later RETURN, CHECK or exception keeps it);
+      x may be any data object: structures and tables come back as JSON.
 
 Runtime errors (ST22) — a listing, and a post-mortem around one dump:
   SAP(action="analyze", params={"type": "list_dumps", "since": "2026-08-01", "program": "ZDEMO_POST"})
