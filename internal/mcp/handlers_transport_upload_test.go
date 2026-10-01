@@ -26,7 +26,6 @@ type uploadFakeWS struct {
 	actions []string
 	dials   int
 	client  string
-	job     string
 }
 
 func (f *uploadFakeWS) SendDomainRequest(_ context.Context, domain, action string, params map[string]any, _ time.Duration) (*adt.WSResponse, error) {
@@ -44,14 +43,10 @@ func (f *uploadFakeWS) SendDomainRequest(_ context.Context, domain, action strin
 		data = map[string]any{"status": "done", "system": "QAS", "client": f.client, "file_exists": true, "total": 1,
 			"entries": []any{map[string]any{"trkorr": "XYZK900001", "raw": "XYZK900001 K758 TESTUSER"}}}
 	case "add_to_buffer":
-		f.job = action
-		data = map[string]any{"status": "started", "ticket": "4711", "job": "ZVSP_TRANSPORT_BUFFER"}
-	case "buffer_result":
-		if f.job == "add_to_buffer" {
-			data = map[string]any{"status": "done", "request": "XYZK900001", "system": "QAS", "tp_command": "ADDTOBUFFER XYZK900001 QAS", "tp_rc": "0000"}
-		} else {
-			data = map[string]any{"status": "done", "system": "QAS", "client": f.client, "total": 1, "entries": []any{map[string]any{"trkorr": "XYZK900001"}}}
-		}
+		data = map[string]any{"status": "pending", "ticket": "47110001", "job": "ZVSP_TRANSPORT_BUFFER", "job_count": "47110001", "request": "XYZK900001"}
+	case "add_status":
+		data = map[string]any{"request": "XYZK900001", "system": "QAS", "outcome": "queued", "job_count": params["job"],
+			"job_status": "F", "in_buffer": true}
 	default:
 		data = map[string]any{}
 	}
@@ -192,11 +187,12 @@ func TestUploadTransportHappyPath(t *testing.T) {
 		t.Fatalf("refused: %s", uploadResultText(res))
 	}
 	want := "transport.upload_files:begin,transport.upload_files:chunk,transport.upload_files:chunk," +
-		"transport.upload_files:commit,transport.add_to_buffer,transport.buffer_result,transport.show_buffer"
+		"transport.upload_files:commit,transport.add_to_buffer"
 	if got := strings.Join(ws.calls(), ","); got != want {
 		t.Errorf("conversation:\n got %s\nwant %s", got, want)
 	}
-	if !strings.Contains(uploadResultText(res), "NOT been imported") || !strings.Contains(uploadResultText(res), `"queued": true`) {
+	// The tool answers once the job is released: pending, with the job.
+	if !strings.Contains(uploadResultText(res), `"status": "pending"`) || !strings.Contains(uploadResultText(res), `"count": "47110001"`) {
 		t.Errorf("answer %s", uploadResultText(res))
 	}
 }
@@ -258,5 +254,25 @@ func TestUploadTransportRefusesUnreadableSystemsConfig(t *testing.T) {
 	res := callUpload(t, s, map[string]any{"cofile_path": co, "datafile_path": da})
 	if !res.IsError || !strings.Contains(uploadResultText(res), "cannot be read") || ws.dialed() != 0 {
 		t.Errorf("got %q, dials %d", uploadResultText(res), ws.dialed())
+	}
+}
+
+// transport_status is a read: allowed under --read-only, one message, and it
+// says queued only from the status call's answer.
+func TestTransportStatusView(t *testing.T) {
+	s, ws := uploadServer(t, func(c *Config) { c.ReadOnly = true; c.Mode = "hyperfocused" })
+	res, err := s.handleUniversalTool(context.Background(), newRequest(map[string]any{
+		"action": "system", "params": map[string]any{"type": "transport_status", "transport": "XYZK900001", "job": "47110001"}}))
+	if err != nil || res.IsError || !strings.Contains(uploadResultText(res), `"outcome": "queued"`) {
+		t.Fatalf("got %v %s", err, uploadResultText(res))
+	}
+	if got := strings.Join(ws.calls(), ","); got != "transport.add_status" {
+		t.Errorf("a status read sent %s", got)
+	}
+	s, ws = uploadServer(t, func(c *Config) { c.EnableTransports = false })
+	res, _ = s.handleUniversalTool(context.Background(), newRequest(map[string]any{
+		"action": "system", "params": map[string]any{"type": "transport_status", "transport": "XYZK900001"}}))
+	if !res.IsError || ws.dialed() != 0 {
+		t.Errorf("without --enable-transports: %s, dials %d", uploadResultText(res), ws.dialed())
 	}
 }

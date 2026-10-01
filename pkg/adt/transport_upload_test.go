@@ -273,10 +273,9 @@ type fakeTransportWS struct {
 	buffer       []map[string]any
 	files        map[string][]byte // download source
 	got          map[string][]byte
-	// pending is the job add_to_buffer or show_buffer started; the first
-	// buffer_result poll for it answers "pending".
-	pending map[string]any
-	polls   int
+	// statuses are add_status's answers, in order; the last one repeats.
+	statuses []map[string]any
+	jobs     int
 }
 
 func init() { transportPollInterval = time.Millisecond }
@@ -333,27 +332,20 @@ func (f *fakeTransportWS) SendDomainRequest(_ context.Context, domain, action st
 		return ok(map[string]any{"status": "done", "system": f.system, "client": f.client, "source": "DIR_TRANS/buffer/" + f.system,
 			"file_exists": true, "total": len(entries), "entries": entries})
 	case "add_to_buffer":
-		p["action"] = action
-		f.pending, f.polls = p, 0
-		return ok(map[string]any{"status": "started", "ticket": "4711", "job": "ZVSP_TRANSPORT_BUFFER"})
-	case "buffer_result":
-		if f.pending == nil || p["ticket"] != "4711" {
-			return &WSResponse{Success: false, Error: &WSError{Code: "NO_SUCH_JOB", Message: "none"}}, nil
+		if f.addErr != nil {
+			return &WSResponse{Success: false, Error: f.addErr}, nil
 		}
-		if f.polls++; f.polls == 1 {
-			return ok(map[string]any{"status": "pending", "job_status": "R"})
+		f.jobs++
+		return ok(map[string]any{"status": "pending", "ticket": "47110001", "job": "ZVSP_TRANSPORT_BUFFER", "job_count": "47110001", "request": p["request"]})
+	case "add_status":
+		if len(f.statuses) == 0 {
+			return ok(map[string]any{"request": p["request"], "system": f.system, "outcome": "unknown", "job_count": p["job"]})
 		}
-		job := f.pending
-		f.pending = nil
-		if job["action"] == "add_to_buffer" {
-			if f.addErr != nil {
-				return &WSResponse{Success: false, Error: f.addErr}, nil
-			}
-			f.buffer = append(f.buffer, map[string]any{"trkorr": job["request"], "tarcli": ""})
-			return ok(map[string]any{"status": "done", "request": job["request"], "system": f.system,
-				"tp_command": "ADDTOBUFFER " + job["request"].(string) + " " + f.system, "tp_rc": "0000"})
+		st := f.statuses[0]
+		if len(f.statuses) > 1 {
+			f.statuses = f.statuses[1:]
 		}
-		return &WSResponse{Success: false, Error: &WSError{Code: "INVALID_PARAM", Message: "job action"}}, nil
+		return ok(st)
 	case "download_files":
 		name := p["file"].(string)
 		data := f.files[name]
@@ -421,8 +413,7 @@ func TestUploadTransportHappyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"upload_files:begin", "upload_files:chunk", "upload_files:chunk", "upload_files:chunk",
-		"upload_files:chunk", "upload_files:commit", "add_to_buffer", "buffer_result", "buffer_result",
-		"show_buffer"}
+		"upload_files:chunk", "upload_files:commit", "add_to_buffer"}
 	if got := ws.actions(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("conversation:\n got %v\nwant %v", got, want)
 	}
@@ -446,10 +437,12 @@ func TestUploadTransportHappyPath(t *testing.T) {
 			}
 		}
 	}
-	if !res.FilesWritten || !res.Queued || res.InBuffer == nil || res.System != "QAS" {
+	// The upload answers once the job is released: pending, with the job,
+	// and no wait of its own.
+	if !res.FilesWritten || res.Status != TransportPending || res.Job == nil || res.Job.Count != "47110001" || res.System != "QAS" {
 		t.Errorf("result %+v", res)
 	}
-	if !strings.Contains(res.Note, "NOT been imported") {
+	if !strings.Contains(res.Note, "transport status XYZK900001 --job 47110001") || strings.Contains(res.Note, "is in the import queue") {
 		t.Errorf("note %q", res.Note)
 	}
 }
@@ -483,21 +476,23 @@ func TestUploadTransportRefusesAnotherRequest(t *testing.T) {
 func got(ws *fakeTransportWS) string { return strings.Join(ws.actions(), ",") }
 
 func TestUploadTransportAddFailure(t *testing.T) {
+	// No job could be started and the files were taken back: certain.
 	ws := newFakeTransportWS()
-	ws.addErr = &WSError{Code: "ADD_FAILED_ROLLED_BACK", Message: "tp failed. The files this upload wrote were deleted again."}
+	ws.addErr = &WSError{Code: "ADD_FAILED_ROLLED_BACK", Message: "The buffer job could not be started."}
 	res, err := uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
 	var se *TransportServiceError
 	if !errors.As(err, &se) || se.Code != "ADD_FAILED_ROLLED_BACK" {
 		t.Fatalf("got %v", err)
 	}
-	if res == nil || res.Queued || res.FilesWritten || !res.RolledBack {
+	if res == nil || res.Status != TransportNotAdded || res.FilesWritten || !res.RolledBack || res.Job != nil {
 		t.Errorf("result %+v", res)
 	}
+	// An answer that did not arrive: a job may have been released.
 	ws = newFakeTransportWS()
-	ws.addErr = &WSError{Code: "PERMISSION_DENIED", Message: "needs S_CTS_ADMI TADD"}
+	ws.addErr = &WSError{Code: "SERVICE_EXCEPTION", Message: "connection reset"}
 	res, err = uploadClient(enabled()).UploadTransport(context.Background(), ws, sampleFiles(t, sampleData()))
-	if err == nil || !strings.Contains(err.Error(), "TADD") || res.Queued || !res.FilesWritten {
-		t.Errorf("permission: %v %+v", err, res)
+	if err == nil || res.Status != TransportUnknown || !res.FilesWritten || !strings.Contains(res.Note, "unknown") {
+		t.Errorf("lost answer: %v %+v", err, res)
 	}
 }
 
@@ -542,25 +537,49 @@ func TestTransportBufferAndDownload(t *testing.T) {
 	}
 }
 
-// A buffer job that never reports is not taken for success or failure.
-func TestTransportJobTimeout(t *testing.T) {
-	saved := transportJobTimeout
-	transportJobTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { transportJobTimeout = saved })
-	ws := stuckJobWS{}
-	err := transportJob(context.Background(), ws, "add_to_buffer", map[string]any{"request": "XYZK900001"}, &struct{}{})
-	if err == nil || !strings.Contains(err.Error(), "SM37") || !strings.Contains(err.Error(), "unknown") {
-		t.Errorf("got %v", err)
+// The status call's "queued" is believed only with the buffer file behind
+// it (review round 2, critic #3).
+func TestTransportAddStatusQueuedNeedsTheBuffer(t *testing.T) {
+	ws := newFakeTransportWS()
+	ws.statuses = []map[string]any{{"request": "XYZK900001", "system": "QAS", "outcome": "queued", "job_status": "F", "in_buffer": false, "job_count": "47110001"}}
+	st, err := uploadClient(enabled()).TransportAddStatus(context.Background(), ws, "XYZK900001", "47110001")
+	if err != nil || st.Outcome != TransportUnknown {
+		t.Fatalf("%+v %v", st, err)
+	}
+	ws.statuses = []map[string]any{{"request": "XYZK900001", "system": "QAS", "outcome": "queued", "job_status": "F", "in_buffer": true, "job_count": "47110001"}}
+	st, _ = uploadClient(enabled()).TransportAddStatus(context.Background(), ws, "XYZK900001", "47110001")
+	if st.Outcome != TransportQueued || !strings.Contains(st.Note, "NOT been imported") {
+		t.Errorf("%+v", st)
+	}
+	// A read: allowed under read-only.
+	s := enabled()
+	s.ReadOnly = true
+	if _, err := uploadClient(s).TransportAddStatus(context.Background(), ws, "XYZK900001", "47110001"); err != nil {
+		t.Errorf("status under read-only: %v", err)
 	}
 }
 
-type stuckJobWS struct{}
-
-func (stuckJobWS) SendDomainRequest(_ context.Context, _, action string, _ map[string]any, _ time.Duration) (*WSResponse, error) {
-	if action == "buffer_result" {
-		return &WSResponse{Success: true, Data: []byte(`{"status":"pending","job_status":"S"}`)}, nil
+func TestWaitTransportAdd(t *testing.T) {
+	ws := newFakeTransportWS()
+	ws.statuses = []map[string]any{
+		{"outcome": "pending", "job_status": "R"},
+		{"outcome": "pending", "job_status": "R"},
+		{"outcome": "queued", "job_status": "F", "in_buffer": true, "system": "QAS"},
 	}
-	return &WSResponse{Success: true, Data: []byte(`{"status":"started","ticket":"4711","job":"ZVSP_TRANSPORT_BUFFER"}`)}, nil
+	st, err := uploadClient(enabled()).WaitTransportAdd(context.Background(), ws, "XYZK900001", "47110001")
+	if err != nil || st.Outcome != TransportQueued {
+		t.Fatalf("%+v %v", st, err)
+	}
+
+	// Waiting that ends before the job does says unknown, and where to look.
+	ws = newFakeTransportWS()
+	ws.statuses = []map[string]any{{"outcome": "pending", "job_status": "R", "system": "QAS"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	st, err = uploadClient(enabled()).WaitTransportAdd(ctx, ws, "XYZK900001", "47110001")
+	if err == nil || st.Outcome != TransportUnknown || !strings.Contains(st.Note, "STMS") || !strings.Contains(st.Note, "SM37") || !strings.Contains(st.Note, "47110001") {
+		t.Errorf("%+v %v", st, err)
+	}
 }
 
 // A download is a sensitive read: refused under read-only, even with

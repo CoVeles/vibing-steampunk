@@ -74,6 +74,11 @@ func orDefaultClient(c string) string {
 //
 //	SAP(action="system", params={"type": "upload_transport",
 //	    "cofile_path": "/path/K900123.DEV", "datafile_path": "/path/R900123.DEV"})
+//
+// It answers as soon as the files are written and the background job that
+// adds the request is released: status "pending" and the job's number.
+// transport_status tells the outcome.
+//
 //	SAP(action="system", params={"type": "upload_transport",
 //	    "cofile_name": "K900123.DEV", "cofile_base64": "...",
 //	    "datafile_name": "R900123.DEV", "datafile_base64": "..."})
@@ -198,6 +203,34 @@ func (s *Server) handleTransportBuffer(ctx context.Context, request mcp.CallTool
 		return newToolResultError(err.Error()), nil
 	}
 	return newToolResultJSON(res), nil
+}
+
+// handleTransportStatus reports the outcome of an upload's add to the import
+// queue: queued, pending, job_failed or unknown, from the job's status and log
+// and the buffer file. Read-only.
+//
+//	SAP(action="system", params={"type": "transport_status", "transport": "TR-EXAMPLE", "job": "12345678"})
+func (s *Server) handleTransportStatus(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := request.GetArguments()
+	req := strings.ToUpper(strings.TrimSpace(transportParam(args)))
+	if req == "" {
+		return newToolResultError("transport (the request) is required, with job (the number upload_transport reported)"), nil
+	}
+	if err := s.adtClient.CheckTransportBufferRead(req, "TransportAddStatus"); err != nil {
+		return newToolResultError(err.Error()), nil
+	}
+	if err := s.checkOwnTarget(args); err != nil {
+		return newToolResultError(err.Error()), nil
+	}
+	ws, err := s.transportService(ctx)
+	if err != nil {
+		return newToolResultError(err.Error()), nil
+	}
+	st, err := s.adtClient.TransportAddStatus(ctx, ws, req, getStringParam(args, "job"))
+	if err != nil {
+		return newToolResultError(err.Error()), nil
+	}
+	return newToolResultJSON(st), nil
 }
 
 func orDefault(v, d string) string {

@@ -477,14 +477,25 @@ buffer, as STMS's *Extras > Other Requests > Add* does. vsp never imports:
 the import stays a human step in STMS.
 
 ```bash
-SAP_ENABLE_TRANSPORTS=true vsp -s qassys transport upload --cofile ./K900123.DEV --datafile ./R900123.DEV
+SAP_ENABLE_TRANSPORTS=true vsp -s qassys transport upload --cofile ./K900123.DEV --datafile ./R900123.DEV   # waits up to --wait (60s) for the outcome
+SAP_ENABLE_TRANSPORTS=true vsp -s qassys transport status TR-EXAMPLE --job 12345678   # queued / pending / job_failed / unknown, read-only
 SAP_ENABLE_TRANSPORTS=true vsp -s qassys transport buffer TR-EXAMPLE      # read-only view of the queue
 SAP_ENABLE_TRANSPORTS=true vsp -s devsys transport download TR-EXAMPLE -o ./out   # copy out of DIR_TRANS; changes nothing, but refused under --read-only (data files can hold table contents)
 ```
 
 MCP (expert mode only): `system` with `upload_transport` (`cofile_path` +
-`datafile_path`, or `cofile_name`/`cofile_base64` + `datafile_name`/`datafile_base64`)
-and the read-only `transport_buffer` (optional `transport`).
+`datafile_path`, or `cofile_name`/`cofile_base64` + `datafile_name`/`datafile_base64`),
+and the read-only `transport_status` (`transport`, `job`) and `transport_buffer`
+(optional `transport`).
+
+The upload answers as soon as the files are written and the background job
+that adds the request is released: status `pending` and the job's number.
+`transport_status` / `vsp transport status` then say `queued` only when the
+buffer file holds the request and the job is done, `pending` while it runs,
+`job_failed` when it ended without the request in the buffer, and `unknown`
+otherwise -- check STMS and the job in SM37 then. An upload committed but
+never handed to a job (the session ends, or a new upload begins) has its files
+deleted again.
 
 The rules, checked in vsp and again in ZADT_VSP's `ZCL_VSP_TRANSPORT_SERVICE`:
 both files, matching number and SID, the cofile's shape (a header and an

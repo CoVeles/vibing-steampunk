@@ -333,15 +333,15 @@ type TransportUploadResult struct {
 	FilesWritten bool   `json:"filesWritten"`
 	CofilePath   string `json:"cofilePath,omitempty"`
 	DataPath     string `json:"dataPath,omitempty"`
-	// Queued says the request was added to the import buffer of System.
-	Queued bool `json:"queued"`
-	// RolledBack says the files written by this upload were deleted again
-	// because the request could not be added to the buffer.
-	RolledBack bool               `json:"rolledBack,omitempty"`
-	TP         *TransportTPResult `json:"tp,omitempty"`
-	// InBuffer is the buffer entry read back after the add.
-	InBuffer *TransportBufferEntry `json:"inBuffer,omitempty"`
-	Note     string                `json:"note"`
+	// Status is the add's outcome as far as this call knows it: pending
+	// (the job is released; ask TransportAddStatus), not_added (certain:
+	// no job ran, or the files were taken back), or unknown.
+	Status string `json:"status"`
+	// Job is the background job doing the add, when one was started.
+	Job *TransportJob `json:"job,omitempty"`
+	// RolledBack says the files written by this upload were deleted again.
+	RolledBack bool   `json:"rolledBack,omitempty"`
+	Note       string `json:"note"`
 }
 
 // TransportTPResult is what tp answered.
@@ -421,53 +421,167 @@ func transportCall(ctx context.Context, ws TransportService, action string, para
 
 // The tp step does not run in the ZADT_VSP session: tp is started over
 // synchronous RFC, which an ABAP Push Channel may not do. add_to_buffer
-// schedules background job ZVSP_TRANSPORT_BUFFER and answers with a ticket;
-// buffer_result answers "pending" until the job has stored its result.
-var (
-	transportPollInterval = 2 * time.Second
-	transportJobTimeout   = 5 * time.Minute
+// schedules background job ZVSP_TRANSPORT_BUFFER and answers at once with
+// its number; the outcome is read with add_status (TransportAddStatus), which
+// only says "queued" when the buffer file has the request.
+
+// Outcomes of an add, as TransportAddStatus reports them.
+const (
+	// TransportQueued: the buffer file has the request and the job is done.
+	TransportQueued = "queued"
+	// TransportPending: the job has not finished.
+	TransportPending = "pending"
+	// TransportJobFailed: the job ended (finished or cancelled) and the
+	// buffer file does not have the request.
+	TransportJobFailed = "job_failed"
+	// TransportNotAdded: certainly not added, nothing was queued by this
+	// upload (no job was started, or its files were taken back).
+	TransportNotAdded = "not_added"
+	// TransportUnknown: not established -- check STMS and SM37.
+	TransportUnknown = "unknown"
 )
 
+var transportPollInterval = 2 * time.Second
+
 type transportJobStarted struct {
-	Status string `json:"status"`
-	Ticket string `json:"ticket"`
-	Job    string `json:"job"`
+	Status   string `json:"status"`
+	Ticket   string `json:"ticket"`
+	Job      string `json:"job"`
+	JobCount string `json:"job_count"`
+	Request  string `json:"request"`
 }
 
-// transportJob starts a buffer job with action and waits for its result,
-// which is decoded into out.
-func transportJob(ctx context.Context, ws TransportService, action string, params map[string]any, out any) error {
-	var started transportJobStarted
-	if err := transportCall(ctx, ws, action, params, time.Minute, &started); err != nil {
-		return err
+// TransportJob is the background job that adds a request to the buffer.
+type TransportJob struct {
+	Name  string `json:"name"`
+	Count string `json:"count"`
+}
+
+// TransportAddStatus is what add_status reports: the outcome, and what it is
+// based on.
+type TransportAddStatus struct {
+	Request       string   `json:"request"`
+	System        string   `json:"system"`
+	Outcome       string   `json:"outcome"`
+	Job           string   `json:"job,omitempty"`
+	JobCount      string   `json:"jobCount,omitempty"`
+	JobFound      bool     `json:"jobFound"`
+	JobStatus     string   `json:"jobStatus,omitempty"`
+	InBuffer      bool     `json:"inBuffer"`
+	BufferError   string   `json:"bufferError,omitempty"`
+	CofilePresent bool     `json:"cofilePresent"`
+	DataPresent   bool     `json:"dataPresent"`
+	JobLog        []string `json:"jobLog,omitempty"`
+	Note          string   `json:"note,omitempty"`
+}
+
+// Terminal says the outcome will not change by waiting.
+func (s *TransportAddStatus) Terminal() bool {
+	return s.Outcome == TransportQueued || s.Outcome == TransportJobFailed
+}
+
+type transportStatusAnswer struct {
+	Request       string   `json:"request"`
+	System        string   `json:"system"`
+	Outcome       string   `json:"outcome"`
+	Job           string   `json:"job"`
+	JobCount      string   `json:"job_count"`
+	JobFound      bool     `json:"job_found"`
+	JobStatus     string   `json:"job_status"`
+	InBuffer      bool     `json:"in_buffer"`
+	BufferError   string   `json:"buffer_error"`
+	CofilePresent bool     `json:"cofile_present"`
+	DataPresent   bool     `json:"data_present"`
+	JobLog        []string `json:"job_log"`
+}
+
+// TransportAddStatus reads the outcome of adding request to the buffer by
+// background job jobCount (empty: the buffer alone). It changes nothing.
+func (c *Client) TransportAddStatus(ctx context.Context, ws TransportService, request, jobCount string) (*TransportAddStatus, error) {
+	request = strings.ToUpper(strings.TrimSpace(request))
+	if err := c.CheckTransportBufferRead(request, "TransportAddStatus"); err != nil {
+		return nil, err
 	}
-	if started.Ticket == "" {
-		return fmt.Errorf("transport.%s: ZADT_VSP started no job", action)
+	if !requestRe.MatchString(request) {
+		return nil, fmt.Errorf("request %q is not <SID>K<6 digits>", request)
 	}
-	deadline := time.Now().Add(transportJobTimeout)
+	params := map[string]any{"request": request}
+	if jobCount = strings.TrimSpace(jobCount); jobCount != "" {
+		params["job"] = jobCount
+	}
+	var a transportStatusAnswer
+	if err := transportCall(ctx, ws, "add_status", params, time.Minute, &a); err != nil {
+		return nil, err
+	}
+	st := &TransportAddStatus{Request: request, System: a.System, Outcome: a.Outcome, Job: a.Job, JobCount: a.JobCount,
+		JobFound: a.JobFound, JobStatus: strings.TrimSpace(a.JobStatus), InBuffer: a.InBuffer, BufferError: a.BufferError,
+		CofilePresent: a.CofilePresent, DataPresent: a.DataPresent, JobLog: a.JobLog}
+	if st.JobCount == "" {
+		st.JobCount = jobCount
+	}
+	if st.Job == "" && st.JobCount != "" {
+		st.Job = transportJobName
+	}
+	// "queued" is believed only with the buffer file behind it.
+	if st.Outcome == TransportQueued && !st.InBuffer {
+		st.Outcome = TransportUnknown
+	}
+	st.Note = transportOutcomeNote(st.Request, st.System, st.Outcome, st.Job, st.JobCount)
+	return st, nil
+}
+
+// WaitTransportAdd waits until the add by job jobCount has a final outcome,
+// or ctx ends. It asks add_status every few seconds. When ctx ends first,
+// the last status is returned with the outcome unknown.
+func (c *Client) WaitTransportAdd(ctx context.Context, ws TransportService, request, jobCount string) (*TransportAddStatus, error) {
+	var last *TransportAddStatus
 	for {
-		var raw json.RawMessage
-		if err := transportCall(ctx, ws, "buffer_result", map[string]any{"ticket": started.Ticket}, time.Minute, &raw); err != nil {
-			return err
-		}
-		var st struct {
-			Status    string `json:"status"`
-			JobStatus string `json:"job_status"`
-		}
-		_ = json.Unmarshal(raw, &st)
-		if st.Status != "pending" {
-			return json.Unmarshal(raw, out)
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("background job %s %s has not finished after %s (status %q); see SM37 -- what it did to the buffer is unknown",
-				started.Job, started.Ticket, transportJobTimeout, st.JobStatus)
+		st, err := c.TransportAddStatus(ctx, ws, request, jobCount)
+		if err == nil {
+			last = st
+			if st.Terminal() {
+				return st, nil
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return unknownAfterWait(last, request, jobCount), ctx.Err()
 		case <-time.After(transportPollInterval):
 		}
 	}
+}
+
+func unknownAfterWait(last *TransportAddStatus, request, jobCount string) *TransportAddStatus {
+	if last == nil {
+		last = &TransportAddStatus{Request: strings.ToUpper(request), JobCount: jobCount, Job: transportJobName}
+	}
+	out := *last
+	out.Outcome = TransportUnknown
+	out.Note = transportOutcomeNote(out.Request, out.System, out.Outcome, out.Job, out.JobCount)
+	return &out
+}
+
+const transportJobName = "ZVSP_TRANSPORT_BUFFER"
+
+// transportOutcomeNote says what an outcome means, without claiming more.
+func transportOutcomeNote(request, system, outcome, job, jobCount string) string {
+	if job == "" {
+		job = transportJobName
+	}
+	where := fmt.Sprintf("check the import queue in STMS and job %s %s in SM37", job, jobCount)
+	switch outcome {
+	case TransportQueued:
+		return fmt.Sprintf("%s is in the import queue of %s and has NOT been imported. Import it, if at all, in STMS.", request, system)
+	case TransportPending:
+		return fmt.Sprintf("the add is still running; ask again later (vsp transport status %s --job %s), or %s", request, jobCount, where)
+	case TransportJobFailed:
+		return fmt.Sprintf("%s is not in the import queue: the job ended without adding it (see its log in SM37: %s %s)", request, job, jobCount)
+	case TransportNotAdded:
+		return fmt.Sprintf("%s was not added to the import queue", request)
+	case "not_in_buffer":
+		return fmt.Sprintf("%s is not in the import queue", request)
+	}
+	return fmt.Sprintf("whether %s is in the import queue is unknown -- %s", request, where)
 }
 
 // TransportServiceError is a refusal or failure reported by
@@ -493,16 +607,6 @@ type transportCommitAnswer struct {
 	DataPath   string `json:"data_path"`
 	CofileSize int    `json:"cofile_size"`
 	DataSize   int    `json:"data_size"`
-}
-
-type transportAddAnswer struct {
-	Request    string   `json:"request"`
-	System     string   `json:"system"`
-	Command    string   `json:"tp_command"`
-	ReturnCode string   `json:"tp_rc"`
-	Message    string   `json:"tp_message"`
-	Stdout     []string `json:"stdout"`
-	RolledBack bool     `json:"rolled_back"`
 }
 
 type transportBufferAnswer struct {
@@ -541,17 +645,17 @@ func sameClient(a, b string) bool {
 	return norm(a) == norm(b)
 }
 
-// UploadTransport writes files into DIR_TRANS of the connected system and adds
-// the request to that system's import buffer. It never imports.
+// UploadTransport writes files into DIR_TRANS of the connected system and has
+// the request added to that system's import buffer. It never imports.
 //
 // Order: the gates; begin (ZADT_VSP re-validates the names and sizes, checks
 // that neither file exists and answers which system and client it is); a
 // check that this is the client the client was configured for; the chunks;
 // commit (SHA-256 and size of each file, cofile shape, write data file then
-// cofile, and on any failure delete what this commit wrote); add to buffer
-// (refused when the request is already there; when tp fails and the request
-// is not in the buffer, the files this upload wrote are deleted again); and a
-// read of the buffer to show the entry.
+// cofile, and on any failure delete what this commit wrote); and add_to_buffer,
+// which releases background job ZVSP_TRANSPORT_BUFFER and answers at once.
+// The result's Status is "pending" with the job; TransportAddStatus or
+// WaitTransportAdd tell the outcome. There is no fixed wait here.
 func (c *Client) UploadTransport(ctx context.Context, ws TransportService, files *TransportFiles) (*TransportUploadResult, error) {
 	if files == nil {
 		return nil, errors.New("no files to upload")
@@ -632,24 +736,32 @@ func (c *Client) UploadTransport(ctx context.Context, ws TransportService, files
 	res.FilesWritten = true
 	res.CofilePath, res.DataPath = commit.CofilePath, commit.DataPath
 
-	var add transportAddAnswer
-	addErr := transportJob(ctx, ws, "add_to_buffer", map[string]any{"request": files.Request}, &add)
+	var started transportJobStarted
+	addErr := transportCall(ctx, ws, "add_to_buffer", map[string]any{"request": files.Request}, time.Minute, &started)
 	if addErr != nil {
 		var se *TransportServiceError
-		if errors.As(addErr, &se) && se.Code == "ADD_FAILED_ROLLED_BACK" {
-			res.FilesWritten, res.RolledBack = false, true
+		switch {
+		case errors.As(addErr, &se) && se.Code == "ADD_FAILED_ROLLED_BACK":
+			// No job ran and the files were taken back.
+			res.Status, res.FilesWritten, res.RolledBack = TransportNotAdded, false, true
+		case errors.As(addErr, &se) && (se.Code == "NOT_UPLOADED" || se.Code == "FILES_MISSING" || se.Code == "INVALID_REQUEST"):
+			// Refused before any job was scheduled.
+			res.Status = TransportNotAdded
+		default:
+			// The answer was lost: a job may have been scheduled.
+			res.Status = TransportUnknown
 		}
-		res.Note = "the request was not added to the import buffer"
+		res.Note = transportOutcomeNote(files.Request, res.System, res.Status, transportJobName, "")
 		return res, addErr
 	}
-	res.Queued = true
-	res.TP = &TransportTPResult{Command: add.Command, ReturnCode: add.ReturnCode, Message: add.Message, Stdout: add.Stdout}
-	if buf, err := c.TransportBuffer(ctx, ws, files.Request); err == nil {
-		if e, ok := buf.Contains(files.Request); ok {
-			res.InBuffer = e
-		}
+	res.Status = TransportPending
+	res.Job = &TransportJob{Name: started.Job, Count: started.JobCount}
+	if res.Job.Count == "" {
+		res.Job.Count = started.Ticket
 	}
-	res.Note = fmt.Sprintf("%s is in the import queue of %s and has NOT been imported. Import it, if at all, in STMS.", files.Request, res.System)
+	res.Note = fmt.Sprintf("the files are in DIR_TRANS and job %s %s is adding %s to the import queue of %s; "+
+		"its outcome: vsp transport status %s --job %s (nothing is imported either way)",
+		res.Job.Name, res.Job.Count, files.Request, res.System, files.Request, res.Job.Count)
 	return res, nil
 }
 

@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -77,14 +78,27 @@ and S_CTS_ADMI with EPS1 (files) and TADD (buffer) on the system.
 		}
 		defer closeWS()
 
-		res, uerr := client.UploadTransport(context.Background(), ws, files)
-		if asJSON, _ := cmd.Flags().GetBool("json"); asJSON && res != nil {
-			if perr := printJSON(res); perr != nil {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		res, uerr := client.UploadTransport(ctx, ws, files)
+		asJSON, _ := cmd.Flags().GetBool("json")
+		out := uploadOutput{Upload: res}
+		if uerr == nil && res != nil && res.Job != nil {
+			// The add runs as a background job; wait for its outcome as
+			// long as asked, then say what is known -- nothing more.
+			wait, _ := cmd.Flags().GetDuration("wait")
+			if wait > 0 {
+				wctx, cancel := context.WithTimeout(ctx, wait)
+				st, _ := client.WaitTransportAdd(wctx, ws, res.Request, res.Job.Count)
+				cancel()
+				out.Status = st
+			}
+		}
+		if asJSON && res != nil {
+			if perr := printJSON(out); perr != nil {
 				return perr
 			}
-			return uerr
-		}
-		if res != nil {
+		} else if res != nil {
 			fmt.Fprintf(os.Stderr, "%s -> %s client %s\n", res.Request, res.System, res.Client)
 			if res.FilesWritten {
 				fmt.Fprintf(os.Stderr, "  wrote %s (%d bytes) and %s (%d bytes)\n", res.DataPath, res.DataSize, res.CofilePath, res.CofileSize)
@@ -92,14 +106,81 @@ and S_CTS_ADMI with EPS1 (files) and TADD (buffer) on the system.
 			if res.RolledBack {
 				fmt.Fprintln(os.Stderr, "  the files this upload wrote were deleted again")
 			}
-			if res.TP != nil {
-				fmt.Fprintf(os.Stderr, "  tp: %s (rc %s) %s\n", res.TP.Command, res.TP.ReturnCode, strings.TrimSpace(res.TP.Message))
+			if res.Job != nil {
+				fmt.Fprintf(os.Stderr, "  job %s %s released\n", res.Job.Name, res.Job.Count)
 			}
-			if res.Note != "" {
+			if out.Status != nil {
+				printAddStatus(out.Status)
+			} else if res.Note != "" {
 				fmt.Fprintln(os.Stderr, "  "+res.Note)
 			}
 		}
-		return uerr
+		if uerr != nil {
+			return uerr
+		}
+		if out.Status != nil && out.Status.Outcome != adt.TransportQueued {
+			return fmt.Errorf("%s: %s", out.Status.Outcome, out.Status.Note)
+		}
+		return nil
+	},
+}
+
+// uploadOutput is what vsp transport upload --json prints: the upload, and
+// the add's status when it was waited for.
+type uploadOutput struct {
+	Upload *adt.TransportUploadResult `json:"upload"`
+	Status *adt.TransportAddStatus    `json:"status,omitempty"`
+}
+
+func printAddStatus(st *adt.TransportAddStatus) {
+	fmt.Fprintf(os.Stderr, "  outcome: %s", st.Outcome)
+	if st.JobCount != "" {
+		fmt.Fprintf(os.Stderr, " (job %s %s, status %q)", st.Job, st.JobCount, st.JobStatus)
+	}
+	fmt.Fprintf(os.Stderr, ", in buffer: %t\n", st.InBuffer)
+	for _, l := range st.JobLog {
+		fmt.Fprintln(os.Stderr, "    "+l)
+	}
+	if st.Note != "" {
+		fmt.Fprintln(os.Stderr, "  "+st.Note)
+	}
+}
+
+var transportStatusCmd = &cobra.Command{
+	Use:   "status <REQUEST> [--job <NUMBER>]",
+	Short: "Say whether an uploaded request reached the import queue (read-only; needs ZADT_VSP)",
+	Long: `Report the outcome of vsp transport upload's add to the import queue:
+queued (the buffer file DIR_TRANS/buffer/<SID> has the request and the job is
+done), pending (job ZVSP_TRANSPORT_BUFFER has not finished), job_failed (the job
+ended and the buffer does not have it), or unknown. Without --job, only the
+buffer is read. Read-only: no tp, nothing written. Requires --enable-transports.
+
+  SAP_ENABLE_TRANSPORTS=true vsp -s qassys transport status TR-EXAMPLE --job 12345678`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		job, _ := cmd.Flags().GetString("job")
+		client, err := createADTClientFor(cmd)
+		if err != nil {
+			return err
+		}
+		if err := client.CheckTransportBufferRead(args[0], "TransportAddStatus"); err != nil {
+			return err
+		}
+		ws, closeWS, err := transportServiceWS()
+		if err != nil {
+			return err
+		}
+		defer closeWS()
+		st, err := client.TransportAddStatus(context.Background(), ws, args[0], job)
+		if err != nil {
+			return err
+		}
+		if asJSON, _ := cmd.Flags().GetBool("json"); asJSON {
+			return printJSON(st)
+		}
+		fmt.Fprintf(os.Stderr, "%s on %s\n", st.Request, st.System)
+		printAddStatus(st)
+		return nil
 	},
 }
 
@@ -242,7 +323,10 @@ func init() {
 	transportUploadCmd.Flags().String("cofile", "", "The cofile, K<6 digits>.<SID>")
 	transportUploadCmd.Flags().String("datafile", "", "The data file, R<6 digits>.<SID>")
 	transportUploadCmd.Flags().Bool("json", false, "Emit JSON")
+	transportUploadCmd.Flags().Duration("wait", 60*time.Second, "How long to wait for the add's outcome (0: return once the job is released)")
+	transportStatusCmd.Flags().String("job", "", "The job number vsp transport upload reported")
+	transportStatusCmd.Flags().Bool("json", false, "Emit JSON")
 	transportBufferCmd.Flags().Bool("json", false, "Emit JSON")
 	transportDownloadCmd.Flags().StringP("output", "o", ".", "Directory to write the two files into")
-	transportCmd.AddCommand(transportUploadCmd, transportBufferCmd, transportDownloadCmd)
+	transportCmd.AddCommand(transportUploadCmd, transportStatusCmd, transportBufferCmd, transportDownloadCmd)
 }

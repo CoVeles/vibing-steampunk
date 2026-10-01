@@ -35,6 +35,8 @@ var transportServiceFunctions = map[string]bool{
 	"JOB_SUBMIT":           true,
 	"JOB_CLOSE":            true,
 	"GET_JOB_RUNTIME_INFO": true,
+	// add_status reads the job's log (read-only).
+	"BP_JOBLOG_READ": true,
 }
 
 // tpCommands are tp commands (LSTPACON) and TMS buffer commands. Only
@@ -313,17 +315,21 @@ func checkTransportService(src string) []string {
 		bad = append(bad, "dir_of must have exactly one assignment")
 	}
 
-	// show_buffer reads the buffer file and does nothing else.
-	for _, st := range methodStatements(stmts, "HANDLE_SHOW_BUFFER") {
+	// show_buffer and add_status read and do nothing else.
+	var reads []string
+	for _, m := range []string{"HANDLE_SHOW_BUFFER", "READ_BUFFER_FILE", "BUFFER_LINES", "HANDLE_ADD_STATUS"} {
+		reads = append(reads, methodStatements(stmts, m)...)
+	}
+	for _, st := range reads {
 		up := strings.ToUpper(st)
 		if m := callFunctionRe.FindStringSubmatch(st); m != nil {
-			if n := strings.ToUpper(strings.Trim(m[1], "'")); n != "EPS_OPEN_INPUT_FILE" && n != "EPS_CLOSE_FILE" {
-				bad = append(bad, "show_buffer calls "+n+"; it may only read the buffer file")
+			if n := strings.ToUpper(strings.Trim(m[1], "'")); n != "EPS_OPEN_INPUT_FILE" && n != "EPS_CLOSE_FILE" && n != "BP_JOBLOG_READ" {
+				bad = append(bad, "a read path calls "+n+"; it may only read files and the job log")
 			}
 		}
-		for _, kw := range []string{"START_JOB(", "DATABASE", "MS_PENDING", "COMMIT WORK", "INSERT ", "UPDATE ", "MODIFY "} {
+		for _, kw := range []string{"START_JOB(", "DATABASE", "MS_PENDING", "COMMIT WORK", "INSERT ", "UPDATE ", "MODIFY ", "DELETE_FILE(", "ROLLBACK_WRITTEN("} {
 			if strings.Contains(up, kw) {
-				bad = append(bad, "show_buffer does more than read: "+st)
+				bad = append(bad, "a read path does more than read: "+st)
 			}
 		}
 	}
@@ -394,11 +400,11 @@ func TestTransportServiceGuardBites(t *testing.T) {
 	mutations := map[string]struct{ old, new string }{
 		"another tp command":                      {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = 'IMPORT'`},
 		"command from a variable":                 {`iv_tp_command      = 'ADDTOBUFFER'`, `iv_tp_command      = lv_cmd`},
-		"another system":                          {"iv_system_name     = lv_system\n              iv_request", "iv_system_name     = lv_sid\n              iv_request"},
+		"another system":                          {"iv_system_name     = lv_system\n          iv_request", "iv_system_name     = lv_sid\n          iv_request"},
 		"lv_system not sy-sysid":                  {"    lv_system = sy-sysid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'", "    lv_system = lv_sid.\n\n    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'"},
-		"lv_system changed later":                 {"        lv_trkorr = ls_ticket-request.\n", "        lv_trkorr = ls_ticket-request.\n        CONCATENATE lv_sid space INTO lv_system.\n"},
+		"lv_system changed later":                 {"    lv_trkorr = ls_ticket-request.\n", "    lv_trkorr = ls_ticket-request.\n    CONCATENATE lv_sid space INTO lv_system.\n"},
 		"tp options":                              {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_tp_options      = lv_msg\n"},
-		"tp step on another system (DESTINATION)": {"          CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'\n", "          CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER' DESTINATION 'NONE'\n"},
+		"tp step on another system (DESTINATION)": {"      CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'\n", "      CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER' DESTINATION 'NONE'\n"},
 		"job step as another user":                {"report            = 'ZVSP_TRANSPORT_BUFFER'\n", "report            = 'ZVSP_TRANSPORT_BUFFER'\n        authcknam         = 'DDIC'\n"},
 		"tp parameter outside the allow-list":     {"iv_request         = lv_trkorr\n", "iv_request         = lv_trkorr\n              iv_prid_text       = lv_msg\n"},
 		"buffer read in a new task":               {"    CALL FUNCTION 'TMS_TP_SHOW_BUFFER'\n", "    CALL FUNCTION 'TMS_TP_SHOW_BUFFER' STARTING NEW TASK 'T'\n"},
@@ -462,9 +468,9 @@ func TestTransportServiceAbortChecksAssemblyID(t *testing.T) {
 // directory listing without the file.
 func TestShowBufferReportsReadFailures(t *testing.T) {
 	stmts := abapStatements(transportServiceSource(t))
-	show := strings.ToUpper(strings.Join(methodStatements(stmts, "HANDLE_SHOW_BUFFER"), "\n"))
+	show := strings.ToUpper(strings.Join(append(methodStatements(stmts, "HANDLE_SHOW_BUFFER"), methodStatements(stmts, "READ_BUFFER_FILE")...), "\n"))
 	if !strings.Contains(show, "PROBE_FILE(") {
-		t.Error("show_buffer does not use probe_file")
+		t.Error("the buffer file read does not use probe_file")
 	}
 	for _, bad := range []string{"LV_SUBRC <> 7", "LV_SUBRC = 7", "LV_SUBRC = 8", "LV_SUBRC <> 8"} {
 		if strings.Contains(show, bad) {
@@ -479,5 +485,45 @@ func TestShowBufferReportsReadFailures(t *testing.T) {
 	exists := strings.ToUpper(strings.Join(methodStatements(stmts, "FILE_EXISTS"), "\n"))
 	if !strings.Contains(exists, "PROBE_FILE(") {
 		t.Error("file_exists does not use probe_file")
+	}
+}
+
+// The add is asynchronous: no pending slot that a lost answer could leave
+// BUSY, no polled result store; an upload committed and never handed to a
+// job is rolled back when abandoned; and "queued" is only ever concluded
+// from a buffer read.
+func TestTransportServiceAsyncOutcome(t *testing.T) {
+	src := transportServiceSource(t)
+	up := strings.ToUpper(src)
+	for _, gone := range []string{"MS_PENDING", "'BUSY'", "BUFFER_RESULT", "INDX(ZU)"} {
+		if strings.Contains(up, gone) {
+			t.Errorf("%s is still in the service", gone)
+		}
+	}
+	stmts := abapStatements(src)
+	for _, m := range []string{"ZIF_VSP_SERVICE~ON_DISCONNECT", "UPLOAD_BEGIN"} {
+		if !strings.Contains(strings.ToUpper(strings.Join(methodStatements(stmts, m), "\n")), "ROLLBACK_WRITTEN( )") {
+			t.Errorf("%s does not roll back an abandoned upload", m)
+		}
+	}
+	// run_job: every "queued" follows a buffer read showing the request.
+	job := methodStatements(stmts, "RUN_JOB")
+	queued := 0
+	for i, st := range job {
+		if strings.ToUpper(st) == "LS_RES-OUTCOME = `QUEUED`" {
+			queued++
+			prev := strings.ToUpper(strings.Join(job[max(0, i-2):i], "\n"))
+			if !strings.Contains(prev, "LINE_EXISTS( LT_BUFFER[ TRKORR = LV_TRKORR ] )") && !strings.Contains(prev, "IF LS_RES-IN_BUFFER = ABAP_TRUE") {
+				t.Errorf("run_job concludes queued without the buffer: %s", prev)
+			}
+		}
+	}
+	if queued == 0 {
+		t.Error("run_job never concludes queued")
+	}
+	// add_status: queued only WHEN the buffer file has the request.
+	status := strings.ToUpper(strings.Join(methodStatements(stmts, "HANDLE_ADD_STATUS"), "\n"))
+	if n := strings.Count(status, "`QUEUED`"); n != 2 || strings.Count(status, "WHEN LV_IN_BUFFER = ABAP_TRUE THEN `QUEUED`") != 2 {
+		t.Errorf("add_status says queued other than from the buffer file (%d)", n)
 	}
 }
