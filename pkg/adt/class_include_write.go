@@ -152,8 +152,16 @@ func (c *Client) writeClassIncludeUpdate(ctx context.Context, name string, inclu
 		return failUnderLock(created(fmt.Sprintf("Failed to update the %s include of %s: %v", include, name, err)))
 	}
 
-	if err := c.UnlockObject(ctx, objectURL, lock.LockHandle); err != nil {
-		result.Message = created(fmt.Sprintf("The %s include was written, but unlocking %s failed: %v", include, name, err))
+	if unlockErr := c.UnlockObject(ctx, objectURL, lock.LockHandle); unlockErr != nil {
+		// The UNLOCK fails before it is sent once ctx has ended; retry it
+		// detached, or the class stays locked.
+		msg := fmt.Sprintf("The %s include was written, but unlocking %s failed: %v", include, name, unlockErr)
+		if retryErr := c.releaseLockAfterFailure(ctx, objectURL, lock.LockHandle); retryErr != nil {
+			msg += "; " + strandedLockAdvice(objectURL, retryErr)
+		} else {
+			msg += " — the lock was released on a retry"
+		}
+		result.Message = created(msg)
 		return result, nil
 	}
 
