@@ -429,7 +429,19 @@ func rfcWriteGate(cmd *cobra.Command, opName string) error {
 	if err != nil {
 		return err
 	}
-	safety := adt.SafetyConfig{ReadOnly: params.ReadOnly || envFlag("SAP_READ_ONLY")}
+	return cliWorkflowGate(cliReadOnly(params), opName)
+}
+
+// cliReadOnly says whether the selected system is read-only for the CLI:
+// read_only in .vsp.json, or SAP_READ_ONLY.
+func cliReadOnly(params *systemParams) bool {
+	return params.ReadOnly || envFlag("SAP_READ_ONLY")
+}
+
+// cliWorkflowGate is the workflow-operation check the MCP server applies to
+// rfc call and RunReport, for a CLI command on a system that may be read-only.
+func cliWorkflowGate(readOnly bool, opName string) error {
+	safety := adt.SafetyConfig{ReadOnly: readOnly}
 	return safety.CheckOperation(adt.OpWorkflow, opName)
 }
 
