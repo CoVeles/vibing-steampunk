@@ -409,6 +409,11 @@ func (c *Client) SearchObjectByType(ctx context.Context, query, objectType strin
 // begins; the window is wide so that it is not cut off by them.
 const exactSearchFetch = 1000
 
+// ErrExactSearchWindowFull is returned by SearchObjectExact when the quick
+// search filled the whole window with longer names and the name itself was
+// not among them: whether it exists is unknown, not "no".
+var ErrExactSearchWindowFull = errors.New("exact search inconclusive")
+
 // SearchObjectExact returns the objects whose name equals name, ignoring
 // case, optionally of one type, at most maxResults of them (0: no limit).
 // A name can belong to several objects of different types (a program and a
@@ -426,6 +431,16 @@ func (c *Client) SearchObjectExact(ctx context.Context, name, objectType string,
 		return nil, err
 	}
 	out := FilterExactName(results, name)
+	if len(out) == 0 && len(results) >= exactSearchFetch {
+		// A full window without the name says nothing about whether it
+		// exists: it may be ranked beyond the window.
+		narrow := "pass type to narrow"
+		if objectType != "" {
+			narrow = "even with type " + objectType + "; the name cannot be found this way"
+		}
+		return nil, fmt.Errorf("%w: %q not found within the first %d prefix matches; %s",
+			ErrExactSearchWindowFull, name, exactSearchFetch, narrow)
+	}
 	if maxResults > 0 && len(out) > maxResults {
 		out = out[:maxResults]
 	}

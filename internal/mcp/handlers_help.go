@@ -141,7 +141,10 @@ High-level create (with source):
   SAP(action="search", target="ZCL_*", params={"maxResults": 50})
   SAP(action="search", target="ZCL_*", params={"type": "CLAS", "max": 20})   — type filter, applied before max
   SAP(action="search", target="ZCL_ORDER", params={"exact": true})            — only objects named exactly ZCL_ORDER (case-insensitive)
-  SAP(action="search", target="ZCL_ORDER", params={"exact": true, "type": "CLAS"})`)
+  SAP(action="search", target="ZCL_ORDER", params={"exact": true, "type": "CLAS"})
+
+  exact reads the first 1000 prefix matches of the name. If all of them are
+  longer names it reports the search as inconclusive; add "type" to narrow.`)
 
 	case "query":
 		return mcp.NewToolResultText(`SAP(action="query") - Database queries

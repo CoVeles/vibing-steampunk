@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -142,7 +143,7 @@ func init() {
 	rootCmd.Flags().Duration("keepalive", 0, "Session keep-alive interval (e.g., 60s, 5m). Prevents session timeout during idle periods. 0 = disabled (default; see #168)")
 
 	// Long calls
-	rootCmd.Flags().Int("call-timeout", 0, "Default budget in seconds of one long MCP call (ExecuteABAP, ABAP Unit, deploy) that names no params.timeout. 0 = none: each request to SAP is limited to 60s")
+	rootCmd.Flags().Int("call-timeout", 0, "Default budget in seconds of one long MCP call (ExecuteABAP, ABAP Unit, deploy) that names no params.timeout; at most 3600. 0 = none: each request to SAP is limited to 60s. A negative value is a startup error")
 
 	// Safety options
 	rootCmd.Flags().BoolVar(&cfg.ReadOnly, "read-only", false, "Block all write operations (create, update, delete, activate)")
@@ -247,6 +248,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if err := validateConfig(); err != nil {
 		return err
 	}
+
+	// Long-call budget of the MCP server: flag > SAP_CALL_TIMEOUT env
+	callTimeout, err := resolveCallTimeout(cmd)
+	if err != nil {
+		return err
+	}
+	cfg.CallTimeout = callTimeout
 
 	// Browser-based SSO authentication (must run before processCookieAuth)
 	if err := processBrowserAuth(cmd); err != nil {
@@ -577,9 +585,6 @@ func resolveConfig(cmd *cobra.Command) {
 		}
 	}
 
-	// Long-call budget: flag > SAP_CALL_TIMEOUT env (seconds)
-	cfg.CallTimeout = resolveCallTimeout(cmd)
-
 	// Keep-alive interval: flag > SAP_KEEPALIVE env
 	if !cmd.Flags().Changed("keepalive") {
 		if v := viper.GetString("KEEPALIVE"); v != "" {
@@ -592,23 +597,56 @@ func resolveConfig(cmd *cobra.Command) {
 	}
 }
 
-// resolveCallTimeout reads --call-timeout, else SAP_CALL_TIMEOUT, in
-// seconds. An unparsable or negative value means none.
-func resolveCallTimeout(cmd *cobra.Command) time.Duration {
-	secs := 0
+// resolveCallTimeout reads --call-timeout, else SAP_CALL_TIMEOUT: seconds
+// (the env also takes a Go duration such as 5m). 0, or nothing set, means no
+// budget of the server's own. Anything else that is not at least one second
+// is an error, not a silent "no budget": a typo would otherwise take the limit
+// the operator meant to set away without a word. Capped at MaxCallTimeout.
+func resolveCallTimeout(cmd *cobra.Command) (time.Duration, error) {
+	var d time.Duration
+	var source string
 	if cmd.Flags().Changed("call-timeout") {
-		secs, _ = cmd.Flags().GetInt("call-timeout")
+		secs, err := cmd.Flags().GetInt("call-timeout")
+		if err != nil {
+			return 0, fmt.Errorf("--call-timeout: %w", err)
+		}
+		source = fmt.Sprintf("--call-timeout %d", secs)
+		if secs < 0 {
+			return 0, fmt.Errorf("%s: must be a number of seconds, at least 1 (0 for none)", source)
+		}
+		if secs > int(mcp.MaxCallTimeout/time.Second) {
+			return mcp.MaxCallTimeout, nil
+		}
+		d = time.Duration(secs) * time.Second
 	} else if v := strings.TrimSpace(viper.GetString("CALL_TIMEOUT")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			secs = n
-		} else if d, err := time.ParseDuration(v); err == nil {
-			secs = int(d.Seconds())
+		source = fmt.Sprintf("SAP_CALL_TIMEOUT=%q", v)
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			if math.IsNaN(f) || f < 0 {
+				return 0, fmt.Errorf("%s: must be a number of seconds, at least 1 (0 for none)", source)
+			}
+			if f > mcp.MaxCallTimeout.Seconds() {
+				return mcp.MaxCallTimeout, nil
+			}
+			d = time.Duration(f * float64(time.Second))
+		} else if pd, err := time.ParseDuration(v); err == nil {
+			if pd < 0 {
+				return 0, fmt.Errorf("%s: must not be negative", source)
+			}
+			d = pd
+		} else {
+			return 0, fmt.Errorf("%s: not a number of seconds or a duration such as 5m", source)
 		}
 	}
-	if secs <= 0 {
-		return 0
+	if d == 0 {
+		return 0, nil
 	}
-	return time.Duration(secs) * time.Second
+	if d < time.Second {
+		return 0, fmt.Errorf("%s: below 1s; give at least one second, or 0 for none", source)
+	}
+	if d > mcp.MaxCallTimeout {
+		d = mcp.MaxCallTimeout
+	}
+	return d, nil
 }
 
 func validateConfig() error {

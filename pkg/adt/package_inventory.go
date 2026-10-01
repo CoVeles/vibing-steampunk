@@ -54,8 +54,9 @@ type PackageInventory struct {
 	Skipped []string `json:"skipped,omitempty"`
 }
 
-// inventoryMaxObjects bounds the TADIR read.
-const inventoryMaxObjects = 5000
+// inventoryMaxObjects bounds the TADIR read. A variable so tests can make it
+// small.
+var inventoryMaxObjects = 5000
 
 // packageNamePattern is the shape of a package name. The name goes into an
 // SQL literal, so anything else is refused rather than escaped.
@@ -94,22 +95,26 @@ func (c *Client) PackageInventory(ctx context.Context, packageName string) (*Pac
 
 	rows, err := c.RunQuery(ctx, fmt.Sprintf(
 		"SELECT object, obj_name, author, created_on FROM tadir WHERE pgmid = 'R3TR' AND devclass = '%s'", pkg),
-		inventoryMaxObjects)
+		// One more than is listed, so a package with exactly the limit is
+		// not reported as truncated.
+		inventoryMaxObjects+1)
 	if err != nil {
 		inv.Notes = append(inv.Notes, fmt.Sprintf("TADIR could not be read (%v); objects are from the ADT package contents, without author and created on", err))
 		objectsFromADT = true
 	} else {
-		for _, r := range rows.Rows {
+		listed := rows.Rows
+		if len(listed) > inventoryMaxObjects {
+			listed = listed[:inventoryMaxObjects]
+			inv.ObjectsTruncated = true
+			inv.Notes = append(inv.Notes, fmt.Sprintf("only the first %d TADIR entries are listed", inventoryMaxObjects))
+		}
+		for _, r := range listed {
 			inv.Objects = append(inv.Objects, InventoryObject{
 				Type:      rowString(r, "OBJECT"),
 				Name:      rowString(r, "OBJ_NAME"),
 				Author:    rowString(r, "AUTHOR"),
 				CreatedOn: sapDate(rowString(r, "CREATED_ON")),
 			})
-		}
-		if len(rows.Rows) >= inventoryMaxObjects {
-			inv.ObjectsTruncated = true
-			inv.Notes = append(inv.Notes, fmt.Sprintf("only the first %d TADIR entries are listed", inventoryMaxObjects))
 		}
 		if len(rows.Rows) == 0 {
 			inv.Notes = append(inv.Notes, "TADIR has no entry for this package, not even its own: it may not exist")

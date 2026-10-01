@@ -184,3 +184,28 @@ func TestPackageInventoryRefusesOddNames(t *testing.T) {
 		}
 	}
 }
+
+// objects_truncated means rows were left out: one more than the limit is
+// read, so a package holding exactly the limit is complete.
+func TestPackageInventoryTruncatedOnlyBeyondTheLimit(t *testing.T) {
+	saved := inventoryMaxObjects
+	t.Cleanup(func() { inventoryMaxObjects = saved })
+
+	inventoryMaxObjects = 3 // the fixture's TADIR holds exactly 3
+	inv, err := newInventoryClient(t, &inventorySAP{}).PackageInventory(context.Background(), "$ZDEMO")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.ObjectsTruncated || len(inv.Objects) != 3 {
+		t.Fatalf("exactly the limit: truncated=%v, %d objects", inv.ObjectsTruncated, len(inv.Objects))
+	}
+
+	inventoryMaxObjects = 2
+	inv, err = newInventoryClient(t, &inventorySAP{}).PackageInventory(context.Background(), "$ZDEMO")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inv.ObjectsTruncated || len(inv.Objects) != 2 {
+		t.Fatalf("beyond the limit: truncated=%v, %d objects", inv.ObjectsTruncated, len(inv.Objects))
+	}
+}

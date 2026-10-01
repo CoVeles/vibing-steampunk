@@ -23,8 +23,15 @@ func WithCallDeadline(ctx context.Context) context.Context {
 	return context.WithValue(ctx, callDeadlineKey{}, true)
 }
 
-// callDeadlineGoverns reports whether ctx was marked by WithCallDeadline.
+// callDeadlineGoverns reports whether ctx was marked by WithCallDeadline and
+// still has a deadline. The mark is a value, so it survives
+// context.WithoutCancel, which drops the deadline: a context detached that way
+// must fall back to the client's per-request Timeout, or a request under it
+// could hang without bound.
 func callDeadlineGoverns(ctx context.Context) bool {
+	if _, ok := ctx.Deadline(); !ok {
+		return false
+	}
 	v, _ := ctx.Value(callDeadlineKey{}).(bool)
 	return v
 }

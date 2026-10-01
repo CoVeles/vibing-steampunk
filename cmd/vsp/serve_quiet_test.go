@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -33,18 +34,54 @@ func TestServeMCPErrorPrintsNoUsage(t *testing.T) {
 }
 
 func TestResolveCallTimeout(t *testing.T) {
-	t.Setenv("SAP_CALL_TIMEOUT", "")
-	cmd := &cobra.Command{Use: "vsp"}
-	cmd.Flags().Int("call-timeout", 0, "")
-	if got := resolveCallTimeout(cmd); got != 0 {
-		t.Fatalf("no flag, no env: got %v, want 0", got)
+	newCmd := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "vsp"}
+		cmd.Flags().Int("call-timeout", 0, "")
+		return cmd
 	}
-	t.Setenv("SAP_CALL_TIMEOUT", "300")
-	if got := resolveCallTimeout(cmd); got.Seconds() != 300 {
-		t.Fatalf("SAP_CALL_TIMEOUT=300: got %v", got)
+	good := []struct {
+		flag, env string
+		want      time.Duration
+	}{
+		{"", "", 0},
+		{"", "0", 0},
+		{"", "300", 300 * time.Second},
+		{"", "5m", 5 * time.Minute},
+		{"", "1.5", 1500 * time.Millisecond},
+		{"", "100000", time.Hour}, // capped
+		{"", "3h", time.Hour},     // capped
+		{"90", "300", 90 * time.Second},
+		{"0", "300", 0}, // an explicit 0 on the flag wins: none
+		{"7200", "", time.Hour},
 	}
-	_ = cmd.Flags().Set("call-timeout", "90")
-	if got := resolveCallTimeout(cmd); got.Seconds() != 90 {
-		t.Fatalf("flag 90 over env: got %v", got)
+	for _, c := range good {
+		t.Setenv("SAP_CALL_TIMEOUT", c.env)
+		cmd := newCmd()
+		if c.flag != "" {
+			_ = cmd.Flags().Set("call-timeout", c.flag)
+		}
+		got, err := resolveCallTimeout(cmd)
+		if err != nil || got != c.want {
+			t.Errorf("flag %q env %q: got %v, %v; want %v", c.flag, c.env, got, err, c.want)
+		}
+	}
+	bad := []struct{ flag, env string }{
+		{"", "soon"},
+		{"", "-5"},
+		{"", "-1m"},
+		{"", "500ms"},
+		{"", "0.5"},
+		{"", "NaN"},
+		{"-1", ""},
+	}
+	for _, c := range bad {
+		t.Setenv("SAP_CALL_TIMEOUT", c.env)
+		cmd := newCmd()
+		if c.flag != "" {
+			_ = cmd.Flags().Set("call-timeout", c.flag)
+		}
+		if got, err := resolveCallTimeout(cmd); err == nil {
+			t.Errorf("flag %q env %q: got %v, want a startup error", c.flag, c.env, got)
+		}
 	}
 }

@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -180,5 +182,171 @@ func TestServeStdioShutdownIsClean(t *testing.T) {
 	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
 	if err := s.serveStdio(ctx, pr, io.Discard); err != nil {
 		t.Fatalf("signalled: got %v, want a clean exit", err)
+	}
+}
+
+// A deploy_zip report runs to kilobytes and ends with its cleanup warnings.
+// The timeout message keeps all of it: the LEFT LOCKED line at the very end
+// is the one the caller has to act on, and a cut must never split a rune.
+func TestLongCallKeepsTheWholeReportOnTimeout(t *testing.T) {
+	const locked = "  • CLAS ZCL_DEMO_LAST: LEFT LOCKED — unlock also failed: context deadline exceeded (clear it in SM12, or wait for the ADT session timeout)"
+	report := func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		<-ctx.Done()
+		var sb strings.Builder
+		for i := 0; sb.Len() < 5000; i++ {
+			// Multi-byte runes everywhere, so any byte cut is likely to split one.
+			sb.WriteString("  [✓] Create CLAS ZCL_DEMO_ÄÖÜ… ok\n")
+		}
+		sb.WriteString("\nUpload failures:\n")
+		sb.WriteString("  • CLAS ZCL_DEMO_X: upload failed: context deadline exceeded\n")
+		sb.WriteString("  • CLAS ZCL_DEMO_Y: source uploaded but LEFT LOCKED: context deadline exceeded\n")
+		sb.WriteString(locked + "\n")
+		return mcp.NewToolResultText(sb.String()), nil
+	}
+	s := &Server{config: &Config{}}
+	res, _ := s.longCall(context.Background(), newRequest(map[string]any{"timeout": 0.05}), "deploy_zip", report)
+	text := resultText(res)
+	if !res.IsError || !strings.HasPrefix(text, "deploy_zip timed out after 50ms") {
+		t.Fatalf("want a timeout message, got %.200q", text)
+	}
+	if !strings.HasSuffix(text, locked) {
+		t.Fatalf("the final LEFT LOCKED line was lost; message ends %q", text[max(0, len(text)-200):])
+	}
+	if !strings.Contains(text, "source uploaded but LEFT LOCKED") {
+		t.Fatal("an earlier LEFT LOCKED line was lost")
+	}
+	if !utf8.ValidString(text) {
+		t.Fatal("the message is not valid UTF-8: a rune was split")
+	}
+}
+
+// A handler that finished its work and answered normally did not time out,
+// even if the budget ran out as it returned.
+func TestLongCallDoesNotRewriteCompletedWork(t *testing.T) {
+	done := func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		<-ctx.Done()
+		return mcp.NewToolResultText("Deployment complete: 3 ok, 0 failed"), nil
+	}
+	s := &Server{config: &Config{}}
+	res, _ := s.longCall(context.Background(), newRequest(map[string]any{"timeout": 0.02}), "deploy_zip", done)
+	if res.IsError || resultText(res) != "Deployment complete: 3 ok, 0 failed" {
+		t.Fatalf("completed work was rewritten: %q", resultText(res))
+	}
+
+	refused := func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		<-ctx.Done()
+		return newToolResultError("syntax error in line 3"), nil
+	}
+	res, _ = s.longCall(context.Background(), newRequest(map[string]any{"timeout": 0.02}), "x", refused)
+	if resultText(res) != "syntax error in line 3" {
+		t.Fatalf("a failure unrelated to the deadline was rewritten: %q", resultText(res))
+	}
+}
+
+// When the caller's own deadline is earlier than the call's budget, that is
+// the one that ended it, and the message says so rather than quoting the
+// budget.
+func TestLongCallReportsTheEffectiveDeadline(t *testing.T) {
+	parent, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	s := &Server{config: &Config{}}
+	res, _ := s.longCall(parent, newRequest(map[string]any{"timeout": float64(30)}), "execute_abap", waitForCtx)
+	text := resultText(res)
+	if !strings.Contains(text, "execute_abap timed out after 50ms, at the caller's own deadline, before its budget of 30s") {
+		t.Fatalf("got %q", text)
+	}
+
+	parent2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	res, _ = s.longCall(parent2, newRequest(map[string]any{}), "execute_abap", waitForCtx)
+	if text := resultText(res); !strings.Contains(text, "timed out after 50ms, at the caller's own deadline;") {
+		t.Fatalf("no budget, caller's deadline: got %q", text)
+	}
+}
+
+// Without a budget of its own, a call is not reported as timed out for a bare
+// "context deadline exceeded" in its text: only the Client.Timeout case is
+// the per-request limit.
+func TestLongCallBareDeadlineTextNeedsABudget(t *testing.T) {
+	h := func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return newToolResultError("RFC call failed: context deadline exceeded"), nil
+	}
+	s := &Server{config: &Config{}}
+	res, _ := s.longCall(context.Background(), newRequest(map[string]any{}), "x", h)
+	if resultText(res) != "RFC call failed: context deadline exceeded" {
+		t.Fatalf("no budget: got %q", resultText(res))
+	}
+	res, _ = s.longCall(context.Background(), newRequest(map[string]any{"timeout": float64(30)}), "x", h)
+	if text := resultText(res); !strings.Contains(text, "x stopped after") || !strings.Contains(text, "Detail: RFC call failed") {
+		t.Fatalf("with a budget: got %q", text)
+	}
+}
+
+// deploy_zip goes through longCall: a bad timeout is refused by the budget
+// parser before anything else happens.
+func TestDeployZipIsALongCall(t *testing.T) {
+	s := NewServer(&Config{BaseURL: "http://127.0.0.1:1", Username: "u", Password: "p", Client: "001", Language: "EN", Mode: "expert"})
+	res, err := s.handleDeployZip(context.Background(), newRequest(map[string]any{
+		"source": "abapgit-standalone", "package": "$ZDEMO", "dry_run": true, "timeout": "soon",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(resultText(res), "timeout must be") {
+		t.Fatalf("handleDeployZip ignored params.timeout: %.300q", resultText(res))
+	}
+}
+
+// deploy_zip releases a lock it took even when the call's context ends inside
+// the lock window: the UNLOCK goes out on a context of its own.
+func TestDeployZipUnlocksAfterTheCallContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	locks, unlocks := 0, 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-CSRF-Token", "t")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Get("_action") == "LOCK":
+			mu.Lock()
+			locks++
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/vnd.sap.as+xml")
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA>
+<LOCK_HANDLE>HANDLE-1</LOCK_HANDLE><MODIFICATION_SUPPORT>Modification</MODIFICATION_SUPPORT>
+</DATA></asx:values></asx:abap>`))
+			return
+		case r.Method == http.MethodPost && r.URL.Query().Get("_action") == "UNLOCK":
+			mu.Lock()
+			unlocks++
+			mu.Unlock()
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/source/main"):
+			// The call ends while the upload is on the wire.
+			cancel()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(200 * time.Millisecond):
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(fakeEmptyXML))
+	}))
+	t.Cleanup(ts.Close)
+	s := NewServer(&Config{BaseURL: ts.URL, Username: "u", Password: "p", Client: "001", Language: "EN", Mode: "expert"})
+
+	res, err := s.handleDeployZip(ctx, newRequest(map[string]any{"source": "abapgit-standalone", "package": "$ZDEMO"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if locks == 0 {
+		t.Fatalf("no LOCK reached the server; the test did not reach the lock window: %.500q", resultText(res))
+	}
+	if unlocks != locks {
+		t.Fatalf("LOCK %d, UNLOCK %d: a lock taken before the call ended was not released", locks, unlocks)
 	}
 }

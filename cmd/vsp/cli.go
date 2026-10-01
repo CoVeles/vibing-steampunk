@@ -545,6 +545,8 @@ var searchCmd = &cobra.Command{
 
 With --exact the query is a name, not a pattern: only objects whose name
 equals it (case-insensitive) are listed, still filtered by --type and --max.
+It reads the first 1000 prefix matches; when all of them are longer names
+the search says it is inconclusive rather than "not found" — add --type.
 
 Examples:
   vsp -s a4h search "ZCL_*"
@@ -558,7 +560,7 @@ Examples:
 func init() {
 	searchCmd.Flags().StringVarP(&objectType, "type", "t", "", "Filter by object type (CLAS, PROG, INTF, etc.)")
 	searchCmd.Flags().IntVarP(&maxResults, "max", "m", 100, "Maximum results")
-	searchCmd.Flags().Bool("exact", false, "Only objects whose name equals the query (case-insensitive, no wildcards)")
+	searchCmd.Flags().Bool("exact", false, "Only objects whose name equals the query (case-insensitive, no wildcards); reads the first 1000 prefix matches, so add --type for a short name")
 }
 
 func runSearch(cmd *cobra.Command, args []string) error {

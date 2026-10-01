@@ -802,7 +802,7 @@ func (s *Server) registerSearchTools(shouldRegister func(string) bool) {
 				mcp.Description("Only objects of this type (CLAS, PROG, INTF, FUGR, ...)"),
 			),
 			mcp.WithBoolean("exact",
-				mcp.Description("Only objects whose name equals query, ignoring case (no wildcards). Combines with objectType and maxResults."),
+				mcp.Description("Only objects whose name equals query, ignoring case (no wildcards). Combines with objectType and maxResults. Reads the first 1000 prefix matches; if all are longer names, it says the result is inconclusive — pass objectType to narrow."),
 			),
 		), s.handleSearchObject)
 	}

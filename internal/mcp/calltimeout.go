@@ -13,9 +13,9 @@ import (
 	"github.com/oisee/vibing-steampunk/pkg/adt"
 )
 
-// maxCallTimeout caps a per-call budget. An hour is far beyond any ABAP Unit
+// MaxCallTimeout caps a per-call budget, and the server default. An hour is far beyond any ABAP Unit
 // run or deploy an agent should wait on synchronously.
-const maxCallTimeout = time.Hour
+const MaxCallTimeout = time.Hour
 
 // callTimeoutDescription documents the timeout parameter of every long call.
 const callTimeoutDescription = "Seconds this call may take in all (default: the server's --call-timeout; without one, each request to SAP is limited to 60s). When it runs out the call returns a timeout message; the work may still be running on SAP."
@@ -48,8 +48,8 @@ func callBudget(args map[string]any, serverDefault time.Duration) (time.Duration
 		return 0, fmt.Errorf("timeout must be a positive number of seconds, got %v", raw)
 	}
 	d := time.Duration(secs * float64(time.Second))
-	if d > maxCallTimeout {
-		d = maxCallTimeout
+	if d > MaxCallTimeout {
+		d = MaxCallTimeout
 	}
 	return d, nil
 }
@@ -68,6 +68,7 @@ func (s *Server) longCall(ctx context.Context, request mcp.CallToolRequest, op s
 	if err != nil {
 		return newToolResultError(err.Error()), nil
 	}
+	start := time.Now()
 	callCtx := ctx
 	if budget > 0 {
 		var cancel context.CancelFunc
@@ -75,18 +76,54 @@ func (s *Server) longCall(ctx context.Context, request mcp.CallToolRequest, op s
 		defer cancel()
 		callCtx = adt.WithCallDeadline(callCtx)
 	}
-	start := time.Now()
 	result, herr := h(callCtx, request)
-	if msg := timeoutMessage(op, callCtx, budget, time.Since(start), result, herr); msg != "" {
+	ended := callEnd{budget: budget, elapsed: time.Since(start)}
+	if dl, ok := callCtx.Deadline(); ok {
+		ended.hasDeadline = true
+		ended.deadline = max(dl.Sub(start), 0)
+	}
+	if msg := timeoutMessage(op, callCtx, ended, result, herr); msg != "" {
 		return newToolResultError(msg), nil
 	}
 	return result, herr
 }
 
+// callEnd is what longCall knows about a call's time when it ends.
+type callEnd struct {
+	budget time.Duration // the call's own budget; 0 when it had none
+	// deadline is from start to the effective deadline, the earlier of the
+	// budget's and the caller's, when hasDeadline.
+	deadline    time.Duration
+	hasDeadline bool
+	elapsed     time.Duration
+}
+
+// cancellationMarkers are the texts an ended context or an HTTP timeout
+// leaves in an error.
+var cancellationMarkers = []string{"context deadline exceeded", "context canceled", "Client.Timeout"}
+
+// reflectsCancellation reports whether what the handler returned is the
+// result of its context ending: a context error, or a context error's text in
+// its error or its result. A handler that finished its work and returned an
+// ordinary answer did not time out, even if the deadline passed just after.
+func reflectsCancellation(text string, herr error) bool {
+	if errors.Is(herr, context.DeadlineExceeded) || errors.Is(herr, context.Canceled) {
+		return true
+	}
+	for _, m := range cancellationMarkers {
+		if strings.Contains(text, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // timeoutMessage names a call that ended because a wait ran out, or "" when
-// it did not. A call whose context ended is reported as such even when it
-// produced a result: whatever it produced is incomplete, and is kept as detail.
-func timeoutMessage(op string, ctx context.Context, budget, elapsed time.Duration, result *mcp.CallToolResult, herr error) string {
+// it did not. It rewrites only a result or error that reflects the ending; a
+// call whose work completed is left alone. What the handler said is kept in
+// full as detail: it can end in a cleanup warning (a lock left behind, a
+// temporary program not deleted) the caller needs to act on.
+func timeoutMessage(op string, ctx context.Context, end callEnd, result *mcp.CallToolResult, herr error) string {
 	// Not only an error result: ExecuteABAP reports a run it could not finish
 	// as an ordinary result ("Success: false"), with the context's error
 	// somewhere inside it.
@@ -96,27 +133,39 @@ func timeoutMessage(op string, ctx context.Context, budget, elapsed time.Duratio
 	} else {
 		text = resultText(result)
 	}
+	if !reflectsCancellation(text, herr) {
+		return ""
+	}
 	const still = "the operation may still be running on SAP (check SM50/SM66 before retrying it)"
 	var msg string
 	switch {
-	case budget > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded):
-		msg = fmt.Sprintf("%s timed out after %s; %s. Pass a larger params.timeout (seconds), or start the server with a larger --call-timeout.",
-			op, seconds(budget), still)
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		callersEarlier := end.hasDeadline && (end.budget == 0 || end.deadline < end.budget)
+		switch {
+		case callersEarlier && end.budget > 0:
+			msg = fmt.Sprintf("%s timed out after %s, at the caller's own deadline, before its budget of %s; %s.",
+				op, seconds(end.deadline), seconds(end.budget), still)
+		case callersEarlier:
+			msg = fmt.Sprintf("%s timed out after %s, at the caller's own deadline; %s.",
+				op, seconds(end.deadline), still)
+		default:
+			msg = fmt.Sprintf("%s timed out after %s; %s. Pass a larger params.timeout (seconds), or start the server with a larger --call-timeout.",
+				op, seconds(end.budget), still)
+		}
 	case errors.Is(ctx.Err(), context.Canceled):
-		msg = fmt.Sprintf("%s was cancelled by the client after %s; %s.", op, seconds(elapsed), still)
-	case strings.Contains(text, "Client.Timeout exceeded") || strings.Contains(text, "context deadline exceeded"):
+		msg = fmt.Sprintf("%s was cancelled by the client after %s; %s.", op, seconds(end.elapsed), still)
+	case strings.Contains(text, "Client.Timeout"):
 		msg = fmt.Sprintf("%s timed out after %s: one request to SAP ran past the per-request limit; %s. Pass params.timeout (seconds) to give the whole call a longer budget.",
-			op, seconds(elapsed), still)
+			op, seconds(end.elapsed), still)
+	case end.budget > 0 && strings.Contains(text, "context deadline exceeded"):
+		// The call's own context is live, so a shorter deadline inside the
+		// call ended one of its requests.
+		msg = fmt.Sprintf("%s stopped after %s: a request to SAP ran out of time within the call; %s.",
+			op, seconds(end.elapsed), still)
 	default:
 		return ""
 	}
-	// What the handler said is kept: it can carry a cleanup warning (a
-	// temporary program left behind, a lock not released) the caller needs.
 	if detail := strings.TrimSpace(text); detail != "" {
-		const max = 1000
-		if len(detail) > max {
-			detail = detail[:max] + " ..."
-		}
 		msg += "\nDetail: " + detail
 	}
 	return msg
