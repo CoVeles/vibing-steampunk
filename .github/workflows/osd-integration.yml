@@ -1,0 +1,154 @@
+name: OSD integration (advisory)
+
+# vsp's integration-tagged tests against open-steamgate, a local ADT-speaking
+# system shipped as a release binary (oisee/open-steamgate, MIT). Nothing here
+# touches a real SAP system and nothing needs a secret: the binary accepts any
+# Basic user, the release is public, and the token is the workflow's own.
+#
+# Advisory on purpose. OSD is not SAP: it has routes SAP has not and lacks
+# routes SAP has, and its syntax check is abaplint. The matrix it produces is
+# a map of where vsp and OSD agree, not a gate. Read summary.md; do not block
+# on it. Reports: reports/2026-10-01-001-osgo-integration-ci-spike.md.
+#
+# Target, chosen by binary name only (.github/ci/osd-up.sh):
+#   osd   the Bun build with the ADT facade. Pinned in .github/ci/osd.version.
+#   osgo  the Go build. Pinned in .github/ci/osgo.version, empty until the
+#         first release that ships osgo-* assets; it has no ADT until OSG 0.6,
+#         so it runs as a smoke check and turns into the full suite on its own
+#         the day HEAD /sap/bc/adt/core/discovery answers 200.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'osd or osgo'
+        default: osd
+      tag:
+        description: 'release tag (empty: the pinned one)'
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: osd-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: ${{ matrix.target }} ${{ matrix.tag || 'pinned' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The pinned OSD: every event.
+          - target: osd
+            tag: ''
+          # OSGo: skips with a notice while osgo.version is empty.
+          - target: osgo
+            tag: ''
+          # The newest vscode-v0.4.* tag, nightly only: tells us early when a
+          # new OSD release moves the matrix, without moving the pin.
+          - target: osd
+            tag: latest
+    steps:
+      - name: Decide whether this row runs
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_TARGET: ${{ inputs.target }}
+          IN_TAG: ${{ inputs.tag }}
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          run=true
+          if [ "$EVENT" = workflow_dispatch ]; then
+            [ "$TARGET" = "${IN_TARGET:-osd}" ] && [ "$TAG" != latest ] || run=false
+            TAG=$IN_TAG
+          elif [ "$TAG" = latest ] && [ "$EVENT" != schedule ]; then
+            run=false
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.plan.outputs.run == 'true'
+      - uses: actions/setup-go@v5
+        if: steps.plan.outputs.run == 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve the latest tag
+        if: steps.plan.outputs.run == 'true' && steps.plan.outputs.tag == 'latest'
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release list -R oisee/open-steamgate --limit 50 --json tagName,isDraft \
+            --jq 'map(select((.isDraft | not) and (.tagName | startswith("vscode-v0.4.")))) | .[0].tagName // ""')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "latest ${{ matrix.target }} tag: ${tag:-none}"
+
+      # Download, verify the sha256, start on throwaway state, wait for ready.
+      # No node, no npm: the binary embeds its runtime and dependencies.
+      - name: Start ${{ matrix.target }}
+        if: steps.plan.outputs.run == 'true'
+        id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OSD_BINARY: ${{ matrix.target }}
+          STG_PORT: '3030'
+          TAG: ${{ steps.latest.outputs.tag || steps.plan.outputs.tag }}
+        run: |
+          status=0
+          .github/ci/osd-up.sh "$RUNNER_TEMP/osd" ${TAG:+"$TAG"} || status=$?
+          if [ "$status" = 3 ]; then
+            echo "::notice title=osd-integration::${{ matrix.target }} skipped: no downloadable release asset pinned or published"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$status" = 0 ] || exit "$status"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      # The full suite only where ADT answers; elsewhere the start itself was
+      # the smoke check, and the summary says so.
+      - name: Integration tests
+        if: steps.up.outputs.available == 'true' && env.OSD_ADT == '200'
+        env:
+          SAP_USER: DEVELOPER   # any user: the facade does not authenticate
+          SAP_PASSWORD: osd
+          SAP_CLIENT: '001'     # never 123: that is the runtime's sy-mandt, not an ADT client
+          VSP_TEST_PACKAGE: '$ZOSD_TEST_SRC'   # OSD has no $TMP
+          VSP_TEST_TIMEOUT: 120s             # each activation rebuilds OSD's runtime (25-30 s)
+        run: |
+          go test -tags=integration -json -count=1 -timeout 30m ./pkg/adt/ ./pkg/ctxcomp/ ./pkg/saprfc/ > test.json || true
+
+      - name: Summarise
+        if: always() && steps.up.outputs.available == 'true'
+        run: |
+          mkdir -p out
+          if [ -s test.json ]; then
+            .github/ci/osd-summary.sh test.json out/summary.json out/summary.md | tee out/line.txt
+          else
+            echo "## $OSD_TAG: smoke only (HEAD /sap/bc/adt/core/discovery answered ${OSD_ADT:-nothing})" | tee out/summary.md
+          fi
+          cat out/summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=osd-integration::$(head -1 out/line.txt 2>/dev/null || head -1 out/summary.md)"
+          cp "$OSD_WORKDIR"/osd.log "$OSD_WORKDIR"/build.json out/ 2>/dev/null || true
+          kill "$OSD_PID" 2>/dev/null || true
+
+      - name: Upload the matrix
+        if: always() && steps.up.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: osd-matrix-${{ matrix.target }}-${{ matrix.tag || 'pinned' }}
+          path: out/
+          retention-days: 30

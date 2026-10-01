@@ -1,0 +1,391 @@
+# Spike: vsp integration tests in CI against open-steamgate (OSD / OSGo)
+
+**Date:** 2026-10-01
+**Branch:** `spike/osgo-ci`
+**Question:** can CI download the latest open-steamgate release, start it, and
+run vsp's read / write / lock / version / dump / impact / callgraph tests
+against it, so that the same scenarios can later be diffed against A4H?
+
+**Short answer:** yes for the OSD release binary, and the job is drafted
+(`.github/workflows/osd-integration.yml`, advisory). Against
+OSD `vscode-v0.4.1444`, 18 of 57 integration tests pass and 1 more passes
+vacuously. Most of the rest fail for two reasons. Either OSD does not serve
+the route (16), or the test reads an SAP-standard object that OSD does not
+ship (7). Five are real behaviour differences worth triage, and the lock
+session model is the first of them. OSGo, the Go build, has no ADT yet. The
+job carries it as a disabled smoke row that turns on by itself once it does.
+
+## 1. What OSGO is, and which binary to run
+
+"OSGO" covers two artefacts from one repository, `oisee/open-steamgate` (public,
+MIT; local checkouts at `~/dev/osg-research` and `~/dev/open-steamgate`):
+
+| | OSD | OSGo |
+|---|---|---|
+| What | The whole system as one Bun binary: ICF, Gateway, apps, SQLite, **ADT façade** (`tools/adt-facade.mjs`) | The same system compiled to Go by `gogen` (`tools/gogen/go/cmd/osgo`) |
+| Release assets | Every `vscode-v0.4.*` tag: `osd-linux-x64`, `osd-linux-arm64`, `osd-darwin-arm64`, `osd-windows-x64.exe`, each with `.sha256` (checked for 1413, 1414, 1444) | None today. Planned for OSG 0.5: `osgo-*` on the same `vscode-v*` tags, static (CGO off, pure-Go SQLite), with `.sha256` |
+| ADT | Yes, under `/sap/bc/adt/` | No. HEAD `/sap/bc/adt/core/discovery` is not 200. The façade port is OSG 0.6 |
+| Start | `osd up` | `osgo -port … -db … -home …`; the 0.5 binary takes the same env as OSD |
+
+**Decision (stoker, osg-research and dell, relayed):** the full suite runs on
+the **OSD release binary, pinned to exactly `vscode-v0.4.1444`**, never
+"latest". The nightly job also tries the newest `vscode-v0.4.*` tag, as
+advisory only. OSGo is the preferred long-term target, because it is native
+and faster, but it has no ADT to test until 0.6. Until then it is a smoke row
+behind an empty pin (`.github/ci/osgo.version`). The spike did not build OSGo
+from source, on the coordinator's instruction. The build needs node,
+`npm ci`, `osd-libs` and `osgo.mjs` over all 822 classes, run under OSG's
+shared lock, which is too heavy for a CI pre-step when 0.5 will ship a binary.
+
+### Running OSD headless (verified locally)
+
+```
+gh release download vscode-v0.4.1444 -R oisee/open-steamgate -p 'osd-linux-x64*'
+sha256sum -c osd-linux-x64.sha256 && mv osd-linux-x64 osd && chmod +x osd
+XDG_DATA_HOME=$W/xdg HOME=$W/home STG_DB_PATH=$W/db/osd.sqlite STG_PORT=3030 ./osd up
+```
+
+The CI job needs no node, no `npm ci` and no `osd-libs`. The binary embeds its
+runtime and every pinned dependency. `.github/ci/osd-up.sh <workdir>` does all
+of the above and the readiness wait, and it runs the same locally.
+
+| Setting | Value | Source |
+|---|---|---|
+| URL | `http://localhost:$STG_PORT` (default 3030), ADT under `/sap/bc/adt/` | binary, osg-research |
+| User / password | Any Basic user and password are accepted, or none. The façade reports identity `DEVELOPER` | dell; verified |
+| Client | **`001`**, or no `sap-client` at all. **Never `123`**: that is only the runtime's `sy-mandt`, where the seed rows live | dell |
+| SID | `OS2` (override with `STG_ADT_SID`) | osg-research; `build.json` |
+| Ready | `GET /sap/bc/adt/core/http/build` answers **and** `system.serving == system.live`, non-null. The stamp answers earlier, with `serving: null`, so "it answers" alone is too early | verified |
+| Reset | A **fresh `XDG_DATA_HOME`**, a fresh `STG_DB_PATH` and a fresh process. A new DB alone is not enough: on first run the seed unpacks into `$XDG_DATA_HOME/open-steamgate/osd-home-<seed>/`, ADT writes land there as abapGit files, and builds go to `<home>/build/by-input/<hash>` | dell; verified |
+| Writable package | **`$ZOSD_TEST_SRC`**. There is no `$TMP` ("DEVC $TMP does not exist"). A new package must be named `<parent>_<FOLDER>` | verified |
+| Timing (cold, this host) | 121 s and 178 s from download to ready (110 MB download, seed unpack, full transpile). On the first run, with the binary already on disk, the stamp answered in 25 s and serving followed later | measured |
+| Memory | ~1.85 GB RSS: `osd up` (the supervisor/builder) 1.48 GB plus `osd serve` 0.38 GB | measured |
+| Disk | 147 MB home, 13 MB database | measured |
+
+A note on isolation. My very first `osd doctor` run unpacked a 75 MB home into
+the real `~/.local/share/open-steamgate`, although `XDG_DATA_HOME` was set on
+the same command line. I removed it at once (it was 10 s old and nothing else
+was in it). I could not reproduce this; later runs honoured `XDG_DATA_HOME`.
+The binary's code reads `env.XDG_DATA_HOME` correctly, so the cause is
+unexplained. `osd-up.sh` now also sets `HOME` into the work dir, so a miss
+like that one lands in scratch. Open question Q1.
+
+## 2. How the run was made
+
+- A worktree on `origin/main` (`9789f00`) and OSD `vscode-v0.4.1444`, started
+  with `osd-up.sh` on fresh state (generation `1299cac0540dd93f`).
+- Env: `SAP_URL=http://localhost:<port> SAP_USER=DEVELOPER SAP_PASSWORD=osd SAP_CLIENT=001
+  VSP_TEST_PACKAGE=$ZOSD_TEST_SRC VSP_TEST_TIMEOUT=120s`.
+- `go test -tags=integration -json ./pkg/adt/ ./pkg/ctxcomp/ ./pkg/saprfc/`.
+  These are every package with integration-tagged files. The tag also builds
+  the 1 400+ unit tests, and they all pass. `osd-summary.sh` counts only the
+  57 top-level tests defined in integration-tagged files.
+- No A4H credentials, no `.mcp.json`, no A4H contact.
+
+### Two minimal changes to the tests
+
+Both are opt-in; with neither variable set the tests behave exactly as before
+against A4H.
+
+1. **`VSP_TEST_PACKAGE`**: `integrationPackage()` replaces the 13 hard-coded
+   `"$TMP"` in the write tests. The function-module tests already read this
+   variable. Without it, every create test fails on OSD before it reaches the
+   behaviour under test (first run: 35 fail, 14 pass).
+2. **`VSP_TEST_TIMEOUT`**: overrides the integration client's fixed 30 s.
+   Every OSD activation rebuilds and reboots the runtime, which takes 25-30 s
+   (the log shows a fresh `boot: loading the generation` plus `cross-reference`
+   per activation). `WriteProgram` and `CreateAndActivateProgram` timed out at
+   36 s and 30 s. With 120 s both pass.
+
+## 3. The capability matrix (OSD vscode-v0.4.1444)
+
+**57 tests: 18 pass, 1 vacuous-pass, 16 missing-endpoint, 7 missing-object,
+5 different-answer, 2 environment, 8 skipped.**
+
+Classes (`osd-summary.sh`):
+
+- `missing-endpoint`: OSD said "`<path>` is not served by OSD".
+- `missing-object`: "`<TYPE> <NAME>` does not exist", for an SAP-standard
+  fixture.
+- `different-answer`: OSD answered, and the answer was not what the test
+  expects.
+- `vacuous-pass`: the test passed while tolerating a missing route.
+- `timeout`, `environment`, `skipped`: as named.
+
+Following dell's ask, a missing route is kept apart from a different answer.
+
+**Who owns each failure:** "OSD gap" means a missing or different OSD
+behaviour. "vsp assumption" means the test assumes SAP-standard content or
+names. "env" means the runner lacks something.
+
+| Test | Result | Class | Owner | Reason |
+|---|---|---|---|---|
+| **Read** | | | | |
+| SearchObject | pass | | | |
+| GetClass | pass | | | |
+| GetTable, GetTableContents, …WithQuery, RunQuery | pass ×4 | | | T000 exists in OSD's DDIC |
+| GetProgram | skip | missing-object | vsp assumption | SAPMSSY0 / RS_ABAP_SOURCE_SCAN not shipped |
+| GetPackage | skip | missing-object | vsp assumption | DEVC BASIS |
+| GetDDLS | fail | missing-object | vsp assumption | I_ABAPPACKAGE |
+| GetCDSDependencies | skip | missing-endpoint | OSD gap | `testcodegen/dependencies/doubledata` |
+| GetBDEF, GetSRVB, GetSource_RAP | fail ×3 | missing-endpoint | OSD gap | no BDEF / SRVB routes |
+| Namespace_GetSource_{Class,Interface,Program,DDLS}, RoundTrip | fail ×5 | missing-object | vsp assumption | `/UI5/`, `/DMO/` objects not shipped |
+| Namespace_GetSource_BDEF, ExportToFile, GetSource_Function | fail ×3 | missing-endpoint | OSD gap | BDEF; function modules under a group |
+| Namespace_SearchObject | fail | different-answer | vsp assumption | `/DMO/*` finds nothing (no /DMO/ content) |
+| Namespace_ParseFilename, URLEncoding | pass ×2 | | | offline |
+| ctxcomp AnalyzerLive | fail | missing-object | vsp assumption | ZCL_ABAPGIT_AJSON (OSD ships ZCL_AJSON) |
+| ctxcomp BenchmarkLive | pass | | | 18 abapGit classes found and analysed |
+| **Write / CRUD / activate** | | | | |
+| CRUD_FullWorkflow | pass | | | create → lock → write → unlock → activate → read → delete |
+| EditSource | pass | | | 106 s: four activations |
+| WriteProgram, WriteClass, CreateAndActivateProgram | pass ×3 | | | with `VSP_TEST_TIMEOUT=120s` |
+| SyntaxCheck, SyntaxCheckWithErrors | pass ×2 | | | abaplint, not the SAP compiler |
+| RunUnitTests | pass | | | |
+| ClassWithUnitTests, CreateClassWithTests | fail ×2 | missing-endpoint | OSD gap | POST `oo/classes/{n}/includes` (creating the test-classes include) |
+| CreatePackage | fail | different-answer | vsp assumption / OSD rule | 501: a package under P must be named `P_<FOLDER>` |
+| CreateFunctionGroupThenRFCModule | fail | missing-endpoint | OSD gap | FUGR create/lock |
+| CreateRFCFunctionModule | skip | environment | env | needs `VSP_TEST_FUGR` |
+| RAP_E2E_OData | fail | different-answer | OSD fidelity + fixtures | vsp's pre-save syntax check (abaplint on OSD) rejects the CDS view: "Source has syntax errors - not saved" |
+| **Lock** | | | | |
+| LockUnlock | skip | missing-object | vsp assumption | locks SAPMSSY0 |
+| StatelessRequestInsideAnotherCallersLockWindow | fail | **different-answer** | **OSD gap, triage first** | 409 "lock handle … does not hold this object in this session" after one stateless read between LOCK and PUT |
+| ConcurrentLockChainsAndReaders | fail | **different-answer** | **OSD gap, same cause** | every write in both chains: same 409 |
+| **Code intelligence** | | | | |
+| CodeCompletion, FindDefinition, GetTypeHierarchy, PrettyPrint, GetPrettyPrinterSettings | fail ×5 | missing-endpoint | OSD gap | `codecompletion`, `navigation/target`, `typehierarchy`, `prettyprinter` |
+| FindReferences | skip | missing-endpoint | OSD gap | `usageReferences`: the test skips on any error |
+| **Debugger / RFC** | | | | |
+| DebuggerListener | pass | (vacuous) | | logs the errors and passes |
+| StatelessClientRefusesDebugCallsWithoutASession | vacuous-pass | | | `/sap/bc/adt/debugger` not served |
+| ExternalBreakpoints | skip | missing-endpoint | OSD gap (by design) | |
+| saprfc Conformance_Debugger, StepCost | fail ×2 | missing-endpoint | OSD gap (by design) | `debugger/breakpoints` |
+| saprfc Conformance_Trace | skip | environment | env | no RFC listener on the ADT port |
+| BrowserAuth ×2 | fail | environment | env | no `google-chrome` on the runner; out of scope for OSD |
+
+OSD logs each miss itself (`ADT miss (resource|object): <METHOD> <path>` in
+`osd.log`, uploaded with the matrix). That log is the authoritative list of
+route gaps for one run.
+
+### Scenarios the suite does not cover yet (probed by hand)
+
+vsp has **no** integration tests for versions, dumps, impact or callgraph. A
+throwaway probe (not committed) ran the client methods against OSD:
+
+| Scenario | vsp call | OSD answer | Verdict |
+|---|---|---|---|
+| Versions, existing class | `GetRevisions("CLAS", "ZCL_AJSON")` | one entry `00000`, URI `…/includes/main/versions/19700101101123/00000/content`; `GetRevisionSource` gives 27 KB | works. The fixed `19700101101123` segment is stoker's design. Entry 00000 is the working tree; git commits are 00001..n |
+| Versions after write and activate | `GetRevisions("PROG", new)` | still only `00000` | **different from A4H by design**: A4H adds a version on activation, OSD only on a git commit. The diff must say this, not flag it |
+| Dumps | `Dumps(last 24 h)` | `[]`, no error | empty feed by design. `/osd/dumps` is a separate API |
+| Callees / callgraph (callees) | `Callees`, `CallGraph(callees)` | error: "SAP refused the query" with an **empty message** | **OSD gap**: OSD's `CROSS` lacks `PROG` and `WBCROSSGT` lacks `DIRECT`, so vsp's freestyle `SELECT … PROG FROM CROSS` / `… DIRECT FROM WBCROSSGT` is refused. The refusal (`ExceptionResourceWrongData`) carries no text. The tables exist (CROSS 229, WBCROSSGT 4337 rows) |
+| Callers / where-used / impact | `CallGraph(callers)`, `WhereUsed` | 404 `usageReferences is not served by OSD` | missing-endpoint. OSD has only its own `core/http/xref/readers` and `xref/closure` |
+| Two sessions lock one object | `LockObject` from clients A and B | **both get a handle** | **OSD gap**: no enqueue (documented: "session-bound local locks"). A4H refuses B |
+| Create a package | `$ZOSD_TEST_VSPCI` under `$ZOSD_TEST` | 201 and a `package.devc.xml` on disk, but `nodestructure` and search then say it does not exist | **OSD gap**: the created package is not visible |
+| Lock or delete a package | LOCK `/packages/{n}` | 404 not served | missing-endpoint, so the package cannot be cleaned up over ADT |
+| Lock handle | any LOCK | `ModificationSupport: NoModification` even on a writable object | worth checking against A4H |
+
+## 4. The CI job (draft)
+
+Files:
+
+- `.github/workflows/osd-integration.yml`: a separate workflow, so `ci.yml`'s
+  gate stays untouched. `continue-on-error: true` and a 45-minute timeout.
+- `.github/ci/osd.version`: `vscode-v0.4.1444`.
+- `.github/ci/osgo.version`: empty, which disables the OSGo row.
+- `.github/ci/osd-up.sh`: download → verify the sha256 → start on throwaway
+  `XDG_DATA_HOME`/`HOME`/`STG_DB_PATH` → wait for ready → HEAD discovery.
+  Exit 3 means the asset is unavailable and the row is skipped with a notice.
+  The target is chosen by binary name only (`OSD_BINARY=osd|osgo`), as dell
+  asked; there are no OSGo-specific flags.
+- `.github/ci/osd-summary.sh`: `go test -json` → `summary.json`
+  (`schema: vsp-osd-matrix/1`) and `summary.md`, classified as above.
+
+Rows:
+
+- **The pinned OSD** runs on push, PR and nightly.
+- **OSGo** skips while `osgo.version` is empty. Once a tag is pinned it starts
+  the binary, and if HEAD `/sap/bc/adt/core/discovery` is 200 it runs the full
+  suite; otherwise the start itself is the smoke check.
+- **The latest `vscode-v0.4.*` OSD** runs nightly only.
+- `workflow_dispatch` takes `target` and `tag`.
+
+The matrix goes to the step summary and is uploaded as an artifact, together
+with `osd.log` and `build.json`. Nothing is committed, and no issue is opened
+automatically.
+
+**Does it work in principle?** Yes. Everything the job does was run locally:
+`osd-up.sh` against the real release, then the test command, then
+`osd-summary.sh`. The workflow passes actionlint. It has not yet run on a
+GitHub runner. Two expected differences there: the runner downloads the
+110 MB asset each time (cacheable by tag), and the ~1.85 GB RSS fits the
+standard 16 GB runner. The total is roughly 3 min to ready plus 5-6 min of
+tests (each activation costs 25-30 s).
+
+### A capability gate: proposed, not implemented
+
+The classifier already keeps "OSD does not serve this" apart from "OSD got it
+wrong", without hiding anything. If skipping becomes preferable later, the
+minimal gate is one env var, `VSP_TEST_MISSING=debugger,prettyprinter,rap,fugr,usagerefs,enqueue`,
+and a helper `requireCapability(t, "rap")`. The helper would `t.Skipf("target declares rap missing (VSP_TEST_MISSING)")`.
+When the variable is unset, which is the case on A4H, nothing changes, and the
+summary would count such skips separately. I left this out, because a 404
+classified as `missing-endpoint` already says the same thing without
+touching 20 tests.
+
+## 5. Scenario-suite plan
+
+Each scenario is a named sequence of vsp client calls on throwaway objects,
+replayable against any target (OSD, OSGo, A4H). The plan starts from what
+`docs/adt-vsp-contracts.md` in open-steamgate already maps from vsp's
+`pkg/adt`.
+
+| # | Scenario | Steps | Must prove (not just "no error") |
+|---|---|---|---|
+| S1 | CRUD | create PROG / CLAS / INTF in the target package → read → delete | object listed in nodestructure; source round-trips; delete removes it from search |
+| S2 | Write + activate | lock → PUT → unlock → activate → read | activation verdict from the **body** (HTTP 200 alone is not success); inactive list empty after |
+| S3 | Syntax, negative | check a buffer with a known error | a non-empty message list with line/col |
+| S4 | Unit, positive and negative | a class with one passing and one failing test | both outcomes reported. Two empty results prove nothing |
+| S5 | Lock | lock A; lock B (expect refusal); stateless read between LOCK and PUT; unlock | the #91 sequence. On OSD today, B is granted and the PUT gets 409 |
+| S6 | Versions | read the list → write+activate → read the list → read content of the newest entry | A4H: +1 entry per activation. OSD: entry 00000 = working tree, commits 00001..n. Feed root and entry 00000 byte-identical to A4H after normalisation (dell) |
+| S7 | Dumps | list over a window; detail of one | OSD: an empty feed by design. A4H: shape only |
+| S8 | Impact | `WhereUsed` / `usageReferences` on a used class | OSD: missing-endpoint until the façade grows it |
+| S9 | Callgraph | `Callees` via CROSS/WBCROSSGT, `CallGraph` both directions | OSD: needs `CROSS.PROG` and `WBCROSSGT.DIRECT` (or vsp degrades) |
+
+Fixture content comes from what OSD ships (`ZCL_AJSON`, `$ZOSD_TEST_SRC` with
+`ZCL_ZOSD_TEST_DEMO`, `ZIF_ZOSD_TEST_GREETER`). Objects that exist only on SAP
+(SAPMSSY0, `/DMO/`, `/UI5/`) stay in the A4H-only part of the suite.
+
+## 6. The differential harness: A4H vs OSD
+
+**Purpose.** It is a reusable contract, not a one-off diff. dell will use it as
+the façade contract when porting ADT into OSGo (OSG 0.6).
+
+**Shape.** One driver replays S1-S9 against a target and records each HTTP
+exchange vsp makes, through a recording `http.RoundTripper` injected into
+`adt.Client`. Two runs (A4H, OSD) are joined by `(scenario, step)`.
+
+**Format: stable, versioned, machine-readable.**
+
+- NDJSON, one object per exchange, file extension **`.ndjson`**, or one
+  `.json` file per case. Not `.jsonl`: open-steamgate's `.gitignore` swallows
+  `*.jsonl` on purpose, to keep captures out, and the redacted contract is
+  meant to be importable there.
+- Each record:
+
+```json
+{"schema":"vsp-adt-contract/1","scenario":"S5-lock","step":3,
+ "method":"PUT","endpoint":"/sap/bc/adt/programs/programs/{name}/source/main",
+ "request":{"headers":{"X-sap-adt-sessiontype":"stateful"},"query":{"lockHandle":"{lockHandle#1}"}},
+ "a4h_normalized":{"status":200,"contentType":"text/plain","body":"…"},
+ "osd_normalized":{"status":409,"contentType":"application/xml","body":"…"},
+ "verdict":"different"}
+```
+
+- `verdict` is one of `same`, `different`, `missing-endpoint`. `missing-endpoint`
+  is a 404 whose body says the route is not served (OSD's "is not served by
+  OSD"; a 404 for a missing *object* is an answer). Keeping it separate stops
+  one missing route from flooding triage.
+- `schema` is bumped on any field change; consumers refuse an unknown major.
+
+**Normalisation**, applied to both sides before comparing:
+
+| What | Rule |
+|---|---|
+| Timestamps (headers, `adtcore:changedAt`, version feed dates) | → `{ts}`. Order is kept where the scenario asserts it |
+| GUIDs / session IDs (`sap-contextid`, SAP session GUIDs, which embed the client IP) | → `{guid#n}`, numbered per run, so "same handle reused" stays visible |
+| Lock handles | → `{lockHandle#n}`, the same way |
+| CSRF tokens, cookies, `ETag`, `If-Match` | → `{csrf}`, `{cookie}`, `{etag#n}` |
+| Host, SID, client, user | → `{host}`, `{sid}`, `{client}`, `{user}` |
+| Transport numbers | → `{transport}` |
+| Generated object names (`ZMCP_12345`) | → `{name}`, from the scenario's own name table |
+| XML | canonicalised (attribute order, whitespace, namespace prefixes); the comparison is by element and attribute, not by bytes |
+
+**Where each side runs.**
+
+- **OSD** runs in CI. Its capture is an artifact, one file per run, never
+  committed.
+- **A4H** runs manually and locally only, never in CI; its credentials stay in
+  `.mcp.json`. Throwaway objects go in `$TMP`, locked and then deleted one at a
+  time.
+- The A4H capture is redacted (host, SID, user, session GUIDs, CSRF tokens,
+  cookies, transport numbers) **before** it is written to disk. It is then
+  gated with `node tools/osd-leak-scan.mjs --paths <file>`, run from an
+  open-steamgate checkout; a non-zero exit blocks any further use of it.
+- vsp is a public repo, so nothing A4H-derived is ever uploaded from CI or
+  committed here.
+
+**Triage.** An issue in open-steamgate is opened only for a **triaged** OSD
+conformance bug, one per behaviour. It is never opened automatically from the
+diff.
+
+## 7. Risks
+
+- **Fidelity.** OSD is a model of SAP, not SAP:
+  - the syntax check is abaplint, so RAP and CDS sources SAP accepts can be
+    refused;
+  - locks have no enqueue;
+  - versions come from git, not from activation;
+  - dumps are an empty feed;
+  - the xref tables are a column subset.
+
+  A green run on OSD certifies vsp-against-OSD only. The A4H diff is what
+  keeps it honest.
+- **Version drift.** Pinning `vscode-v0.4.1444` keeps the matrix comparable
+  between runs. The nightly "latest" row shows a drift before the pin moves.
+  Tags are frequent (three on 2026-10-01 alone), so moving the pin is a
+  deliberate change that comes with the matrix delta.
+- **State reset.** A new database alone is not a reset (see §1). Within one
+  run, tests share one OSD. Tests that leave objects behind would leak into
+  later tests, and the created-but-invisible package (§3) means a package
+  cannot be cleaned up over ADT. One run per process, on a fresh home.
+- **Cost.** ~1.85 GB RSS and 2-3 min to ready. Each activation reboots the
+  runtime (25-30 s), so activation-heavy scenarios dominate wall time.
+- **Vacuous passes.** Several vsp tests tolerate errors (`DebuggerListener`,
+  `FindReferences` skips on any error, `StatelessClientRefusesDebugCalls…`).
+  On OSD they pass or skip without testing anything. The classifier flags the
+  ones it can see.
+- **Isolation.** See the unexplained write to the real data home in §1.
+
+## 8. Open questions for the OSG team
+
+1. **Data home leak.** One `osd doctor` with `XDG_DATA_HOME` set still
+   materialised into `~/.local/share/open-steamgate` (not reproduced since).
+   Is there a path, for example the first run or doctor, that resolves the
+   home before reading the env?
+2. **Lock and session model.** After LOCK, one stateless request on the same
+   cookie jar makes the next PUT fail with 409 "lock handle does not hold this
+   object in this session". Is OSD retiring the stateful context on a
+   stateless request more eagerly than A4H does (cf. vsp #91)? It breaks both
+   lock-race tests.
+3. **Enqueue.** Two sessions both get a lock on the same object. Is a
+   cross-session refusal planned?
+4. **Packages.** A package created under `$ZOSD_TEST` returns 201 and writes
+   `package.devc.xml`, but is then "does not exist" for nodestructure and
+   search. Is that intended? And LOCK/DELETE on `/packages/{n}` is not served,
+   so how should a test clean up?
+5. **No `$TMP`.** Could OSD ship a `$TMP` (or a documented scratch package)
+   so that SAP-shaped clients work unchanged?
+6. **Cross-reference columns.** Could `CROSS.PROG` and `WBCROSSGT.DIRECT` be
+   added? And could a refused freestyle query carry a message instead of an
+   empty `ExceptionResourceWrongData`?
+7. **Activation cost.** Is a full runtime reboot per activation inherent, or
+   can a single-object activation be incremental? It sets the CI wall time.
+8. **Test include.** POST `oo/classes/{n}/includes` (creating the
+   test-classes include) is not served, which blocks vsp's class-with-tests
+   flow. Is it planned?
+9. **OSGo 0.5.**
+   - Which tag will first carry `osgo-*`?
+   - Which readiness route will it use (`osd-up.sh` waits for any answer on
+     `/` until this is documented)?
+   - Is the start command `osgo` with no subcommand?
+10. **`ModificationSupport: NoModification`** on a writable object's lock
+    response. Is this deliberate, and what does A4H return there?
+
+## 9. Reproduce locally
+
+```
+.github/ci/osd-up.sh "$(mktemp -d)"             # prints SAP_URL, OSD_PID, …
+SAP_URL=… SAP_USER=DEVELOPER SAP_PASSWORD=osd SAP_CLIENT=001 \
+VSP_TEST_PACKAGE='$ZOSD_TEST_SRC' VSP_TEST_TIMEOUT=120s \
+  go test -tags=integration -json ./pkg/adt/ ./pkg/ctxcomp/ ./pkg/saprfc/ > test.json
+.github/ci/osd-summary.sh test.json summary.json summary.md
+kill "$OSD_PID"
+```
