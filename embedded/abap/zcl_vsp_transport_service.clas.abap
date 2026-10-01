@@ -1614,8 +1614,10 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
       SPLIT lv_line AT space INTO TABLE lt_tok.
 
       IF lv_header = abap_false.
-        IF lines( lt_tok ) < 4.
-          rv_error = |line { lv_lineno } (the header) has fewer than owner, request type, target and step|.
+        " Owner, request type, target, step and the nine object counts
+        " STRF_READ_COFILE reads: thirteen fields at least.
+        IF lines( lt_tok ) < 13.
+          rv_error = |line { lv_lineno } (the header) has { lines( lt_tok ) } fields; a header has at least 13 (owner, request type, target, step, nine object counts)|.
           RETURN.
         ENDIF.
         FIND PCRE '^[A-Z]\z' IN lt_tok[ 2 ].

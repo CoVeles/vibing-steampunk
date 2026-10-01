@@ -100,20 +100,20 @@ func TestValidateCofile(t *testing.T) {
 		"empty":                  "",
 		"only directives":        "#$PROJECT = \n#$PREDECESSOR = XYZK900000\n",
 		"header too short":       "TESTUSER K QAS\nXYZ E 0000 20260101120000 h u\n",
-		"type not a letter":      "TESTUSER 7 QAS 3\nXYZ E 0000 20260101120000 h u\n",
-		"step not 0-3":           "TESTUSER K QAS 9\nXYZ E 0000 20260101120000 h u\n",
-		"count not a number":     "TESTUSER K QAS 3 x\nXYZ E 0000 20260101120000 h u\n",
-		"no steps":               "TESTUSER K QAS 3 1 0\n",
-		"bad step time":          "TESTUSER K QAS 3\nXYZ E 0000 2026 h u\n",
-		"bad step retcode":       "TESTUSER K QAS 3\nXYZ E rc 20260101120000 h u\n",
-		"no export":              "TESTUSER K QAS 3\nXYZ.100 R 0000 20260101120000 h u\n",
-		"export from another":    "TESTUSER K QAS 3\nABC.100 E 0000 20260101120000 h u\n",
+		"type not a letter":      "TESTUSER 7 QAS 3 1 0 0 0 0 0 0 0 0\nXYZ E 0000 20260101120000 h u\n",
+		"step not 0-3":           "TESTUSER K QAS 9 1 0 0 0 0 0 0 0 0\nXYZ E 0000 20260101120000 h u\n",
+		"count not a number":     "TESTUSER K QAS 3 x 0 0 0 0 0 0 0 0\nXYZ E 0000 20260101120000 h u\n",
+		"no steps":               "TESTUSER K QAS 3 1 0 0 0 0 0 0 0 0\n",
+		"bad step time":          "TESTUSER K QAS 3 1 0 0 0 0 0 0 0 0\nXYZ E 0000 2026 h u\n",
+		"bad step retcode":       "TESTUSER K QAS 3 1 0 0 0 0 0 0 0 0\nXYZ E rc 20260101120000 h u\n",
+		"no export":              "TESTUSER K QAS 3 1 0 0 0 0 0 0 0 0\nXYZ.100 R 0000 20260101120000 h u\n",
+		"export from another":    "TESTUSER K QAS 3 1 0 0 0 0 0 0 0 0\nABC.100 E 0000 20260101120000 h u\n",
 		"NUL":                    sampleCofile + "\x00",
 		"control character":      sampleCofile + "\x07",
 		"not UTF-8":              sampleCofile + "\xff",
 		"data file given":        string(sampleData()),
-		"function not one char":  "TESTUSER K QAS 3\nXYZ EX 0000 20260101120000 h u\n",
-		"target with path chars": "TESTUSER K ../x 3\nXYZ E 0000 20260101120000 h u\n",
+		"function not one char":  "TESTUSER K QAS 3 1 0 0 0 0 0 0 0 0\nXYZ EX 0000 20260101120000 h u\n",
+		"target with path chars": "TESTUSER K ../x 3 1 0 0 0 0 0 0 0 0\nXYZ E 0000 20260101120000 h u\n",
 	}
 	for name, c := range bad {
 		if err := ValidateCofile([]byte(c), "XYZ"); err == nil {
@@ -666,5 +666,19 @@ func TestDownloadNeedsEnableTransports(t *testing.T) {
 	}
 	if len(ws.actions()) != 0 {
 		t.Errorf("sent %v", ws.actions())
+	}
+}
+
+// A header needs all thirteen mandatory fields (owner, type, target, step,
+// nine object counts); four were accepted before (PR #296 review).
+func TestValidateCofileHeaderNeedsThirteenFields(t *testing.T) {
+	steps := "XYZ.100 E 0000 20260101120000 h u\n"
+	for n, header := range map[int]string{4: "TESTUSER K QAS 3", 12: "TESTUSER K QAS 3 1 0 0 0 0 0 0 0"} {
+		if err := ValidateCofile([]byte(header+"\n"+steps), "XYZ"); err == nil || !strings.Contains(err.Error(), "13 fields") {
+			t.Errorf("%d fields: %v", n, err)
+		}
+	}
+	if err := ValidateCofile([]byte("TESTUSER K QAS 3 1 0 0 0 0 0 0 0 0\n"+steps), "XYZ"); err != nil {
+		t.Errorf("13 fields refused: %v", err)
 	}
 }

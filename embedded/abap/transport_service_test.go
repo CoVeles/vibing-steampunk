@@ -742,3 +742,15 @@ func TestRollbackKeepsPairsAndTellsTheTruth(t *testing.T) {
 		t.Error("add_to_buffer claims a rollback without checking it happened")
 	}
 }
+
+// The ABAP cofile check, like the Go one, requires all thirteen header
+// fields (PR #296 review).
+func TestValidateCofileHeaderFieldsABAP(t *testing.T) {
+	body := strings.ToUpper(strings.Join(methodStatements(abapStatements(transportServiceSource(t)), "VALIDATE_COFILE"), "\n"))
+	if !strings.Contains(body, "IF LINES( LT_TOK ) < 13") {
+		t.Error("validate_cofile does not require 13 header fields")
+	}
+	if !strings.Contains(body, "LOOP AT LT_TOK INTO DATA(LV_COUNT) FROM 5 TO 13") {
+		t.Error("validate_cofile does not check the nine object counts")
+	}
+}

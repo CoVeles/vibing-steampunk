@@ -159,9 +159,14 @@ func ValidateCofile(content []byte, sid string) error {
 	return nil
 }
 
+// cofileHeaderFields is how many fields a cofile header has at least.
+const cofileHeaderFields = 13
+
 func validateCofileHeader(f []string) error {
-	if len(f) < 4 {
-		return errors.New("a header has at least owner, request type, target and step")
+	// owner, request type, target, step and the nine object counts that
+	// STRF_READ_COFILE reads: thirteen fields at least.
+	if len(f) < cofileHeaderFields {
+		return fmt.Errorf("a header has at least %d fields (owner, request type, target, step and nine object counts); this one has %d", cofileHeaderFields, len(f))
 	}
 	if !upperLetterRe.MatchString(f[1]) {
 		return fmt.Errorf("request type %q is not a single letter", f[1])

@@ -39,7 +39,7 @@ func uploadCLIEnv(t *testing.T, extra string) (hits func() int64, cofile, datafi
 		t.Fatal(err)
 	}
 	cofile, datafile = filepath.Join(dir, "K900001.XYZ"), filepath.Join(dir, "R900001.XYZ")
-	if err := os.WriteFile(cofile, []byte("TESTUSER K QAS 3\nXYZ.100 E 0000 20260101120000 h u\n"), 0o600); err != nil {
+	if err := os.WriteFile(cofile, []byte("TESTUSER K QAS 3 1 0 0 0 0 0 0 0 0\nXYZ.100 E 0000 20260101120000 h u\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(datafile, []byte{0, 1}, 0o600); err != nil {
