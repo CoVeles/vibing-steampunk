@@ -14,7 +14,7 @@ import (
 // dialling the gateway.
 func fakeGateway(t *testing.T) (port int, dials func() int64) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
