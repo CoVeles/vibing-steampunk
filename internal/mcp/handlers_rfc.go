@@ -68,6 +68,17 @@ func (s *Server) routeRFCAction(ctx context.Context, action, objectType, objectN
 			return nil, true, err
 		}
 	}
+	// A caller's WHERE clause goes to RFC_READ_TABLE as written: a free
+	// query on any table, so --block-free-sql refuses it as it refuses
+	// RunQuery. A read without one, and search's own TFDIR filter, stay.
+	switch op {
+	case "read_table", "read-table", "table":
+		if strings.TrimSpace(getStringParam(params, "where")) != "" {
+			if err := s.adtClient.Safety().CheckOperation(adt.OpFreeSQL, "RFCReadTable"); err != nil {
+				return nil, true, err
+			}
+		}
+	}
 
 	c, release, err := s.rfcClientFor(ctx, params)
 	if err != nil {
