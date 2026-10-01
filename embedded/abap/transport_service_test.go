@@ -685,3 +685,30 @@ func TestAMCApplicationDefinition(t *testing.T) {
 		t.Errorf("%d authorities; want exactly two", n)
 	}
 }
+
+// The job step runs only with its own variant: VSP<job number>, protected,
+// created by the user the job runs as, changed by no one else. That is
+// checked before anything else -- no file read, no lock, no tp call
+// (critic, round 3 #2).
+func TestJobRunsOnlyWithItsOwnVariant(t *testing.T) {
+	job := methodStatements(abapStatements(transportServiceSource(t)), "RUN_JOB")
+	check := indexOf(job, "IF SY-SLSET <> LV_OWN_VARIANT OR LV_VARIANT_FOUND = ABAP_FALSE OR LS_VARID-PROTECTED <> 'X' OR LS_VARID-ENAME <> SY-UNAME OR ( LS_VARID-AENAME IS NOT INITIAL AND LS_VARID-AENAME <> SY-UNAME )")
+	if check < 0 {
+		t.Fatal("run_job does not check that it runs with its own protected variant")
+	}
+	if own := indexOf(job, "DATA(LV_OWN_VARIANT) = CONV RSVAR-VARIANT( |VSP{ LV_JOBCOUNT }| )"); own < 0 || own > check {
+		t.Error("the variant checked must be VSP<own job number>")
+	}
+	if sel := indexOf(job, "FROM VARID"); sel < 0 || sel > check {
+		t.Error("the variant's protection and owner must be read from VARID before the check")
+	}
+	for _, later := range []string{"READ_DIR_FILE(", "LOCK_REQUEST(", "READ_BUFFER(", "CALL FUNCTION 'TMS_TP_MAINTAIN_BUFFER'", "DELETE_FILE("} {
+		if i := indexOf(job, later); i >= 0 && i < check {
+			t.Errorf("%s comes before the variant check", later)
+		}
+	}
+	// The refusal returns at once.
+	if check+6 >= len(job) || strings.ToUpper(job[check+6]) != "RETURN" {
+		t.Errorf("the variant check does not refuse: %v", job[check:min(len(job), check+7)])
+	}
+}

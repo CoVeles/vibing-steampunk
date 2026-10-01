@@ -973,6 +973,25 @@ CLASS zcl_vsp_transport_service IMPLEMENTATION.
     ENDIF.
 
     ls_res = VALUE #( request = to_upper( iv_request ) system = CONV #( sy-sysid ) job = CONV #( lv_jobcount ) ).
+
+    " The step must run with this job's own variant as start_job made it:
+    " VSP<job number>, protected, created by this user and changed by no one
+    " else. The program run by hand, with another variant, or with a variant
+    " someone edited is refused here, before anything else is done.
+    DATA(lv_own_variant) = CONV rsvar-variant( |VSP{ lv_jobcount }| ).
+    SELECT SINGLE protected, ename, aename FROM varid INTO @DATA(ls_varid)
+      WHERE report = 'ZVSP_TRANSPORT_BUFFER' AND variant = @lv_own_variant.
+    DATA(lv_variant_found) = xsdbool( sy-subrc = 0 ).
+    IF sy-slset <> lv_own_variant OR lv_variant_found = abap_false OR ls_varid-protected <> 'X'
+       OR ls_varid-ename <> sy-uname OR ( ls_varid-aename IS NOT INITIAL AND ls_varid-aename <> sy-uname ).
+      ls_res-outcome = `not_added`.
+      ls_res-code = `VARIANT_MISMATCH`.
+      ls_res-message = |The step does not run with its own protected variant { lv_own_variant } of { sy-uname } (runs with '{ sy-slset }'); nothing was done.|.
+      job_log( ls_res ).
+      publish( is_result = ls_res iv_push_id = iv_push_id ).
+      RETURN.
+    ENDIF.
+
     " The SHA-256 of the two files as the upload wrote them, in base64.
     DATA(lv_shac) = condense( CONV string( iv_cofile_sha ) ).
     DATA(lv_shad) = condense( CONV string( iv_data_sha ) ).
