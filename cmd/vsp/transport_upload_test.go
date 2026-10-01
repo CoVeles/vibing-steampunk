@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -138,5 +139,43 @@ func TestTransportDownloadCLI_RefusedUnderReadOnly(t *testing.T) {
 				t.Errorf("contacted the system %d time(s)", n)
 			}
 		})
+	}
+}
+
+// The transport commands' WebSocket authenticates like the profile's HTTP
+// client: a profile that signs in with a cookie_string (or cookie_file, or
+// SSO) sends that session on the upgrade, not just the global cookies
+// (PR #296 review).
+func TestTransportWSUsesTheProfileSession(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("HOME", dir)
+	for _, name := range envOnlyCLIVars {
+		t.Setenv(name, "")
+	}
+	saved, savedCookies := systemName, cfg.Cookies
+	systemName, cfg.Cookies = "", nil
+	t.Cleanup(func() { systemName, cfg.Cookies = saved, savedCookies })
+
+	var mu sync.Mutex
+	var upgradeCookie string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") != "" {
+			mu.Lock()
+			upgradeCookie = r.Header.Get("Cookie")
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+	conf := fmt.Sprintf(`{"default":"qassys","systems":{"qassys":{"url":%q,"client":"100","cookie_string":"MYSAPSSO2=profile-session","enable_transports":true}}}`, srv.URL)
+	if err := os.WriteFile(".vsp.json", []byte(conf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = transportBufferCmd.RunE(transportBufferCmd, nil)
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(upgradeCookie, "MYSAPSSO2=profile-session") {
+		t.Errorf("the WebSocket upgrade carried %q, not the profile's session", upgradeCookie)
 	}
 }
