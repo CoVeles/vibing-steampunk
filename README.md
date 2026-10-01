@@ -802,26 +802,52 @@ The headline changes are in the **"New in the last three releases"** callout at 
 
 ### Unreleased — behaviour changes since v2.58.0
 
-- **`--read-only` covers more.** Besides object edits it now refuses transport
-  writes (create, release, delete, merge, move, entry add/remove — with
-  `--enable-transports` too), `SAP(action="rfc")` `call`, `RunReport` /
-  `RunReportAsync`, `SetTextElements`, and gCTS create, delete, clone, pull,
-  commit and switch-branch. Reads stay allowed. The CLI's `vsp rfc call`,
-  `rfc run`, non-GET `rfc adt`, and the `run` and `call` commands of the
-  `vsp debug` REPL now honour `read_only` in `.vsp.json` and `SAP_READ_ONLY`.
-- **A named system must be the connected one.** When `-s` / `SAP_SYSTEM` names a
-  `.vsp.json` entry whose `url`/`client` differ from `SAP_URL`/`SAP_CLIENT`, the
-  server warns at startup and refuses RFC use. An entry without a `url` (gateway
-  only) still applies. A per-call `host` or `sysnr` on `SAP(action="rfc")` that
-  differs from the server's own gateway is refused, so the configured RFC
-  credentials are never sent to a caller-chosen host.
-- **`--block-free-sql` covers `rfc read_table`** when the caller passes a
-  `where`, and so do `block_free_sql` / `SAP_BLOCK_FREE_SQL` for
-  `vsp rfc read-table --where`. Reads without one, and `search`, are unchanged.
-- **Go toolchain:** `go.mod` pins `toolchain go1.26.8`.
-- **HTTP transport:** mcp-go v1.1.0 answers 403 to a request from a loopback
-  address that carries a non-loopback `Host` header (DNS-rebinding protection).
-  A reverse proxy on the same host must rewrite `Host` to reach vsp.
+**`--read-only` now also refuses**, each before anything reaches SAP:
+
+- transport writes (create, release, delete, merge, move, entry add/remove),
+  even with `--enable-transports`;
+- gCTS create, delete, clone, pull, commit and switch-branch;
+- code execution: `SAP(action="rfc")` `call`, `CallRFC` (`debug CALL_RFC`),
+  `RunReport` / `RunReportAsync`, and unit test runs that include dangerous or
+  critical tests (`include_dangerous`). Ordinary unit test runs still work;
+- object and system changes: `SetTextElements`, `MoveObject` (`edit MOVE`,
+  `debug MOVE`), publishing and unpublishing service bindings,
+  `SetPrettyPrinterSettings`, and MODIFY locks (`LockObject`, `edit LOCK`).
+  READ locks still work;
+- debugger variable writes (`DebuggerSetVariableValue`, and so Lua
+  `setVariable`, `forceReplay`, `injectCheckpoint`, `replayFromStep`).
+
+**The CLI honours `read_only` in `.vsp.json` and `SAP_READ_ONLY`** for
+`vsp rfc call`, `rfc run`, `rfc adt` with a method other than GET/HEAD/OPTIONS,
+`vsp trace run --call`, `vsp trace unit --call`, the Run button of
+`vsp debug ui`, `run` and `call` in the `vsp debug` REPL, and `eset` and
+writing `adt` requests in the `vsp rfc debug` / `vsp adt debug` REPLs.
+
+**`--block-free-sql`** (and `block_free_sql` / `SAP_BLOCK_FREE_SQL` on the
+CLI) refuses `rfc read_table` / `vsp rfc read-table` with a caller's WHERE.
+Reads without one, and `search`, are unchanged.
+
+**RFC goes only to the server's own system.** When `-s` / `SAP_SYSTEM` names a
+`.vsp.json` entry whose `url`/`client` differ from `SAP_URL`/`SAP_CLIENT`, the
+server warns at startup and refuses RFC use. An entry without a `url` (gateway
+only) still applies. A per-call `host`, `sysnr` or `port` on
+`SAP(action="rfc")` that differs from the server's own gateway is refused, so
+the configured RFC credentials never go to a caller-chosen destination.
+
+**Known gaps** (not gated by `--read-only` yet): setting and deleting
+breakpoints, debugger stepping, starting an AMDP debug session, arming and
+removing traces (`vsp trace run` without `--call`, `vsp trace rm`), and the
+per-call RFC `user` override, which can still try other users' logons with the
+configured password and so risks locking an account. The name mask of
+`rfc search` is not escaped. `vsp rfc adt POST` is checked as a workflow
+operation (`W`), while `vsp adt request` checks the same kind of request as an
+update (`U`). Both are refused under read-only, but they use different
+operation letters.
+
+**Build and transport:** `go.mod` pins `toolchain go1.26.8`. mcp-go v1.1.0
+answers 403 to a request from a loopback address that carries a non-loopback
+`Host` header (DNS-rebinding protection), so a reverse proxy on the same host
+must rewrite `Host` to reach vsp over HTTP.
 
 ### Hyperfocused Mode — 1 Tool to Rule Them All (Recommended)
 
