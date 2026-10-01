@@ -967,8 +967,10 @@ func actionCases() []actionCase {
 		{Name: "SAP edit type=unpublish_service", Action: "edit", Like: "UnpublishServiceBinding", Params: kv("type", "unpublish_service")},
 		{Name: "SAP edit type=write_program", Action: "edit", Like: "WriteProgram", Params: kv("type", "write_program")},
 		{Name: "SAP edit type=write_class", Action: "edit", Like: "WriteClass", Params: kv("type", "write_class")},
-		{Name: "SAP edit type=set_description", Action: "edit", Target: "PROG ZDEMO_REPORT", Params: kv("type", "set_description")},
-		{Name: "SAP edit type=description", Action: "edit", Target: "PROG ZDEMO_REPORT", Params: kv("type", "description")},
+		// Exact: with a source parameter, routeSourceAction would claim the
+		// call as a WriteSource before routeWorkflowAction saw it.
+		{Name: "SAP edit type=set_description", Action: "edit", Target: "PROG ZDEMO_REPORT", Exact: true, Params: kv("type", "set_description", "description", "Demo")},
+		{Name: "SAP edit type=description", Action: "edit", Target: "PROG ZDEMO_REPORT", Exact: true, Params: kv("type", "description", "description", "Demo")},
 		{Name: "SAP edit type=deploy_from_file", Action: "edit", Like: "DeployFromFile", Params: kv("type", "deploy_from_file")},
 		{Name: "SAP edit type=save_to_file", Action: "edit", Like: "SaveToFile", Params: kv("type", "save_to_file")},
 		{Name: "SAP edit type=rename", Action: "edit", Like: "RenameObject", Params: kv("type", "rename")},
@@ -1096,16 +1098,17 @@ func (s *Server) tableCases() []actionCase {
 	return out
 }
 
-// routedLiterals parses the SAP() route functions and returns every string
-// literal they match an action, target type, type or op against.
-func routedLiterals(t *testing.T) map[string]string {
+// routedLiterals parses the SAP() route functions and returns, per function,
+// every string literal it matches an action, target type, type or op against,
+// together with the order handleUniversalTool tries the route functions in.
+func routedLiterals(t *testing.T) (lits map[string]map[string]bool, order []string) {
 	t.Helper()
 	fset := token.NewFileSet()
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := map[string]string{}
+	lits = map[string]map[string]bool{}
 	routeFn := regexp.MustCompile(`^route[A-Za-z0-9]*Action$`)
 	for _, file := range files {
 		if strings.HasSuffix(file, "_test.go") {
@@ -1120,6 +1123,7 @@ func routedLiterals(t *testing.T) map[string]string {
 			if !ok || fn.Body == nil || (!routeFn.MatchString(fn.Name.Name) && fn.Name.Name != "handleUniversalTool") {
 				continue
 			}
+			name := fn.Name.Name
 			add := func(e ast.Expr) {
 				lit, ok := e.(*ast.BasicLit)
 				if !ok || lit.Kind != token.STRING {
@@ -1129,7 +1133,10 @@ func routedLiterals(t *testing.T) map[string]string {
 				if err != nil || v == "" {
 					return
 				}
-				out[v] = fn.Name.Name
+				if lits[name] == nil {
+					lits[name] = map[string]bool{}
+				}
+				lits[name][v] = true
 			}
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				switch n := n.(type) {
@@ -1142,11 +1149,197 @@ func routedLiterals(t *testing.T) map[string]string {
 						add(n.X)
 						add(n.Y)
 					}
+				case *ast.CompositeLit:
+					// routes := []routeFunc{s.routeSourceAction, ...}
+					if name != "handleUniversalTool" {
+						return true
+					}
+					if typ, ok := n.Type.(*ast.ArrayType); !ok || fmt.Sprint(typ.Elt) != "routeFunc" {
+						return true
+					}
+					for _, e := range n.Elts {
+						if sel, ok := e.(*ast.SelectorExpr); ok {
+							order = append(order, sel.Sel.Name)
+						}
+					}
 				}
 				return true
 			})
 		}
 	}
+	if len(order) == 0 {
+		t.Fatal("found no route list in handleUniversalTool")
+	}
+	return lits, order
+}
+
+type routeFunc = func(ctx context.Context, action, objectType, objectName string, params map[string]any) (*mcp.CallToolResult, bool, error)
+
+// routeTable names every route function, so that the router a case reaches
+// can be found by trying them in handleUniversalTool's own order. A router
+// added there and not here fails the test.
+func routeTable(s *Server) map[string]routeFunc {
+	return map[string]routeFunc{
+		"routeSourceAction":         s.routeSourceAction,
+		"routeReadAction":           s.routeReadAction,
+		"routeSearchAction":         s.routeSearchAction,
+		"routeGrepAction":           s.routeGrepAction,
+		"routeCodeIntelAction":      s.routeCodeIntelAction,
+		"routeDevToolsAction":       s.routeDevToolsAction,
+		"routeATCAction":            s.routeATCAction,
+		"routeCRUDAction":           s.routeCRUDAction,
+		"routeClassIncludeAction":   s.routeClassIncludeAction,
+		"routeWorkflowAction":       s.routeWorkflowAction,
+		"routeFileIOAction":         s.routeFileIOAction,
+		"routeDebuggerAction":       s.routeDebuggerAction,
+		"routeDebuggerLegacyAction": s.routeDebuggerLegacyAction,
+		"routeAMDPADTAction":        s.routeAMDPADTAction,
+		"routeAMDPAction":           s.routeAMDPAction,
+		"routeUI5Action":            s.routeUI5Action,
+		"routeTransportAction":      s.routeTransportAction,
+		"routeGitAction":            s.routeGitAction,
+		"routeReportAction":         s.routeReportAction,
+		"routeInstallAction":        s.routeInstallAction,
+		"routeSystemAction":         s.routeSystemAction,
+		"routeRFCAction":            s.routeRFCAction,
+		"routeDumpsAction":          s.routeDumpsAction,
+		"routeTracesAction":         s.routeTracesAction,
+		"routeSQLTraceAction":       s.routeSQLTraceAction,
+		"routeLintAction":           s.routeLintAction,
+		"routeAnalysisAction":       s.routeAnalysisAction,
+		"routeContextAction":        s.routeContextAction,
+		"routeServiceBindingAction": s.routeServiceBindingAction,
+		"routeI18nAction":           s.routeI18nAction,
+		"routeRevisionsAction":      s.routeRevisionsAction,
+	}
+}
+
+// shadowedRouteLiterals are literals a router matches that no call can reach,
+// because an earlier router claims every call that carries them. Each is
+// checked to still be in its router, and still to be claimed by the earlier
+// one, so the list cannot go stale in either direction.
+var shadowedRouteLiterals = map[string]string{
+	"routeReadAction PROG": shadowedBySource,
+	"routeReadAction CLAS": shadowedBySource,
+	"routeReadAction INTF": shadowedBySource,
+	"routeReadAction FUNC": shadowedBySource,
+	"routeReadAction FUGR": shadowedBySource,
+	"routeReadAction INCL": shadowedBySource,
+	"routeReadAction MSAG": shadowedBySource,
+}
+
+const shadowedBySource = "routeSourceAction claims action=read for this type first; routeReadAction's case for it is dead code"
+
+// attributeCases finds, for each case, the route function that claims it: the
+// first in handleUniversalTool's order to answer handled. It calls the
+// handlers, so it runs against the fake SAP like everything else, and what
+// it sends is discarded.
+func (env *invariantEnv) attributeCases(t *testing.T, order []string, cases []actionCase, tools map[string]mcp.Tool) map[string]string {
+	t.Helper()
+	cfg := env.cfg()
+	cfg.Mode = "hyperfocused"
+	s := NewServer(cfg)
+	table := routeTable(s)
+	for _, name := range order {
+		if table[name] == nil {
+			t.Errorf("handleUniversalTool tries %s, which routeTable does not know: add it there so its cases can be attributed", name)
+		}
+	}
+	if len(table) != len(order) {
+		t.Errorf("routeTable has %d routers and handleUniversalTool tries %d", len(table), len(order))
+	}
+	defer func() {
+		s.closeDebugSession(context.Background())
+		s.dropSharedRFC(context.Background())
+		env.sap.take()
+	}()
+	out := map[string]string{}
+	for _, c := range cases {
+		action := strings.ToLower(strings.TrimSpace(c.Action))
+		if action == "" || action == "info" || action == "help" {
+			out[c.Name] = "handleUniversalTool"
+			continue
+		}
+		objectType, objectName := parseTarget(c.Target)
+		params := c.params(tools, env.dir)
+		for _, name := range order {
+			fn := table[name]
+			if fn == nil {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+			_, handled, _ := fn(ctx, action, objectType, objectName, mergeArgs(nil, params))
+			cancel()
+			if handled {
+				out[c.Name] = name
+				break
+			}
+		}
+	}
+	return out
+}
+
+// uncoveredRouteLiterals returns every (router, literal) pair no case that
+// reaches that router carries, as action, target type, type or op.
+func uncoveredRouteLiterals(t *testing.T, lits map[string]map[string]bool, order []string, cases []actionCase, claimedBy map[string]string) []string {
+	t.Helper()
+	covered := map[string]map[string]bool{}
+	carries := map[string][]string{} // literal -> names of cases carrying it
+	for _, c := range cases {
+		fn := claimedBy[c.Name]
+		if fn == "" {
+			continue
+		}
+		if covered[fn] == nil {
+			covered[fn] = map[string]bool{}
+		}
+		typ, _ := parseTarget(c.Target)
+		keys := []string{c.Action, typ}
+		for _, k := range []string{"type", "op"} {
+			if v, ok := c.Params[k].(string); ok {
+				keys = append(keys, v)
+			}
+		}
+		for _, k := range keys {
+			covered[fn][strings.ToLower(k)] = true
+			carries[strings.ToLower(k)] = append(carries[strings.ToLower(k)], c.Name)
+		}
+	}
+	rank := map[string]int{"handleUniversalTool": -1}
+	for i, n := range order {
+		rank[n] = i
+	}
+	var out []string
+	seenShadow := map[string]bool{}
+	for fn, set := range lits {
+		for lit := range set {
+			if covered[fn][strings.ToLower(lit)] {
+				continue
+			}
+			key := fn + " " + lit
+			if why, ok := shadowedRouteLiterals[key]; ok {
+				seenShadow[key] = true
+				// Still shadowed: some case carrying it is claimed earlier.
+				earlier := false
+				for _, name := range carries[strings.ToLower(lit)] {
+					if r, ok := rank[claimedBy[name]]; ok && r < rank[fn] {
+						earlier = true
+					}
+				}
+				if !earlier {
+					t.Errorf("shadowedRouteLiterals says %s is shadowed (%s), but no case carrying it is claimed by an earlier router", key, why)
+				}
+				continue
+			}
+			out = append(out, fmt.Sprintf("%q in %s", lit, fn))
+		}
+	}
+	for key := range shadowedRouteLiterals {
+		if !seenShadow[key] {
+			t.Errorf("shadowedRouteLiterals lists %s, which is no longer an unreached literal of that router: remove it", key)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -1293,7 +1486,7 @@ func (env *invariantEnv) runAll(expert *Server, tools map[string]mcp.Tool, cases
 // behind either answer, and prints the summary line CI lifts.
 func TestReadOnlyInvariant(t *testing.T) {
 	// Parsed before the environment moves the working directory.
-	lits := routedLiterals(t)
+	lits, order := routedLiterals(t)
 	env := newInvariantEnv(t, readOnlyConfig)
 
 	expert := NewServer(&Config{BaseURL: env.sap.srv.URL, Mode: "expert", ReadOnly: true})
@@ -1314,25 +1507,10 @@ func TestReadOnlyInvariant(t *testing.T) {
 	}
 	env.sap.absent.Store(false)
 
-	// Every literal a router matches on must be exercised by some case.
-	covered := map[string]bool{}
-	for _, c := range cases {
-		covered[c.Action] = true
-		typ, _ := parseTarget(c.Target)
-		covered[typ] = true
-		for _, k := range []string{"type", "op"} {
-			if v, ok := c.Params[k].(string); ok {
-				covered[v] = true
-			}
-		}
-	}
-	var unrouted []string
-	for lit, fn := range lits {
-		if !covered[lit] && !covered[strings.ToUpper(lit)] && !covered[strings.ToLower(lit)] {
-			unrouted = append(unrouted, fmt.Sprintf("%q (%s)", lit, fn))
-		}
-	}
-	sort.Strings(unrouted)
+	// Every literal a router matches on must be exercised by some case that
+	// reaches that router, not merely by some case somewhere: a new case in
+	// one router reusing another router's literal is still unclassified.
+	unrouted := uncoveredRouteLiterals(t, lits, order, cases, env.attributeCases(t, order, cases, tools))
 
 	assertReadOnlyInvariant(t, outcomes, unrouted)
 
@@ -1415,7 +1593,7 @@ func assertReadOnlyInvariant(t *testing.T, outcomes []probeOutcome, unrouted []s
 		t.Errorf("%s: classify me — add it to readOnlyClasses as READ, MUTATE or EXECUTE", n)
 	}
 	for _, u := range unrouted {
-		t.Errorf("the router literal %s is exercised by no actionCase: add a case for it to actionCases and classify me", u)
+		t.Errorf("the router literal %s is exercised by no actionCase that reaches that router: add a case for it to actionCases and classify me", u)
 	}
 	for n := range readOnlyClasses {
 		if !reached[n] {
