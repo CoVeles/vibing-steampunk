@@ -13,7 +13,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // mockSAMLServer creates an httptest server simulating a 4-step SAML flow:
@@ -248,10 +247,23 @@ func TestSAMLLogin_ReauthConcurrent(t *testing.T) {
 	}))
 	defer csrfServer.Close()
 
+	// The first re-auth holds until every caller has been launched, so the
+	// others arrive while it is still in progress -- the stampede -- rather
+	// than after it, without a sleep standing in for SAML latency.
+	const callers = 5
+	var launched sync.WaitGroup
+	launched.Add(callers)
+	allLaunched := make(chan struct{})
+	go func() { launched.Wait(); close(allLaunched) }()
+
 	var reauthCount int32
 	reauthFunc := func(ctx context.Context) (map[string]string, error) {
 		atomic.AddInt32(&reauthCount, 1)
-		time.Sleep(100 * time.Millisecond) // Simulate SAML dance latency
+		select {
+		case <-allLaunched:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 		return map[string]string{"MYSAPSSO2": "fresh"}, nil
 	}
 
@@ -260,14 +272,22 @@ func TestSAMLLogin_ReauthConcurrent(t *testing.T) {
 
 	// Simulate concurrent callReauthFunc invocations.
 	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = transport.callReauthFunc(context.Background())
+			launched.Done()
+			errs <- transport.callReauthFunc(context.Background())
 		}()
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("callReauthFunc: %v", err)
+		}
+	}
 
 	count := atomic.LoadInt32(&reauthCount)
 	if count != 1 {
