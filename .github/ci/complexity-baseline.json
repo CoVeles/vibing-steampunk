@@ -9,7 +9,6 @@
   "cmd/vsp/devops.go": 3895,
   "internal/mcp/handlers_graph.go": 1973,
   "internal/mcp/sweep.go": 1081,
-  "internal/mcp/tools_register.go": 2577,
   "pkg/adt/client.go": 2846,
   "pkg/adt/crud.go": 1993,
   "pkg/adt/debugger.go": 1840,
