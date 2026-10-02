@@ -146,6 +146,9 @@ func checkGlobalDeclaration(filePath, keyword, name string) error {
 					continue // CLASS ... IMPLEMENTATION
 				}
 				rest = rest[1:]
+				if len(rest) >= 2 && rest[0] == "LOCAL" && rest[1] == "FRIENDS" {
+					continue // grants friendship; declares nothing
+				}
 			}
 			if containsToken(rest, "DEFERRED") || containsToken(rest, "LOAD") {
 				continue
@@ -252,24 +255,44 @@ func checkSourceDefinition(filePath string, kind CreatableObjectType, name strin
 	default:
 		return nil
 	}
+	// The statement may span lines (define root view entity<newline>ZI_X),
+	// so the source is read as one text: comments, literals and annotation
+	// lines out, the rest joined.
 	inBlock := false
+	var text strings.Builder
 	for _, line := range strings.Split(strings.TrimPrefix(string(data), "\uFEFF"), "\n") {
 		line = stripDDLComments(line, &inBlock)
 		line = sqlLiteral.ReplaceAllString(line, "''")
 		if strings.HasPrefix(strings.TrimSpace(line), "@") {
 			continue
 		}
-		if m := define.FindStringSubmatch(line); m != nil {
-			if got := strings.ToUpper(m[1]); got != name {
-				return fmt.Errorf("%s is named for %s %s but its definition names %s; it was not deployed under either name: rename the file or fix the definition", base, kind, name, got)
-			}
-			return nil
-		}
-		if extend.MatchString(line) {
-			return nil
-		}
+		text.WriteString(line)
+		text.WriteString("\n")
 	}
-	return fmt.Errorf("could not find the definition in %s: expected %s", base, want)
+	src := text.String()
+	d := define.FindStringSubmatchIndex(src)
+	e := extend.FindStringIndex(src)
+	if e != nil && (d == nil || e[0] < d[0]) {
+		return nil
+	}
+	if d == nil {
+		return fmt.Errorf("could not find the definition in %s: expected %s", base, want)
+	}
+	got := strings.ToUpper(src[d[2]:d[3]])
+	if ddlKeywords[got] {
+		// define root view entity with nothing after it: no name to compare.
+		return fmt.Errorf("could not find the name in the definition of %s: expected %s", base, want)
+	}
+	if got != name {
+		return fmt.Errorf("%s is named for %s %s but its definition names %s; it was not deployed under either name: rename the file or fix the definition", base, kind, name, got)
+	}
+	return nil
+}
+
+// ddlKeywords are the words between define and the name in a CDS definition.
+var ddlKeywords = map[string]bool{
+	"ROOT": true, "VIEW": true, "ENTITY": true, "TABLE": true, "FUNCTION": true, "ABSTRACT": true,
+	"CUSTOM": true, "HIERARCHY": true, "TRANSIENT": true, "EXTERNAL": true, "BEHAVIOR": true, "FOR": true, "SERVICE": true,
 }
 
 // stripDDLComments removes // and -- line comments and /* */ block comments

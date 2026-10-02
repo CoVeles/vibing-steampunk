@@ -107,3 +107,61 @@ func TestImportRefusesTwoFilesForOneObject(t *testing.T) {
 		}
 	}
 }
+
+// zcl_a.abap (no include type) and zcl_a.clas.abap (main) both deploy to
+// ZCL_A's main source.
+func TestImportRefusesAPlainAndATypedFileForOneClass(t *testing.T) {
+	dir := writeImportDir(t, map[string]string{
+		"zcl_a.abap":      "CLASS zcl_a DEFINITION PUBLIC.\nENDCLASS.\nCLASS zcl_a IMPLEMENTATION.\nENDCLASS.\n",
+		"zcl_a.clas.abap": "CLASS zcl_a DEFINITION PUBLIC.\nENDCLASS.\nCLASS zcl_a IMPLEMENTATION.\nENDCLASS.\n",
+	})
+	b, err := Import(nil).FromDirectory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.DryRun().Output(&bytes.Buffer{}).Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SuccessCount != 0 || res.SkippedCount != 2 {
+		t.Fatalf("both files should be refused, got %d imported, skipped %+v", res.SuccessCount, res.Skipped)
+	}
+}
+
+// A file given twice is one file: imported once, not refused against itself.
+func TestImportTakesAFileGivenTwiceOnce(t *testing.T) {
+	dir := writeImportDir(t, map[string]string{"zrep.prog.abap": "REPORT zrep.\n"})
+	p := filepath.Join(dir, "zrep.prog.abap")
+	b, err := Import(nil).FromFiles(p, p, filepath.Join(dir, ".", "zrep.prog.abap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	res, err := b.DryRun().Output(&out).Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.TotalFiles != 1 || res.SuccessCount != 1 || res.SkippedCount != 0 || out.Len() != 0 {
+		t.Fatalf("want one file imported once, got %+v, printed %q", res, out.String())
+	}
+}
+
+// A new program's INCLUDE statements fail its syntax check until the
+// includes exist, so includes are imported first.
+func TestImportDeploysIncludesBeforeTheirProgram(t *testing.T) {
+	dir := writeImportDir(t, map[string]string{
+		"zrep.prog.abap":     "REPORT zrep.\nINCLUDE zrep_top.\n",
+		"zrep_top.incl.abap": "DATA gv_x TYPE i.\n",
+	})
+	b, err := Import(nil).FromDirectory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.DryRun().Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Results) != 2 || res.Results[0].File.ObjectName != "ZREP_TOP" || res.Results[1].File.ObjectName != "ZREP" {
+		t.Fatalf("want ZREP_TOP then ZREP, got %+v", res.Results)
+	}
+}

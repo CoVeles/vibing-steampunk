@@ -252,10 +252,11 @@ func (b *ImportBuilder) OnError(fn func(file ImportFile, err error)) *ImportBuil
 
 // Execute runs the batch import.
 func (b *ImportBuilder) Execute(ctx context.Context) (*BatchImportResult, error) {
-	files, clashes := refuseClashes(b.files)
+	unique := dedupePaths(b.files)
+	files, clashes := refuseClashes(unique)
 	skipped := append(append([]SkippedFile{}, b.skipped...), clashes...)
 	result := &BatchImportResult{
-		TotalFiles:   len(b.files) + len(b.skipped),
+		TotalFiles:   len(unique) + len(b.skipped),
 		SkippedCount: len(skipped),
 		Skipped:      skipped,
 		Results:      make([]ImportResult, 0, len(files)),
@@ -600,7 +601,32 @@ func objectKey(f ImportFile) string {
 	if f.ObjectType == adt.ObjectTypeInclude {
 		t = string(adt.ObjectTypeProgram)
 	}
-	return t + "|" + f.ObjectName + "|" + string(f.IncludeType)
+	inc := f.IncludeType
+	if f.ObjectType == adt.ObjectTypeClass && inc == "" {
+		// A plain zcl_a.abap has no include type, and deploys to the same
+		// main source as zcl_a.clas.abap.
+		inc = adt.ClassIncludeMain
+	}
+	return t + "|" + f.ObjectName + "|" + string(inc)
+}
+
+// dedupePaths drops a file given more than once (the same path, however it
+// was spelled), keeping its first occurrence. It is one file, not a clash.
+func dedupePaths(files []ImportFile) []ImportFile {
+	seen := map[string]bool{}
+	var out []ImportFile
+	for _, f := range files {
+		key := filepath.Clean(f.Path)
+		if abs, err := filepath.Abs(key); err == nil {
+			key = abs
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, f)
+	}
+	return out
 }
 
 // refuseClashes takes out every file that deploys to the same object as
@@ -680,7 +706,10 @@ func isABAPSourceFile(path string) bool {
 }
 
 // getPriority returns import priority (lower = first).
-// Order: Interfaces → Classes (main) → Programs → Class includes → DDLS → BDEF → SRVD
+// Order: Interfaces → Classes (main) → Class includes → Program includes →
+// Programs → Function groups → DDLS → BDEF → SRVD. Program includes go
+// before programs: a new program's INCLUDE statements fail its syntax check
+// until the includes exist.
 func getPriority(objType adt.CreatableObjectType, includeType adt.ClassIncludeType) int {
 	switch objType {
 	case adt.ObjectTypeInterface:
@@ -690,6 +719,8 @@ func getPriority(objType adt.CreatableObjectType, includeType adt.ClassIncludeTy
 			return 20 // Main class first
 		}
 		return 25 // Includes after main class
+	case adt.ObjectTypeInclude:
+		return 28
 	case adt.ObjectTypeProgram:
 		return 30
 	case adt.ObjectTypeFunctionGroup:

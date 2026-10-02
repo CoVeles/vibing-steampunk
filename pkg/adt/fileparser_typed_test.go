@@ -201,3 +201,23 @@ func TestDeployFromFileRefusesATopIncludeBeforeAnyRequest(t *testing.T) {
 		t.Fatalf("want a refusal naming ZREP_TOP, got %v", err)
 	}
 }
+
+// The name may follow on the next line; it was read as ENTITY.
+func TestADDLDefinitionSplitAcrossLinesIsRead(t *testing.T) {
+	wantObject(t, writeFixture(t, "zi_split.ddls.asddls", "define root view entity\n  ZI_Split\n  as select from t { key a }\n"), ObjectTypeDDLS, "ZI_SPLIT")
+	wantRefused(t, writeFixture(t, "zi_split.ddls.asddls", "define root view entity\n  ZI_Other as select from t { key a }\n"), "ZI_SPLIT", "ZI_OTHER")
+	wantRefused(t, writeFixture(t, "zi_split.ddls.asddls", "define root view entity\n"), "could not find the name")
+}
+
+// CLASS x DEFINITION LOCAL FRIENDS grants friendship and declares nothing:
+// it does not stand in for the class's own declaration.
+func TestLocalFriendsIsNotADeclaration(t *testing.T) {
+	err := func() error {
+		_, err := parseWithin(t, writeFixture(t, "zcl_main.clas.abap", "CLASS zcl_main DEFINITION LOCAL FRIENDS ltcl_test.\n"))
+		return err
+	}()
+	if err == nil || !strings.Contains(err.Error(), "does not declare ZCL_MAIN") {
+		t.Fatalf("want a refusal for a missing declaration, got %v", err)
+	}
+	wantObject(t, writeFixture(t, "zcl_main.clas.abap", "CLASS zcl_main DEFINITION LOCAL FRIENDS ltcl_test.\nCLASS zcl_main DEFINITION PUBLIC.\nENDCLASS.\n"), ObjectTypeClass, "ZCL_MAIN")
+}
