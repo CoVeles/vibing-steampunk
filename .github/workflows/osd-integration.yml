@@ -56,7 +56,7 @@ jobs:
           # OSGo: skips with a notice while osgo.version is empty.
           - target: osgo
             tag: ''
-          # The newest vscode-v0.4.* tag, nightly only: tells us early when a
+          # The newest vscode-v0.* tag, nightly only: tells us early when a
           # new OSD release moves the matrix, without moving the pin.
           - target: osd
             tag: latest
@@ -95,7 +95,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag=$(gh release list -R oisee/open-steamgate --limit 50 --json tagName,isDraft \
-            --jq 'map(select((.isDraft | not) and (.tagName | startswith("vscode-v0.4.")))) | .[0].tagName // ""')
+            --jq 'map(select((.isDraft | not) and (.tagName | startswith("vscode-v0.")))) | .[0].tagName // ""')
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "latest ${{ matrix.target }} tag: ${tag:-none}"
 

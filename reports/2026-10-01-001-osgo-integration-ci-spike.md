@@ -15,6 +15,96 @@ ship (7). Five are real behaviour differences worth triage, and the lock
 session model is the first of them. OSGo, the Go build, has no ADT yet. The
 job carries it as a disabled smoke row that turns on by itself once it does.
 
+## Update 2026-10-02: both pins move to `vscode-v0.5.1486`
+
+dell released `vscode-v0.5.1486`. It is the first tag with OSGo binaries
+(`osgo-linux-x64`, `-linux-arm64`, `-darwin-arm64`, `-windows-x64.exe`). Its
+`osd` carries the ADT fixes this spike asked for. Both `.github/ci/osd.version`
+and `.github/ci/osgo.version` now pin it. All 8 `osd-*` and `osgo-*` assets
+were downloaded and pass `sha256sum -c`. The branch was merged with
+`origin/main` (`1b917ee`) first. `VSP_TEST_PACKAGE` and `VSP_TEST_TIMEOUT`
+still work; no new hard-coded `$TMP` arrived.
+
+**OSD suite (`vscode-v0.5.1486`):**
+
+| | Count |
+|---|---|
+| Tests | 57 |
+| pass | 22 |
+| vacuous-pass | 1 |
+| missing-endpoint | 14 |
+| missing-object | 7 |
+| different-answer | 3 |
+| environment | 2 |
+| skipped | 8 |
+
+On `vscode-v0.4.1444` the same suite had 18 pass, 16 missing-endpoint and
+5 different-answer. Same env as before (`$ZOSD_TEST_SRC`, `120s`), fresh
+`XDG_DATA_HOME`, `HOME` and `STG_DB_PATH`. The log's `system home` line
+pointed into scratch.
+
+Four tests flipped to **pass**:
+
+| Test | Was | Fix |
+|---|---|---|
+| StatelessRequestInsideAnotherCallersLockWindow | different-answer (409) | stateless requests keep the session's locks |
+| ConcurrentLockChainsAndReaders | different-answer (409) | same |
+| ClassWithUnitTests | missing-endpoint | class includes can be created |
+| CreateClassWithTests | missing-endpoint | same |
+
+No integration test covers the other fixes, so they were checked with the
+hand probe:
+
+- **Package visibility** is fixed. `$ZOSD_TEST_VSPCI` under `$ZOSD_TEST` is
+  created (201). `GetPackage` and search then find it, and a program can be
+  created in it.
+  - Cleanup works dell's way: delete the program, then
+    `DELETE /packages/<name>` without a lock. After that, search no longer
+    finds the package.
+- **Enqueue** is fixed. A second session locking a held object gets **403**
+  "User DEVELOPER is currently editing ZVSP_PROBE_…", as A4H does.
+- **Database error text** is fixed. The callees refusal now reads
+  `no such column: DIRECT` / `no such column: PROG`. The columns themselves
+  are still 0.6.
+
+**Still failing on `vscode-v0.5.1486`:**
+
+- **different-answer (3):** each is a vsp assumption or a known fidelity
+  limit:
+  - CreatePackage hits the `<parent>_<FOLDER>` naming rule;
+  - RAP_E2E_OData's CDS view is refused by the abaplint check;
+  - Namespace_SearchObject finds no `/DMO/` content.
+- **missing-endpoint (14):** code completion, navigation, type hierarchy,
+  pretty-printer, BDEF/SRVB, function groups and modules, debugger.
+- **missing-object (7):** unchanged.
+
+Activation still costs 25-30 s per call (FindDefinition 28 s,
+GetTypeHierarchy 28 s). `OSD_WARM=1 STG_DEV=1` is not yet tried. From the
+script's start to ready took 50 s, including the 111 MB download. RSS
+across both processes was about 2.7 GB.
+
+**OSGo smoke (`vscode-v0.5.1486`), run through `OSD_BINARY=osgo .github/ci/osd-up.sh`:**
+
+- **Start:** download, sha256 check, then `-home <fresh> -port`. The whole
+  script took 12.6 s, mostly the 39 MB download.
+- **Ready:** `GET /health` → `{"status":"ready","version":"vscode-v0.5.1486","commit":"ad753f1d…"}`.
+  `-version` prints `osgo vscode-v0.5.1486 (ad753f1d…)`.
+- **Cold start to ready:** **453-454 ms** over three fresh homes.
+- **RSS:** **59-64 MB**, against about 2.7 GB for OSD.
+- **HEAD `/sap/bc/adt/core/discovery`:** **404**, as expected (OData only),
+  so the row runs smoke only. `GET /` answers 200, and the ICF services are
+  listed in the log.
+- **Isolation:** the database is `<home>/osgo.sqlite`, "new: seeded". The
+  real `~/.local/share/open-steamgate` was untouched.
+
+The CI OSGo row is now live. It turns into the full suite by itself once
+discovery answers 200. The nightly "latest" row now follows any `vscode-v0.*`
+tag, not only `v0.4.*`.
+
+Sections 1-8 below are the original 2026-10-01 write-up against
+`vscode-v0.4.1444`, kept as the baseline. Section 8's answers marked
+"0.4.x" shipped in `vscode-v0.5.1486`.
+
 ## 1. What OSGO is, and which binary to run
 
 "OSGO" covers two artefacts from one repository, `oisee/open-steamgate` (public,
@@ -190,7 +280,7 @@ Files:
 
 - `.github/workflows/osd-integration.yml`: a separate workflow, so `ci.yml`'s
   gate stays untouched. `continue-on-error: true` and a 45-minute timeout.
-- `.github/ci/osd.version`: `vscode-v0.4.1444`.
+- `.github/ci/osd.version`: `vscode-v0.4.1444` at first; `vscode-v0.5.1486` since 2026-10-02.
 - `.github/ci/osgo.version`: empty, which disables the OSGo row.
 - `.github/ci/osd-up.sh`: download → verify the sha256 → start on throwaway
   `XDG_DATA_HOME`/`HOME`/`STG_DB_PATH` → wait for ready → HEAD discovery.
@@ -208,7 +298,7 @@ Rows:
   `GET /health` until `status` is `ready`. If HEAD
   `/sap/bc/adt/core/discovery` is 200 it runs the full suite; otherwise the
   start itself is the smoke check.
-- **The latest `vscode-v0.4.*` OSD** runs nightly only.
+- **The latest `vscode-v0.*` OSD** runs nightly only.
 - `workflow_dispatch` takes `target` and `tag`.
 
 The matrix goes to the step summary and is uploaded as an artifact, together
