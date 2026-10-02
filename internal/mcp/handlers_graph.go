@@ -217,14 +217,15 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 	var unreadable []adt.Unsearched
 	truncated := 0
 
-	// read reads one object into the graph, or records why it could not.
-	read := func(objType, name, parent string) {
+	// read reads one object into the graph, or records why it could not, and
+	// says whether it was read.
+	read := func(objType, name, parent string) bool {
 		if count >= maxObjects {
 			// The cap is counted rather than broken on, because "we stopped
 			// at 50 of 130" and "the package has 50 objects" are different
 			// answers and the report cannot otherwise tell them apart.
 			truncated++
-			return
+			return false
 		}
 		// The type is passed, not omitted. GetSource switches on it and has
 		// no branch for the empty string, so asking without one failed for
@@ -238,12 +239,21 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 			// edges is what a clean object looks like. Record it or the
 			// verdict below is about code nobody opened.
 			unreadable = append(unreadable, adt.Unsearched{Object: objType + " " + name, Reason: err.Error()})
-			return
+			return false
 		}
 		// A function group is read part by part, and a part that failed is
 		// as absent from the edges as a whole object would be.
 		for _, m := range missedParts {
 			unreadable = append(unreadable, adt.Unsearched{Object: objType + " " + name + ": " + m.Object, Reason: m.Reason})
+		}
+		// A source that came back empty has no edges, which is what a clean
+		// object looks like; it is not one that was read. (A group whose
+		// every part failed is already named part by part above.)
+		if strings.TrimSpace(source) == "" {
+			if len(missedParts) == 0 {
+				unreadable = append(unreadable, adt.Unsearched{Object: objType + " " + name, Reason: "empty source"})
+			}
+			return false
 		}
 		nodeID := graph.NodeID(objType, name)
 		g.AddNode(&graph.Node{
@@ -254,6 +264,7 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 		})
 		g.AddSourceDeps(nodeID, source)
 		count++
+		return true
 	}
 
 	// The package listing carries SAP's own two-part code — CLAS/OC, PROG/P,
@@ -272,10 +283,11 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 		case "CLAS", "PROG", "INTF", "INCL":
 			read(objType, obj.Name, "")
 		case "FUGR":
-			if count < maxObjects {
+			// Only a group that was actually read covers its modules. One
+			// refused, empty or past the cap leaves them to be read alone.
+			if read(objType, obj.Name, "") {
 				groupsRead[strings.ToUpper(obj.Name)] = true
 			}
-			read(objType, obj.Name, "")
 		case "FUNC":
 			// Decided after the walk, once it is known which groups are read.
 			modules = append(modules, module{obj.Name, adt.FunctionGroupFromURI(obj.URI)})
@@ -291,8 +303,8 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 
 	// A function module's source is read with its group's, and reading it
 	// again would count a part as another whole. But only when the group is
-	// in this listing and was read: a module whose group lies elsewhere, or
-	// was left beyond the cap, is read on its own.
+	// in this listing and was read: a module whose group lies elsewhere, was
+	// left beyond the cap, or could not be read, is read on its own.
 	for _, m := range modules {
 		group := m.group
 		if group == "" {

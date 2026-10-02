@@ -173,3 +173,65 @@ func TestPackageHealthReadsFunctionGroups(t *testing.T) {
 		t.Fatalf("boundaries: %s, want VIOLATIONS from the group's call into $ZOTHER\n%s", s, text)
 	}
 }
+
+// A group whose structure could not be read covered nothing, but it was marked
+// as read before the attempt, so its modules were skipped as covered and their
+// code was read by nobody.
+func TestAModuleOfAGroupThatCouldNotBeReadIsReadOnItsOwn(t *testing.T) {
+	w := fakesap.Gold()
+	w.Packages = map[string]string{"$ZFG": "", "$ZOTHER": ""}
+	w.Objects = []fakesap.Object{
+		{Type: "FUGR", Name: "ZFG", Package: "$ZFG", Source: "FUNCTION-POOL zfg.", SourceStatus: 403},
+		{Type: "FUNC", Name: "Z_RUN", Group: "ZFG", Package: "$ZFG",
+			Source: "FUNCTION z_run.\n  DATA lo TYPE REF TO zcl_foreign.\nENDFUNCTION."},
+		{Type: "CLAS", Name: "ZCL_FOREIGN", Package: "$ZOTHER"},
+	}
+	srv := fakesap.New(t, w)
+	s := &Server{adtClient: adt.NewClient(srv.URL, "TESTUSER", "secret")}
+	var req mcp.CallToolRequest
+	req.Params.Arguments = map[string]any{"package": "$ZFG"}
+	result, err := s.handleCheckBoundaries(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := toolResultText(t, result)
+	if !strings.Contains(strings.ToLower(strings.Join(srv.Log(), "\n")), "/fmodules/z_run/source/main") {
+		t.Fatalf("Z_RUN was not read on its own after its group could not be:\n%s", strings.Join(srv.Log(), "\n"))
+	}
+	if !strings.Contains(text, "Z_RUN → ZCL_FOREIGN") {
+		t.Fatalf("Z_RUN's call into $ZOTHER is not reported:\n%s", text)
+	}
+	if !strings.Contains(text, "FUGR ZFG:") || !strings.Contains(text, "403") {
+		t.Fatalf("the refused group is not named as a gap:\n%s", text)
+	}
+}
+
+// A source that answers 200 with nothing in it has no edges, and was counted as
+// read: package health came back CLEAN on code it never saw.
+func TestAnEmptySourceIsAGapNotAClean(t *testing.T) {
+	w := fakesap.Narrow()
+	w.Objects = append(w.Objects, fakesap.Object{Type: "CLAS", Name: "ZCL_NARROW_EMPTY", Package: "$ZNARROW", EmptySource: true})
+	text := callFake(t, w, (*Server).health, map[string]any{"package": "$ZNARROW"})
+	var got struct {
+		Signals map[string]struct {
+			Details    map[string]any   `json:"details"`
+			Unsearched []adt.Unsearched `json:"unsearched"`
+		} `json:"signals"`
+	}
+	if err := json.Unmarshal([]byte(text), &got); err != nil {
+		t.Fatalf("%v\n%s", err, text)
+	}
+	b := got.Signals["boundaries"]
+	found := false
+	for _, u := range b.Unsearched {
+		if u.Object == "CLAS ZCL_NARROW_EMPTY" && u.Reason == "empty source" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the empty class is not a gap with reason \"empty source\": %+v", b.Unsearched)
+	}
+	if n, _ := b.Details["scanned_objects"].(float64); n != 1 {
+		t.Fatalf("scanned_objects = %v, want 1: the empty class was not read", b.Details["scanned_objects"])
+	}
+}

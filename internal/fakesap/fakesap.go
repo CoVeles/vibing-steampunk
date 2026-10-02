@@ -45,6 +45,8 @@ type Object struct {
 	// Group is a function module's group, which its ADT URI is nested under.
 	// FUNC only.
 	Group string
+	// EmptySource serves the source with 200 and an empty body.
+	EmptySource bool
 }
 
 // World is the landscape the fake serves.
@@ -461,6 +463,10 @@ func (s *Server) serveObjectStructure(w http.ResponseWriter, path string) {
 		refuse(w, "Resource does not exist", http.StatusNotFound)
 		return
 	}
+	if o.SourceStatus != 0 {
+		refuse(w, "No authorisation to display "+o.Name, o.SourceStatus)
+		return
+	}
 	const rel = "http://www.sap.com/adt/relations/source/definitionIdentifier"
 	base := "/sap/bc/adt/functions/groups/" + strings.ToLower(o.Name)
 	var b strings.Builder
@@ -484,6 +490,10 @@ func (s *Server) serveSource(w http.ResponseWriter, path string) {
 			return
 		}
 		refuse(w, "Resource does not exist", http.StatusNotFound)
+		return
+	}
+	if ok && o.EmptySource {
+		w.Header().Set("Content-Type", "text/plain")
 		return
 	}
 	if !ok || o.Source == "" {
