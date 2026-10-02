@@ -598,9 +598,11 @@ Objects are deleted users before what they use: code (PROG, CLAS, INTF,
 FUGR, XSLT and any type not named here), then RAP (SRVB, SRVD, BDEF,
 DCLS/DDLX, DDLS), then search helps and lock objects (SHLP, ENQU), table
 types (TTYP), tables and structures (TABL), data elements (DTEL), domains
-(DOMA); within a type, in the order given. `keep_order: true`
-(`--keep-order`) deletes exactly in the order given. The result's `order`
-is the order used. Each expectation is read right before its own delete,
+(DOMA); within a type, in the order given. An append structure is not
+yet ordered before the table it extends (both are TABL): list it first.
+`keep_order: true` (`--keep-order`) deletes exactly in the order given.
+The result's `order` is every delete attempt in the order made; an object
+retried after a failure is listed twice. Each expectation is read right before its own delete,
 after the deletes ahead of it, while a sha256 read before the call is of the
 state before any of them -- which is why the order matters: deleting a data
 element first changes the serialisation, and so the sha256, of a table that

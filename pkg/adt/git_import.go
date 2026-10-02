@@ -1291,9 +1291,10 @@ type GitDeleteResult struct {
 	PackageDeleted bool     `json:"packageDeleted"`
 	PackageNote    string   `json:"packageNote,omitempty"`
 	Remaining      []string `json:"remaining,omitempty"`
-	// Order is the objects sent to a delete, as "TYPE NAME", in the order
-	// they were checked and deleted (Objects keeps the order given). One
-	// that failed in a way worth retrying is tried once more after them.
+	// Order is every delete attempt, as "TYPE NAME", in the order they
+	// were made (Objects keeps the order given). An object whose first
+	// attempt failed in a way worth retrying is tried once more after the
+	// others, so it is listed twice.
 	Order []string `json:"order"`
 }
 
@@ -1304,7 +1305,9 @@ type GitDeleteResult struct {
 // any type not named here first, then RAP (service binding, service
 // definition, behaviour definition, access control and metadata extension,
 // CDS view), search helps and lock objects, table types, tables and
-// structures, data elements, domains.
+// structures, data elements, domains. All TABLs share one rank: an append
+// structure is not told apart from the table it extends, so it goes before
+// it only when it is listed first.
 func GitDeleteRank(objType string) int {
 	switch strings.ToUpper(strings.TrimSpace(objType)) {
 	case "SRVB":
@@ -1539,7 +1542,8 @@ func (c *Client) DeleteGitObjects(ctx context.Context, ws GitService, pkg string
 // the result's Order says which. Each expect is read right before its own
 // DELETE, so after the deletes ahead of it: a sha256 read before the call is
 // of the state before all of them, and deleting a data element before the
-// table that uses it would change the table's sha256.
+// table that uses it would change the table's sha256. Every TABL shares a
+// rank: an append structure is not ordered before the table it extends.
 func (c *Client) DeleteGitObjectsWith(ctx context.Context, ws GitService, pkg string, items []GitDeleteItem, opts GitDeleteOptions) (*GitDeleteResult, error) {
 	transport := strings.ToUpper(strings.TrimSpace(opts.Transport))
 	deleteRepo := opts.DeleteRepo
@@ -1628,13 +1632,11 @@ func (c *Client) DeleteGitObjectsWith(ctx context.Context, ws GitService, pkg st
 		})
 	}
 	res.Order = make([]string, 0, len(queue))
-	for _, q := range queue {
-		res.Order = append(res.Order, q.item.Type+" "+q.item.Name)
-	}
 	// Two rounds: an object another one uses may go only after it.
 	for round := 0; round < 2 && len(queue) > 0; round++ {
 		var again []todo
 		for _, q := range queue {
+			res.Order = append(res.Order, q.item.Type+" "+q.item.Name)
 			out := &res.Objects[q.i]
 			var check func(context.Context) error
 			if q.item.Expect != nil {

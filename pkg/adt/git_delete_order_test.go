@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -188,9 +189,13 @@ func TestDeleteGitObjectsKeepOrder(t *testing.T) {
 	}
 }
 
-// dependentWS answers object_versions as abapGit's serialisation behaves: a
-// table names its data elements and a data element its domain, so once what
-// an object uses is deleted, its sha256 is another one.
+// dependentWS answers object_versions with the dependency abapGit's
+// serialisation has: once what an object uses is deleted, its sha256 is
+// another one. It models that dependency; it does not prove that abapGit's
+// serialisation of a TABL changes when its DTEL is deleted. The evidence on
+// a real system is the live run in the PR (a 7.58: DOMA, DTEL and a
+// structure using them, listed used-first, all deleted under their sha256);
+// the old order's "changed" was not reproduced there.
 type dependentWS struct {
 	*fakeGitWS
 	rec  *adtRecorder
@@ -264,4 +269,47 @@ func TestDeleteGitObjectsUsedLastKeepsTheirUsersSHA256(t *testing.T) {
 			t.Errorf("package kept: %s", res.PackageNote)
 		}
 	})
+}
+
+// Order lists every attempt as it was made: an object whose DELETE failed
+// once is retried after the others, and is in Order twice.
+func TestDeleteGitObjectsOrderListsRetries(t *testing.T) {
+	var mu sync.Mutex
+	failed := false
+	route := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.EqualFold(r.URL.Path, orderObjs["ZORD_DTEL"].uri) {
+			mu.Lock()
+			first := !failed
+			failed = true
+			mu.Unlock()
+			if first {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, "in use")
+				return
+			}
+		}
+		orderRoute(w, r)
+	}
+	rec := &adtRecorder{}
+	cl := newStubbedClient(t, rec, route, WithAllowedPackages("$ZORD"))
+	ws := &fakeGitWS{contents: []map[string]any{
+		pkgContents("$ZORD", [][2]string{{"DTEL", "ZORD_DTEL"}, {"DOMA", "ZORD_DOMA"}}, nil, false),
+		pkgContents("$ZORD", nil, nil, false),
+	}}
+	res, err := cl.DeleteGitObjectsWith(context.Background(), ws, "$ZORD", orderItems("ZORD_DOMA", "ZORD_DTEL"), GitDeleteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "DTEL ZORD_DTEL,DOMA ZORD_DOMA,DTEL ZORD_DTEL"
+	if got := strings.Join(res.Order, ","); got != want {
+		t.Errorf("order %s; want %s", got, want)
+	}
+	if got := strings.Join(deletedNames(rec.snapshot()), ","); got != "ZORD_DTEL,ZORD_DOMA,ZORD_DTEL,$ZORD" {
+		t.Errorf("DELETEs %s", got)
+	}
+	for _, o := range res.Objects {
+		if o.Status != "deleted" {
+			t.Errorf("%s: %s %s", o.Name, o.Status, o.Reason)
+		}
+	}
 }

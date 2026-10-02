@@ -281,8 +281,10 @@ and the package are kept. --expect-repo-key and --expect-repo-name (with
 
 Objects go users before what they use: code (and any type not named
 here), then SRVB, SRVD, BDEF, DCLS/DDLX, DDLS, then SHLP/ENQU, TTYP, TABL,
-DTEL, DOMA; within a type, in the order given. --keep-order deletes them
-exactly in the order given. Each --expect is read right before its own
+DTEL, DOMA; within a type, in the order given. An append structure is
+not ordered before the table it extends: list it first. --keep-order
+deletes them exactly in the order given. The "order" line lists every
+delete attempt, a retried object twice. Each --expect is read right before its own
 delete, after the deletes ahead of it: a sha256 read before the call is of
 the state before any of them, and deleting a data element before the table
 that uses it changes the table's sha256.
