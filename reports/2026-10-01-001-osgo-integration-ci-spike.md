@@ -79,9 +79,9 @@ hand probe:
 - **missing-object (7):** unchanged.
 
 Activation still costs 25-30 s per call (FindDefinition 28 s,
-GetTypeHierarchy 28 s). `OSD_WARM=1 STG_DEV=1` is not yet tried. From the
-script's start to ready took 50 s, including the 111 MB download. RSS
-across both processes was about 2.7 GB.
+GetTypeHierarchy 28 s) without warm mode. From the script's start to ready
+took 50 s, including the 111 MB download. RSS across both processes was
+about 2.7 GB. Warm mode is measured in the next update.
 
 **OSGo smoke (`vscode-v0.5.1486`), run through `OSD_BINARY=osgo .github/ci/osd-up.sh`:**
 
@@ -100,6 +100,71 @@ across both processes was about 2.7 GB.
 The CI OSGo row is now live. It turns into the full suite by itself once
 discovery answers 200. The nightly "latest" row now follows any `vscode-v0.*`
 tag, not only `v0.4.*`.
+
+## Update 2026-10-02 (2): warm mode, `OSD_WARM=1 STG_DEV=1`
+
+dell's advice: with `OSD_WARM=1 STG_DEV=1`, a content edit of an existing
+class or interface activates in about 0.5 s. Creates, PROG edits and
+`INTERFACES` changes stay cold, and the `X-OSD-Generation` / `X-OSD-Build`
+response headers say which path an activation took. `osd-up.sh` now exports
+both for the `osd` binary (default 1, `OSD_WARM=0 STG_DEV=0` restores the
+old behaviour), and the workflow sets them explicitly. `osgo` ignores them.
+
+Same suite, same pin (`vscode-v0.5.1486`), same env (`$ZOSD_TEST_SRC`,
+`120s`), isolated as before: fresh `XDG_DATA_HOME`, `HOME` and
+`STG_DB_PATH` under the scratch dir, and the `osd: system home` line pointed
+there. The real `~/.local/share/open-steamgate` was untouched (same listing
+and mtimes before and after).
+
+**Results: unchanged.** All 57 tests land in the same class as the cold run:
+22 pass, 1 vacuous-pass, 14 missing-endpoint, 7 missing-object,
+3 different-answer, 2 environment, 8 skipped. Warm mode is kept.
+
+**Time:**
+
+| | cold | warm | saved |
+|---|---|---|---|
+| Script start to ready (incl. 111 MB download) | 50 s | 39 s | (network noise) |
+| `pkg/adt` integration package | 374.3 s | 330.4 s | **43.9 s (12 %)** |
+| EditSource | 111.8 s | 85.0 s | 26.9 s |
+| FindDefinition | 28.3 s | 20.5 s | 7.8 s |
+| GetTypeHierarchy | 27.6 s | 20.0 s | 7.6 s |
+| CreateAndActivateProgram | 27.8 s | 20.4 s | 7.4 s |
+| WriteClass | 31.8 s | 25.2 s | 6.6 s |
+| CreateClassWithTests | 39.6 s | 35.8 s | 3.8 s |
+
+**Why only 12 %:** no activation in the suite took the warm path. Every
+write test creates a fresh object and activates it, which is cold by design.
+`osd.log` says so per build: `warm: a cold build: <file> is new` (or
+`is gone` after a delete), and once `warm: builds stay cold: the tree is not
+the live generation`. The saving comes from the dev loop around the cold
+builds (`dev: reused <generation> …, recycled in 1.7-20 s`; one rebuild
+skipped the 5.5 s cross-reference seed). To get the 0.5 s path, a test has to
+edit a class or interface that already exists in the live generation, such
+as the shipped `ZCL_ZOSD_TEST_DEMO`.
+
+**The warm path itself works.** A hand probe on the same instance: lock,
+PUT, unlock, activate `ZCL_ZOSD_TEST_DEMO` with a one-line comment change.
+
+| Probe | Activate | Headers |
+|---|---|---|
+| 1st edit | 0.49 s | `X-OSD-Build: warm`, `X-OSD-Swap-Ms: 2`, `X-OSD-Closure: 2`, `X-OSD-Closure-Tests: ZCL_ZOSD_TEST_DEMO` |
+| 2nd edit | 0.50 s | `X-OSD-Build: warm`, no `X-OSD-Swap-Ms`; `osd.log`: "the swap was refused, recycling instead: the runtime carries `<gen A>`, and the swap is from `<gen B>`" |
+
+Both returned `activationExecuted="true"`. One point for dell: on the 2nd
+edit the header still says `warm` while the log says the swap was refused
+and the runtime recycled in the background.
+
+**Two dev-mode log lines to watch** (no test result changed): "source changed
+during build; leaving the new edit inactive for the next pass" (7 times, mostly during
+the WriteProgram, WriteClass and EditSource sequences), and a harmless
+`fatal: not a git repository` at boot.
+
+**Memory and disk with warm mode:** at rest after the suite, `osd up`
+2.6 GB plus `osd serve` 0.8 GB RSS. Sampled every 5 s during the suite, the sum
+over all `osd` processes (builds included) peaked at 6.5 GB. The data dir
+grew to about 1 GB (the 0.4 home was 147 MB) and the database to 11 MB. Both
+fit a standard `ubuntu-latest` runner (16 GB RAM, 14 GB free disk).
 
 Sections 1-8 below are the original 2026-10-01 write-up against
 `vscode-v0.4.1444`, kept as the baseline. Section 8's answers marked
@@ -501,7 +566,7 @@ with no `adtcore:packageRef`, and nothing between the create and the lookup.
 ## 9. Reproduce locally
 
 ```
-.github/ci/osd-up.sh "$(mktemp -d)"             # prints SAP_URL, OSD_PID, …
+.github/ci/osd-up.sh "$(mktemp -d)"             # prints SAP_URL, OSD_PID, …; OSD_WARM=0 STG_DEV=0 for all-cold
 SAP_URL=… SAP_USER=DEVELOPER SAP_PASSWORD=osd SAP_CLIENT=001 \
 VSP_TEST_PACKAGE='$ZOSD_TEST_SRC' VSP_TEST_TIMEOUT=120s \
   go test -tags=integration -json ./pkg/adt/ ./pkg/ctxcomp/ ./pkg/saprfc/ > test.json

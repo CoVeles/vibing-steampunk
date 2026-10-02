@@ -13,11 +13,16 @@ name: OSD integration (advisory)
 # Target, chosen by binary name only (.github/ci/osd-up.sh):
 #   osd   the Bun build with the ADT facade. Pinned in .github/ci/osd.version.
 #   osgo  the Go build, started with -home/-port, ready on GET /health.
-#         Pinned in .github/ci/osgo.version, empty until dell names the first
-#         vscode-v0.5.N tag with osgo-* assets. OData only for now (the ADT
-#         facade moves to ABAP compiled to Go, ADR 0007), so it runs as a smoke
-#         check and turns into the full suite on its own the day
-#         HEAD /sap/bc/adt/core/discovery answers 200.
+#         Pinned in .github/ci/osgo.version (an empty pin skips the row).
+#         OData only for now (the ADT facade moves to ABAP compiled to Go,
+#         ADR 0007), so it runs as a smoke check and turns into the full suite
+#         on its own the day HEAD /sap/bc/adt/core/discovery answers 200.
+#
+# Fork-safe: no secrets, read-only contents permission, and the only token is
+# the workflow's own GITHUB_TOKEN (for `gh release download` of a public
+# release). Every row is continue-on-error and the test step swallows go
+# test's exit status, so this workflow never fails main or a PR. The uploaded
+# artifact holds only what OSD and the test run produce on the runner.
 on:
   push:
     branches: [main]
@@ -53,7 +58,7 @@ jobs:
           # The pinned OSD: every event.
           - target: osd
             tag: ''
-          # OSGo: skips with a notice while osgo.version is empty.
+          # OSGo: smoke until its ADT answers; skips while osgo.version is empty.
           - target: osgo
             tag: ''
           # The newest vscode-v0.* tag, nightly only: tells us early when a
@@ -101,13 +106,19 @@ jobs:
 
       # Download, verify the sha256, start on throwaway state, wait for ready.
       # No node, no npm: the binary embeds its runtime and dependencies.
+      # A failed start (not an unavailable asset) is a warning, not a red job.
       - name: Start ${{ matrix.target }}
         if: steps.plan.outputs.run == 'true'
         id: up
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           OSD_BINARY: ${{ matrix.target }}
           STG_PORT: ${{ matrix.target == 'osgo' && '3095' || '3030' }}
+          # osd only (osgo ignores them): warm activation of content edits to
+          # existing classes and interfaces; X-OSD-Build says warm or cold.
+          OSD_WARM: '1'
+          STG_DEV: '1'
           TAG: ${{ steps.latest.outputs.tag || steps.plan.outputs.tag }}
         run: |
           status=0
@@ -129,12 +140,13 @@ jobs:
           SAP_PASSWORD: osd
           SAP_CLIENT: '001'     # never 123: that is the runtime's sy-mandt, not an ADT client
           VSP_TEST_PACKAGE: '$ZOSD_TEST_SRC'   # OSD has no $TMP
-          VSP_TEST_TIMEOUT: 120s             # each activation rebuilds OSD's runtime (25-30 s)
+          VSP_TEST_TIMEOUT: 120s             # a cold activation rebuilds OSD's runtime (15-30 s)
         run: |
           go test -tags=integration -json -count=1 -timeout 30m ./pkg/adt/ ./pkg/ctxcomp/ ./pkg/saprfc/ > test.json || true
 
       - name: Summarise
         if: always() && steps.up.outputs.available == 'true'
+        continue-on-error: true
         run: |
           mkdir -p out
           if [ -s test.json ]; then
@@ -147,8 +159,15 @@ jobs:
           cp "$OSD_WORKDIR"/osd.log "$OSD_WORKDIR"/build.json out/ 2>/dev/null || true
           kill "$OSD_PID" 2>/dev/null || true
 
+      - name: Say why the start failed
+        if: always() && steps.up.outcome == 'failure'
+        run: |
+          echo "::warning title=osd-integration::${{ matrix.target }} did not start; see the step log (advisory, not a failure)"
+          tail -40 "$RUNNER_TEMP/osd/osd.log" 2>/dev/null || true
+
       - name: Upload the matrix
         if: always() && steps.up.outputs.available == 'true'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: osd-matrix-${{ matrix.target }}-${{ matrix.tag || 'pinned' }}

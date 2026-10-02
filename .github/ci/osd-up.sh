@@ -58,6 +58,12 @@ chmod +x "$bin"
 # Never the developer's home: XDG_DATA_HOME and HOME both point into $work.
 export XDG_DATA_HOME="$work/xdg" HOME="$work/home" STG_DB_PATH="$work/db/osd.sqlite" STG_PORT="$port"
 if [ "$binary" = osd ]; then
+  # Warm activation (dell): a content edit of an existing class or interface
+  # activates in about 0.5 s instead of a 25-30 s runtime rebuild. Creates,
+  # PROG edits and INTERFACES changes stay cold; the X-OSD-Generation response
+  # header says which path an activation took and why. OSD_WARM=0 STG_DEV=0
+  # in the caller's environment restores the all-cold behaviour.
+  export OSD_WARM="${OSD_WARM:-1}" STG_DEV="${STG_DEV:-1}"
   (cd "$work/cwd" && "$bin" doctor) > "$work/doctor.log" 2>&1 || true
 fi
 # osd starts with `up`; osgo with its home and port as flags.
@@ -102,7 +108,7 @@ done
 echo "$body" > "$work/build.json"
 # Does it speak ADT? This is the switch between the full suite and a smoke run.
 adt=$(curl -s -o /dev/null -I -m 10 -w '%{http_code}' "$url/sap/bc/adt/core/discovery" || true)
-echo "osd-up: $binary $tag ready on $url after ${SECONDS}s; HEAD core/discovery: $adt" >&2
+echo "osd-up: $binary $tag ready on $url after ${SECONDS}s; HEAD core/discovery: $adt${OSD_WARM:+; OSD_WARM=$OSD_WARM STG_DEV=$STG_DEV}" >&2
 
 out=$(printf 'SAP_URL=%s\nOSD_PID=%s\nOSD_TAG=%s\nOSD_WORKDIR=%s\nOSD_ADT=%s\n' "$url" "$pid" "$binary-$tag" "$work" "$adt")
 echo "$out"
