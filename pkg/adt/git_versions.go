@@ -16,26 +16,50 @@ import (
 // expect. git_delete_objects then takes the ADT lock, reads the version
 // again while it holds the lock, and deletes only when it still matches.
 //
-// stamp (ZCL_VSP_GIT_SERVICE=>object_stamp):
+// sha256 is the one to use when it matters (ZCL_VSP_GIT_SERVICE=>
+// object_sha256): lower-case hex SHA-256 of the UTF-8 text of the lines
+// "<file name>=<lower-case hex SHA-256 of the file>", one per file of the
+// object's abapGit serialisation in its original language only
+// (TADIR-MASTERLANG), sorted (byte order), joined by LF, without a final
+// LF. It covers everything abapGit serialises for the object -- but only
+// the active version: an object with an inactive version (a row of the
+// inactive worklist DWINACTIV for it or a part of it) is never a sha256
+// match, it is "changed". When both stamp and sha256 are expected, sha256
+// decides.
 //
-//	v1:<TABLE>:<YYYYMMDDHHMMSS>:<ROWS>
+// stamp is cheaper and coarser (ZCL_VSP_GIT_SERVICE=>object_stamp):
 //
-// the newest change date and time over every version row of the object,
-// active and inactive, and the number of those rows. CLAS and INTF: REPOSRC
-// UDAT/UTIME over every include of the pool (the name padded with '=' to 30
-// characters, then any suffix); PROG: REPOSRC of the program; TABL DD02L,
-// DTEL DD04L, DOMA DD01L, TTYP DD40L, DDLS DDDDLSRC, AS4DATE/AS4TIME. Its
-// resolution is a second: two changes within the second the stamp was read
-// in look alike; sha256 does not have that limit.
+//	v2:<TABLES>:<YYYYMMDDHHMMSS>:<ROWS>:<DIGEST>
 //
-// sha256 (ZCL_VSP_GIT_SERVICE=>object_sha256): lower-case hex SHA-256 of the
-// UTF-8 text of the lines "<file name>=<lower-case hex SHA-256 of the
-// file>", one per file of the object's abapGit serialisation in its original
-// language only (TADIR-MASTERLANG), sorted (byte order), joined by LF,
-// without a final LF.
+// the newest change date and time over every dated version row of the
+// object, active and inactive, the number of those rows, and the first 16
+// hex digits of a SHA-256 over the rows of its tables that carry no date:
+//
+//	CLAS, INTF  REPOSRC (every include of the pool but CS) and REPOTEXT of
+//	            the pool; digest SEOCLASSDF, SEOCLASSTX, SEOCOMPOTX
+//	PROG        REPOSRC, REPOTEXT, D020S (DGEN/TGEN)
+//	TABL        DD02L, DD09L, DD12L; digest DD02T, DD35L, TDDAT
+//	DTEL        DD04L; digest DD04T
+//	DOMA        DD01L; digest DD01T, DD07L, DD07T
+//	TTYP        DD40L; digest DD40T
+//	DDLS        DDDDLSRC; digest DDDDLSRCT
+//
+// It does NOT cover, among others: documentation (DOKHL/DOKTL) of any type;
+// a program's GUI status and titles (EUDB, RSMPTEXTS) and its dynpro flow
+// logic and fields beyond D020S's generation date; a class's or interface's
+// SOTR texts, its exception texts beyond the text pool, its friends and
+// other relations (SEOMETAREL, SEOFRIENDS), and component definitions
+// beyond what their source carries; a table's field texts (DD03T),
+// foreign keys (DD05S/DD08L) and enhancement category beyond DD02L's date;
+// a search help's field mapping (DD36M). A change only there leaves the
+// stamp as it was: expect sha256 when such changes must not be deleted.
+// CS (the class's whole-source include) is left out on purpose: it is
+// regenerated and moves without the source changing. The resolution of the
+// date part is a second.
 
-// GitExpect is the version of an object a caller saw. Either one matching
-// is enough; one that cannot be read, or is missing, never matches.
+// GitExpect is the version of an object a caller saw. With sha256, sha256
+// decides (and the stamp is only reported); otherwise the stamp. A version
+// that cannot be read, or is missing, never matches.
 type GitExpect struct {
 	Stamp  string `json:"stamp,omitempty"`
 	SHA256 string `json:"sha256,omitempty"`
@@ -61,9 +85,14 @@ type GitDeleteOptions struct {
 type GitChangedError struct {
 	Type, Name string
 	Observed   GitExpect
+	// Inactive: it has an inactive version, which sha256 does not see.
+	Inactive bool
 }
 
 func (e *GitChangedError) Error() string {
+	if e.Inactive {
+		return "it has an inactive version, which its sha256 does not cover (unactivated work); not deleted"
+	}
 	var seen []string
 	if e.Observed.Stamp != "" {
 		seen = append(seen, "stamp "+e.Observed.Stamp)
@@ -78,14 +107,20 @@ func (e *GitChangedError) Error() string {
 	return fmt.Sprintf("changed since its version was read (%s); not deleted", what)
 }
 
-// gitStampTables is the version table of each type that has a stamp.
+// gitStampTables is what the stamp of each type that has one is over.
 var gitStampTables = map[string]string{
-	"CLAS": "REPOSRC", "INTF": "REPOSRC", "PROG": "REPOSRC",
-	"TABL": "DD02L", "DTEL": "DD04L", "DOMA": "DD01L", "TTYP": "DD40L", "DDLS": "DDDDLSRC",
+	"CLAS": "REPOSRC.REPOTEXT.SEOCLASSDF.SEOCLASSTX.SEOCOMPOTX",
+	"INTF": "REPOSRC.REPOTEXT.SEOCLASSDF.SEOCLASSTX.SEOCOMPOTX",
+	"PROG": "REPOSRC.REPOTEXT.D020S",
+	"TABL": "DD02L.DD09L.DD12L.DD02T.DD35L.TDDAT",
+	"DTEL": "DD04L.DD04T",
+	"DOMA": "DD01L.DD01T.DD07L.DD07T",
+	"TTYP": "DD40L.DD40T",
+	"DDLS": "DDDDLSRC.DDDDLSRCT",
 }
 
 var (
-	gitStampRe  = regexp.MustCompile(`^v1:([A-Z0-9]+):([0-9]{14}):([0-9]+)$`)
+	gitStampRe  = regexp.MustCompile(`^v2:([A-Z0-9.]+):([0-9]{14}):([0-9]+):([0-9a-f]{16})$`)
 	gitSHA256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
@@ -110,7 +145,10 @@ func (e *GitExpect) normalized(objType string) (*GitExpect, error) {
 		}
 		m := gitStampRe.FindStringSubmatch(out.Stamp)
 		if m == nil {
-			return nil, fmt.Errorf("expect stamp %q is not v1:<TABLE>:<YYYYMMDDHHMMSS>:<ROWS> as git_object_versions reports it", out.Stamp)
+			if strings.HasPrefix(out.Stamp, "v1:") {
+				return nil, fmt.Errorf("expect stamp %q is a v1 stamp, which covered less; read the version again with git_object_versions", out.Stamp)
+			}
+			return nil, fmt.Errorf("expect stamp %q is not v2:<TABLES>:<YYYYMMDDHHMMSS>:<ROWS>:<DIGEST> as git_object_versions reports it", out.Stamp)
 		}
 		if m[1] != table {
 			return nil, fmt.Errorf("expect stamp %q is of %s; a %s stamp is of %s", out.Stamp, m[1], objType, table)
@@ -232,6 +270,8 @@ type GitObjectVersion struct {
 	SHA256Error string `json:"sha256Error,omitempty"`
 	// Files is the number of files the sha256 is over.
 	Files int `json:"files,omitempty"`
+	// Inactive: the object or a part of it has an inactive version.
+	Inactive bool `json:"inactive,omitempty"`
 }
 
 type gitVersionsAnswer struct {
@@ -245,6 +285,7 @@ type gitVersionsAnswer struct {
 		SHA256      string `json:"sha256"`
 		SHA256Error string `json:"sha256_error"`
 		Files       int    `json:"files"`
+		Inactive    bool   `json:"inactive"`
 	} `json:"objects"`
 }
 
@@ -292,7 +333,7 @@ func (c *Client) GitObjectVersions(ctx context.Context, ws GitService, pkg strin
 	out := make([]GitObjectVersion, 0, len(items))
 	for i, o := range a.Objects {
 		v := GitObjectVersion{Type: strings.ToUpper(t(o.Type)), Name: strings.ToUpper(t(o.Name)), Package: t(o.Devclass), InPackage: o.InPackage,
-			Stamp: t(o.Stamp), StampError: t(o.StampError), SHA256: strings.ToLower(t(o.SHA256)), SHA256Error: t(o.SHA256Error), Files: o.Files}
+			Stamp: t(o.Stamp), StampError: t(o.StampError), SHA256: strings.ToLower(t(o.SHA256)), SHA256Error: t(o.SHA256Error), Files: o.Files, Inactive: o.Inactive}
 		if v.Type != items[i].Type || v.Name != items[i].Name {
 			return nil, fmt.Errorf("ZADT_VSP answered %s %s where %s %s was asked", v.Type, v.Name, items[i].Type, items[i].Name)
 		}
@@ -333,20 +374,26 @@ func (c *Client) checkGitExpect(ctx context.Context, ws GitService, pkg string, 
 	if exp.SHA256 != "" {
 		obs.SHA256 = v.SHA256
 	}
-	if (exp.Stamp != "" && v.Stamp != "" && v.Stamp == exp.Stamp) || (exp.SHA256 != "" && v.SHA256 != "" && v.SHA256 == exp.SHA256) {
+	changed := &GitChangedError{Type: item.Type, Name: item.Name, Observed: *obs}
+	if exp.SHA256 != "" {
+		// sha256 decides: the stamp misses parts of an object that abapGit
+		// serialises, so a stamp match never outweighs a sha256 mismatch.
+		switch {
+		case v.SHA256Error != "":
+			return obs, fmt.Errorf("its sha256 could not be read (%s), so it was not deleted", v.SHA256Error)
+		case v.Inactive:
+			changed.Inactive = true
+			return obs, changed
+		case v.SHA256 == "" || v.SHA256 != exp.SHA256:
+			return obs, changed
+		}
 		return obs, nil
 	}
-	// No match. A part that could not be read leaves it uncertain: failed,
-	// not changed -- and never deleted.
-	var unread []string
-	if exp.Stamp != "" && v.StampError != "" {
-		unread = append(unread, "stamp: "+v.StampError)
+	switch {
+	case v.StampError != "":
+		return obs, fmt.Errorf("its stamp could not be read (%s), so it was not deleted", v.StampError)
+	case v.Stamp == "" || v.Stamp != exp.Stamp:
+		return obs, changed
 	}
-	if exp.SHA256 != "" && v.SHA256Error != "" {
-		unread = append(unread, "sha256: "+v.SHA256Error)
-	}
-	if len(unread) > 0 {
-		return obs, fmt.Errorf("its version could not be read (%s), so it was not deleted", strings.Join(unread, "; "))
-	}
-	return obs, &GitChangedError{Type: item.Type, Name: item.Name, Observed: *obs}
+	return obs, nil
 }

@@ -12,10 +12,12 @@ import (
 )
 
 const (
-	stampOld = "v1:REPOSRC:20261002101500:1"
-	stampNew = "v1:REPOSRC:20261002103000:2"
+	stampOld = "v2:REPOSRC.REPOTEXT.D020S:20261002101500:1:0123456789abcdef"
+	stampNew = "v2:REPOSRC.REPOTEXT.D020S:20261002103000:2:0123456789abcdef"
 	shaOld   = "1111111111111111111111111111111111111111111111111111111111111111"
 	shaNew   = "2222222222222222222222222222222222222222222222222222222222222222"
+
+	clasStamp = "v2:REPOSRC.REPOTEXT.SEOCLASSDF.SEOCLASSTX.SEOCOMPOTX:20261002101500:7:0123456789abcdef"
 )
 
 // versionsWS is fakeGitWS plus object_versions: each object's answer, and,
@@ -197,10 +199,15 @@ func TestDeleteGitObjectsExpectNeverOnUncertainty(t *testing.T) {
 		{"versions not answered", map[string]any{}, errors.New("not connected"), GitExpect{Stamp: stampOld}, "failed", false},
 		{"moved away", nil, nil, GitExpect{Stamp: stampOld}, "failed", false},
 		{"no version rows", map[string]any{"stamp": ""}, nil, GitExpect{Stamp: stampOld}, "changed", false},
-		{"stamp differs, sha unreadable", map[string]any{"stamp": stampNew, "sha256_error": "abapGit could not serialise it"}, nil,
+		{"stamp unreadable, sha matches", map[string]any{"stamp": "", "stamp_error": "x", "sha256": shaOld}, nil, GitExpect{Stamp: stampOld, SHA256: shaOld}, "deleted", true},
+		{"stamp matches, sha unreadable", map[string]any{"stamp": stampOld, "sha256_error": "abapGit could not serialise it"}, nil,
 			GitExpect{Stamp: stampOld, SHA256: shaOld}, "failed", true},
 		{"stamp differs, sha matches", map[string]any{"stamp": stampNew, "sha256": shaOld}, nil, GitExpect{Stamp: stampOld, SHA256: shaOld}, "deleted", true},
-		{"stamp matches, sha differs", map[string]any{"stamp": stampOld, "sha256": shaNew}, nil, GitExpect{Stamp: stampOld, SHA256: shaOld}, "deleted", true},
+		// sha256 decides: a stamp that missed the change never outweighs it.
+		{"stamp matches, sha differs", map[string]any{"stamp": stampOld, "sha256": shaNew}, nil, GitExpect{Stamp: stampOld, SHA256: shaOld}, "changed", true},
+		// sha256 sees the active version only: unactivated work is never a match.
+		{"sha matches, inactive version", map[string]any{"sha256": shaOld, "inactive": true}, nil, GitExpect{SHA256: shaOld}, "changed", true},
+		{"stamp and sha match, inactive version", map[string]any{"stamp": stampOld, "sha256": shaOld, "inactive": true}, nil, GitExpect{Stamp: stampOld, SHA256: shaOld}, "changed", true},
 		{"sha only, matches", map[string]any{"sha256": strings.ToUpper(shaOld)}, nil, GitExpect{SHA256: shaOld}, "deleted", true},
 		{"sha only, differs", map[string]any{"sha256": shaNew}, nil, GitExpect{SHA256: shaOld}, "changed", true},
 		{"sha only, missing", map[string]any{"sha256": ""}, nil, GitExpect{SHA256: shaOld}, "changed", true},
@@ -245,7 +252,8 @@ func TestDeleteGitObjectsExpectRefusedBeforeIO(t *testing.T) {
 	bad := []GitExpect{
 		{},
 		{Stamp: "20261002"},
-		{Stamp: "v1:DD02L:20261002101500:1"}, // a table's stamp for a program
+		{Stamp: "v2:DD02L.DD09L.DD12L.DD02T.DD35L.TDDAT:20261002101500:1:0123456789abcdef"}, // a table's stamp for a program
+		{Stamp: "v1:REPOSRC:20261002101500:1"},                                              // a v1 stamp covered less
 		{SHA256: "abc"},
 	}
 	for _, e := range bad {
@@ -318,15 +326,15 @@ func TestDeleteGitObjectsExpectRepo(t *testing.T) {
 
 func TestParseGitDeleteItemsExpect(t *testing.T) {
 	items, err := ParseGitDeleteItems([]any{
-		map[string]any{"type": "clas", "name": "zcl_demo", "expect": map[string]any{"stamp": stampOld, "sha256": strings.ToUpper(shaOld)}},
-		map[string]any{"type": "TABL", "name": "ZDEMO_T", "expect": map[string]any{"stamp": "v1:DD02L:20261002101500:1"}},
+		map[string]any{"type": "clas", "name": "zcl_demo", "expect": map[string]any{"stamp": clasStamp, "sha256": strings.ToUpper(shaOld)}},
+		map[string]any{"type": "TABL", "name": "ZDEMO_T", "expect": map[string]any{"stamp": "v2:DD02L.DD09L.DD12L.DD02T.DD35L.TDDAT:20261002101500:1:0123456789abcdef"}},
 		map[string]any{"type": "FUGR", "name": "ZDEMO_FG", "expect": map[string]any{"sha256": shaOld}},
 		"PROG ZDEMO_REPORT",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e := items[0].Expect; e == nil || e.Stamp != stampOld || e.SHA256 != shaOld {
+	if e := items[0].Expect; e == nil || e.Stamp != clasStamp || e.SHA256 != shaOld {
 		t.Errorf("CLAS expect %+v", e)
 	}
 	if items[1].Expect == nil || items[2].Expect == nil || items[3].Expect != nil {
@@ -338,8 +346,9 @@ func TestParseGitDeleteItemsExpect(t *testing.T) {
 		"empty expect":         map[string]any{"type": "PROG", "name": "A", "expect": map[string]any{}},
 		"expect not a map":     map[string]any{"type": "PROG", "name": "A", "expect": stampOld},
 		"stamp not a string":   map[string]any{"type": "PROG", "name": "A", "expect": map[string]any{"stamp": 1.0}},
-		"stamp malformed":      map[string]any{"type": "PROG", "name": "A", "expect": map[string]any{"stamp": "v2:REPOSRC:20261002101500:1"}},
-		"stamp of other table": map[string]any{"type": "DTEL", "name": "A", "expect": map[string]any{"stamp": "v1:DD02L:20261002101500:1"}},
+		"stamp malformed":      map[string]any{"type": "PROG", "name": "A", "expect": map[string]any{"stamp": "v3:REPOSRC:20261002101500:1"}},
+		"stamp v1":             map[string]any{"type": "PROG", "name": "A", "expect": map[string]any{"stamp": "v1:REPOSRC:20261002101500:1"}},
+		"stamp of other table": map[string]any{"type": "DTEL", "name": "A", "expect": map[string]any{"stamp": stampOld}},
 		"stamp unsupported":    map[string]any{"type": "FUGR", "name": "A", "expect": map[string]any{"stamp": stampOld}},
 		"sha256 malformed":     map[string]any{"type": "PROG", "name": "A", "expect": map[string]any{"sha256": "xyz"}},
 	} {
@@ -363,10 +372,10 @@ func TestParseGitDeleteItemsExpect(t *testing.T) {
 
 func TestApplyGitExpectFlags(t *testing.T) {
 	items := []GitDeleteItem{{Type: "CLAS", Name: "ZCL_DEMO"}, {Type: "PROG", Name: "ZDEMO"}}
-	if err := ApplyGitExpectFlags(items, []string{"clas zcl_demo stamp=" + stampOld + " sha256=" + shaOld}); err != nil {
+	if err := ApplyGitExpectFlags(items, []string{"clas zcl_demo stamp=" + clasStamp + " sha256=" + shaOld}); err != nil {
 		t.Fatal(err)
 	}
-	if e := items[0].Expect; e == nil || e.Stamp != stampOld || e.SHA256 != shaOld || items[1].Expect != nil {
+	if e := items[0].Expect; e == nil || e.Stamp != clasStamp || e.SHA256 != shaOld || items[1].Expect != nil {
 		t.Errorf("items %+v", items)
 	}
 	for _, bad := range []string{
@@ -375,7 +384,7 @@ func TestApplyGitExpectFlags(t *testing.T) {
 		"PROG ZDEMO stamp",                          // no =
 		"PROG ZDEMO md5=" + shaOld,                  // unknown key
 		"PROG ZDEMO stamp=" + stampOld + " stamp=x", // twice
-		"CLAS ZCL_DEMO stamp=" + stampNew,           // another expect already
+		"CLAS ZCL_DEMO sha256=" + shaNew,            // another expect already
 	} {
 		if err := ApplyGitExpectFlags(items, []string{bad}); err == nil {
 			t.Errorf("%q accepted", bad)
@@ -388,13 +397,13 @@ func TestApplyGitExpectFlags(t *testing.T) {
 func TestGitObjectVersions(t *testing.T) {
 	cl := NewClient("http://sap.invalid", "TESTUSER", "pw", WithReadOnly())
 	ws := &versionsWS{fakeGitWS: &fakeGitWS{}, rec: &adtRecorder{}, versions: map[string]map[string]any{
-		"CLAS ZCL_DEMO": {"stamp": stampOld, "sha256": shaOld, "files": 2},
+		"CLAS ZCL_DEMO": {"stamp": clasStamp, "sha256": shaOld, "files": 2, "inactive": true},
 	}}
 	vs, err := cl.GitObjectVersions(context.Background(), ws, "$zdemo", []GitDeleteItem{{Type: "CLAS", Name: "ZCL_DEMO"}, {Type: "PROG", Name: "ZGONE"}}, true)
 	if err != nil {
 		t.Fatal(err) // read-only does not refuse a read
 	}
-	if len(vs) != 2 || vs[0].Stamp != stampOld || vs[0].SHA256 != shaOld || !vs[0].InPackage || vs[1].InPackage || vs[1].Package != "$ZOTHER" {
+	if len(vs) != 2 || vs[0].Stamp != clasStamp || !vs[0].Inactive || vs[1].Inactive || vs[0].SHA256 != shaOld || !vs[0].InPackage || vs[1].InPackage || vs[1].Package != "$ZOTHER" {
 		t.Errorf("versions %+v", vs)
 	}
 	if c := ws.calls(); len(c) != 1 || c[0].objects != "CLAS ZCL_DEMO,PROG ZGONE" || !c[0].sha {
