@@ -119,7 +119,11 @@ type CrossingReport struct {
 type CrossingOptions struct {
 	// CommonPatterns identifies "common" packages by suffix (default: ["_00"])
 	CommonPatterns []string
-	// TestPatterns identifies test packages — sibling crossings from test packages are OK
+	// TestPatterns identifies test packages — sibling crossings from test packages are OK.
+	// A package is a test package when its name ends with a pattern, or with the
+	// pattern plus "S": $ZLLM_TEST and $ZLLM_TESTS are, $ZLLM_TESTING is not.
+	// The exemption waives a violation, so it matches the name's end as
+	// CommonPatterns does; it used to match anywhere in the name.
 	TestPatterns []string
 	// UpwardSkipThreshold: how many levels of skip before flagging (default: 2)
 	UpwardSkipThreshold int
@@ -525,7 +529,8 @@ func GuessPackageFromName(objName string) string {
 func isTestPackage(pkg string, patterns []string) bool {
 	upper := strings.ToUpper(pkg)
 	for _, p := range patterns {
-		if strings.Contains(upper, strings.ToUpper(p)) {
+		p = strings.ToUpper(p)
+		if strings.HasSuffix(upper, p) || strings.HasSuffix(upper, p+"S") {
 			return true
 		}
 	}

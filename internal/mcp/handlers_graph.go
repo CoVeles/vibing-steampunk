@@ -217,64 +217,96 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 	var unreadable []adt.Unsearched
 	truncated := 0
 
-	for _, obj := range pkgContent.Objects {
-		// The package listing carries SAP's own two-part code — CLAS/OC,
-		// PROG/P, INTF/OI — and this compared it against the bare kind, so
-		// every object was skipped before anything was read. An empty graph
-		// then has no boundary to cross, and the answer was "Total
-		// dependencies: 0, CLEAN" for a package the CLI finds three
-		// crossings in. Nothing reported a failure because nothing was
-		// attempted.
-		//
-		// The code is mapped, not cut at the slash: PROG/I is an include and
-		// is read as one, and FUGR/FF is a function module, whose source is
-		// read with its group's. Reading it again on its own would count a
-		// part as another whole object.
-		objType := adtsource.SourceKind(obj.Type)
-		switch objType {
-		case "CLAS", "PROG", "INTF", "INCL", "FUGR":
-		default:
-			continue
-		}
-
+	// read reads one object into the graph, or records why it could not.
+	read := func(objType, name, parent string) {
 		if count >= maxObjects {
 			// The cap is counted rather than broken on, because "we stopped
 			// at 50 of 130" and "the package has 50 objects" are different
 			// answers and the report cannot otherwise tell them apart.
 			truncated++
-			continue
+			return
 		}
-
 		// The type is passed, not omitted. GetSource switches on it and has
 		// no branch for the empty string, so asking without one failed for
 		// every object in the package — and an object that contributes no
 		// edges is indistinguishable from a clean one, which is how this
 		// answered "Total dependencies: 0, CLEAN" for a package the CLI
 		// finds three boundary crossings in.
-		source, missedParts, err := s.readPackageObjectSource(ctx, objType, obj.Name)
+		source, missedParts, err := s.readPackageObjectSource(ctx, objType, name, parent)
 		if err != nil {
 			// An object we could not read contributes no edges, and no
 			// edges is what a clean object looks like. Record it or the
 			// verdict below is about code nobody opened.
-			unreadable = append(unreadable, adt.Unsearched{Object: objType + " " + obj.Name, Reason: err.Error()})
-			continue
+			unreadable = append(unreadable, adt.Unsearched{Object: objType + " " + name, Reason: err.Error()})
+			return
 		}
 		// A function group is read part by part, and a part that failed is
 		// as absent from the edges as a whole object would be.
 		for _, m := range missedParts {
-			unreadable = append(unreadable, adt.Unsearched{Object: objType + " " + obj.Name + ": " + m.Object, Reason: m.Reason})
+			unreadable = append(unreadable, adt.Unsearched{Object: objType + " " + name + ": " + m.Object, Reason: m.Reason})
 		}
-
-		nodeID := graph.NodeID(objType, obj.Name)
+		nodeID := graph.NodeID(objType, name)
 		g.AddNode(&graph.Node{
 			ID:      nodeID,
-			Name:    obj.Name,
+			Name:    name,
 			Type:    objType,
 			Package: strings.ToUpper(pkg),
 		})
-
 		g.AddSourceDeps(nodeID, source)
 		count++
+	}
+
+	// The package listing carries SAP's own two-part code — CLAS/OC, PROG/P,
+	// INTF/OI. It is mapped, not cut at the slash (adtsource.SourceKind):
+	// PROG/I is an include and is read as one, FUGR/FF is one function module
+	// and not its group. A code that is neither a source kind nor one of the
+	// few excused non-source types is reported, not dropped: an entry nobody
+	// read contributes no edges, and no edges is what a clean object looks
+	// like.
+	type module struct{ name, group string }
+	var modules []module
+	groupsRead := map[string]bool{}
+	for _, obj := range pkgContent.Objects {
+		objType := adtsource.SourceKind(obj.Type)
+		switch objType {
+		case "CLAS", "PROG", "INTF", "INCL":
+			read(objType, obj.Name, "")
+		case "FUGR":
+			if count < maxObjects {
+				groupsRead[strings.ToUpper(obj.Name)] = true
+			}
+			read(objType, obj.Name, "")
+		case "FUNC":
+			// Decided after the walk, once it is known which groups are read.
+			modules = append(modules, module{obj.Name, adt.FunctionGroupFromURI(obj.URI)})
+		default:
+			if !adtsource.IsNonSourceType(obj.Type) {
+				unreadable = append(unreadable, adt.Unsearched{
+					Object: obj.Type + " " + obj.Name,
+					Reason: "listing type " + obj.Type + " is not one this scan reads source for, so its dependencies are not in this verdict",
+				})
+			}
+		}
+	}
+
+	// A function module's source is read with its group's, and reading it
+	// again would count a part as another whole. But only when the group is
+	// in this listing and was read: a module whose group lies elsewhere, or
+	// was left beyond the cap, is read on its own.
+	for _, m := range modules {
+		group := m.group
+		if group == "" {
+			resolved, err := s.adtClient.ResolveFunctionGroup(ctx, m.name)
+			if err != nil {
+				unreadable = append(unreadable, adt.Unsearched{Object: "FUNC " + m.name, Reason: "its function group could not be determined: " + err.Error()})
+				continue
+			}
+			group = strings.ToUpper(resolved)
+		}
+		if groupsRead[group] {
+			continue
+		}
+		read("FUNC", m.name, group)
 	}
 	return &packageScan{Graph: g, Read: count, Unreadable: unreadable, Truncated: truncated, Cap: maxObjects}, nil
 }
@@ -285,11 +317,13 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 // so a group calling across packages read that way came out clean. Its
 // includes and modules are read instead, and the ones that could not be read
 // are returned.
-func (s *Server) readPackageObjectSource(ctx context.Context, objType, name string) (string, []adt.Unsearched, error) {
+//
+// parent is a function module's group, and empty otherwise.
+func (s *Server) readPackageObjectSource(ctx context.Context, objType, name, parent string) (string, []adt.Unsearched, error) {
 	if objType == "FUGR" {
 		return s.adtClient.GetFunctionGroupAllSources(ctx, name)
 	}
-	source, err := s.adtClient.GetSource(ctx, objType, name, nil)
+	source, err := s.adtClient.GetSource(ctx, objType, name, &adt.GetSourceOptions{Parent: parent})
 	return source, nil, err
 }
 

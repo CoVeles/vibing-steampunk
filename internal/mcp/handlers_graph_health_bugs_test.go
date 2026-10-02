@@ -101,3 +101,75 @@ func TestABoundaryCheckReadsAFunctionGroupsCode(t *testing.T) {
 		t.Fatalf("the include that could not be read is not named as a gap:\n%s", text)
 	}
 }
+
+// moduleWorld is a package holding two function modules: one whose group is in
+// the package too, and one whose group is not listed here at all.
+func moduleWorld() fakesap.World {
+	w := funcGroupWorld()
+	w.Packages = map[string]string{"$ZFG": "", "$ZOTHER": ""}
+	w.Objects = append(w.Objects,
+		fakesap.Object{Type: "FUNC", Name: "Z_FG_RUN", Group: "ZFG_MAIN", Package: "$ZFG",
+			Source: "FUNCTION z_fg_run.\n  DATA lo TYPE REF TO zcl_foreign.\nENDFUNCTION."},
+		fakesap.Object{Type: "FUNC", Name: "Z_STRAY_FM", Group: "ZELSEWHERE_FG", Package: "$ZFG",
+			Source: "FUNCTION z_stray_fm.\n  DATA lo TYPE REF TO zcl_foreign.\nENDFUNCTION."},
+	)
+	return w
+}
+
+// A module was skipped on the grounds that its group would be read. When the
+// group is not in the package, nothing read the module at all.
+func TestAModuleWhoseGroupIsNotInThePackageIsReadOnItsOwn(t *testing.T) {
+	srv := fakesap.New(t, moduleWorld())
+	s := &Server{adtClient: adt.NewClient(srv.URL, "TESTUSER", "secret")}
+	var req mcp.CallToolRequest
+	req.Params.Arguments = map[string]any{"package": "$ZFG"}
+	result, err := s.handleCheckBoundaries(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := toolResultText(t, result)
+	if !strings.Contains(text, "Z_STRAY_FM → ZCL_FOREIGN") {
+		t.Fatalf("the stray module's call into $ZOTHER is not reported:\n%s", text)
+	}
+	log := strings.ToLower(strings.Join(srv.Log(), "\n"))
+	if !strings.Contains(log, "/fmodules/z_stray_fm/source/main") {
+		t.Fatalf("the stray module was not read:\n%s", log)
+	}
+	if strings.Contains(log, "/fmodules/z_fg_run/") {
+		t.Fatalf("a module whose group is read was read again on its own:\n%s", log)
+	}
+}
+
+// A listing entry of a type the scan does not read used to vanish, and the
+// verdict over the rest looked complete.
+func TestAnUnsupportedListingEntryIsAGap(t *testing.T) {
+	w := fakesap.Narrow()
+	w.Objects = append(w.Objects,
+		fakesap.Object{Type: "PROG/X", Name: "ZNARROW_ODD", Package: "$ZNARROW"},
+		fakesap.Object{Type: "TABL", Name: "ZNARROW_T", Package: "$ZNARROW"},
+	)
+	text := callFake(t, w, (*Server).checkBoundaries, map[string]any{"package": "$ZNARROW"})
+	if !strings.Contains(text, "PROG/X ZNARROW_ODD: listing type PROG/X is not one this scan reads source for") {
+		t.Fatalf("the unsupported entry is not named as a gap:\n%s", text)
+	}
+	if strings.Contains(text, "ZNARROW_T") {
+		t.Fatalf("a table carries no source and should be excused, not reported:\n%s", text)
+	}
+}
+
+// Health had its own scan, which took classes, programs and interfaces only:
+// a package of function groups had nothing read and no verdict.
+func TestPackageHealthReadsFunctionGroups(t *testing.T) {
+	text := callFake(t, funcGroupWorld(), (*Server).health, map[string]any{"package": "$ZFG"})
+	var got struct {
+		Signals map[string]struct {
+			Status string `json:"status"`
+		} `json:"signals"`
+	}
+	if err := json.Unmarshal([]byte(text), &got); err != nil {
+		t.Fatalf("%v\n%s", err, text)
+	}
+	if s := got.Signals["boundaries"].Status; s != "VIOLATIONS" {
+		t.Fatalf("boundaries: %s, want VIOLATIONS from the group's call into $ZOTHER\n%s", s, text)
+	}
+}

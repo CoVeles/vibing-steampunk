@@ -50,3 +50,37 @@ func TestWhereUsedConfigJSONCarriesItsGaps(t *testing.T) {
 		t.Fatalf("notes = %q", got.Notes)
 	}
 }
+
+// With WBCROSSGT refused and CROSS finding nothing there are no candidates,
+// and the JSON format printed a plain-text line instead of the document —
+// dropping the one fact that mattered, that half the system was not asked.
+func TestWhereUsedConfigJSONWithNoCandidatesStillCarriesItsGaps(t *testing.T) {
+	w := fakesap.CrossDown(false)
+	w.TVARVCReaders[1] = nil
+	srv := fakesap.New(t, w)
+	examplesAgainst(t, srv.Server)
+	withFlags(t, graphWhereUsedConfigCmd, map[string]string{"format": "json"})
+	graphWhereUsedConfigCmd.SetContext(context.Background())
+
+	var err error
+	stdout := captureStdout(t, func() {
+		_ = captureStderr(t, func() { err = runGraphWhereUsedConfig(graphWhereUsedConfigCmd, []string{"ZGOLD_VAR"}) })
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Found      bool             `json:"found"`
+		Unsearched []adt.Unsearched `json:"unsearched"`
+		Notes      []string         `json:"notes"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	if len(got.Unsearched) != 1 || got.Unsearched[0].Object != "WBCROSSGT (object-oriented code)" {
+		t.Fatalf("unsearched = %+v, want the WBCROSSGT gap", got.Unsearched)
+	}
+	if len(got.Notes) != 1 || !strings.HasPrefix(got.Notes[0], "1 of 1 objects could not be searched") {
+		t.Fatalf("notes = %q", got.Notes)
+	}
+}

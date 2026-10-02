@@ -114,3 +114,35 @@ func TestCrossingsDoNotDependOnWalkOrder(t *testing.T) {
 		t.Fatalf("want sibling=1 downward=1 upward=1, got %+v", fwd)
 	}
 }
+
+// The exemption is for test packages, named so at the end. It matched "_TEST"
+// anywhere, so a production package such as $ZROOT_TESTING calling into a
+// sibling was waved through — on the guessed path too, once that path applied
+// the exemption.
+func TestOnlyATestPackageIsExemptFromSiblingViolations(t *testing.T) {
+	for src, exempt := range map[string]bool{
+		"$ZROOT_TEST":    true,
+		"$ZROOT_TESTS":   true,
+		"$ZROOT_TESTING": false,
+		"$ZROOT_TEST_01": false,
+	} {
+		scope := walkScope()
+		scope.Packages = append(scope.Packages, src)
+		scope.PackageSet[src] = true
+		scope.Hierarchy[src] = "$ZROOT"
+		for _, guessed := range []bool{false, true} {
+			g := New()
+			node(g, "CLAS:ZCL_CALLER", src)
+			if guessed {
+				g.AddNode(&Node{ID: "CLAS:ZCL_ROOT_02_THING", Name: "ZCL_ROOT_02_THING", Type: "CLAS"})
+			} else {
+				node(g, "CLAS:ZCL_ROOT_02_THING", "$ZROOT_02")
+			}
+			call(g, "CLAS:ZCL_CALLER", "CLAS:ZCL_ROOT_02_THING")
+			r := AnalyzeCrossings(g, scope, nil)
+			if got := r.Sibling == 0; got != exempt {
+				t.Errorf("%s (guessed=%v): sibling=%d, exempt want %v", src, guessed, r.Sibling, exempt)
+			}
+		}
+	}
+}

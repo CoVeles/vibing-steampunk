@@ -88,3 +88,16 @@ func TestFailedLookupsAreOrderedByStageThenName(t *testing.T) {
 		}
 	}
 }
+
+// Only a short list of codes is excused from a scan; the rest are either read
+// or reported.
+func TestIsNonSourceType(t *testing.T) {
+	for in, want := range map[string]bool{
+		"TABL/DT": true, "tabl/ds": true, "DTEL/DE": true, "DEVC/K": true, "SAPC": true, "SAMC": true,
+		"CLAS/OC": false, "PROG/X": false, "DDLS/DF": false, "FUGR/I": false, "": false,
+	} {
+		if got := IsNonSourceType(in); got != want {
+			t.Errorf("IsNonSourceType(%q) = %v, want %v", in, got, want)
+		}
+	}
+}

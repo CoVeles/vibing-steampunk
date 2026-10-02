@@ -2123,7 +2123,10 @@ func runGraphWhereUsedConfig(cmd *cobra.Command, args []string) error {
 	if crossErr != nil {
 		fmt.Fprintf(os.Stderr, "WARN: classic procedural callers were not searched: %v\n", crossErr)
 	}
-	if len(candidates) == 0 {
+	// JSON goes on to the envelope even with nothing found: "no readers" with
+	// a table gap beside it is a different answer from "no readers", and a
+	// JSON consumer reads nothing but the document.
+	if len(candidates) == 0 && format != "json" {
 		fmt.Println("No programs reference the TVARVC table.")
 		return nil
 	}
