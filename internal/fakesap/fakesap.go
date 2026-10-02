@@ -38,6 +38,10 @@ type Object struct {
 	// Revised is the RFC3339 date of the newest version in the revision feed.
 	// Empty serves a feed with no entries.
 	Revised string
+	// Parts are a function group's includes and modules, by name, as its
+	// object structure lists them; each is served at its own source/main. An
+	// empty source answers 404. FUGR only.
+	Parts map[string]string
 }
 
 // World is the landscape the fake serves.
@@ -142,6 +146,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(path, "/versions"):
 		s.record("GET " + path)
 		s.serveRevisions(w, path)
+		return
+	case strings.HasSuffix(path, "/objectstructure"):
+		s.record("GET " + path)
+		s.serveObjectStructure(w, path)
 		return
 	case strings.HasSuffix(path, "/source/main"):
 		s.record("GET " + path)
@@ -415,7 +423,8 @@ func (s *Server) objectOf(path string) (Object, bool) {
 			switch {
 			case o.Type == "CLAS" && kind == "CLASSES",
 				o.Type == "INTF" && kind == "INTERFACES",
-				o.Type == "PROG" && kind == "PROGRAMS":
+				o.Type == "PROG" && kind == "PROGRAMS",
+				o.Type == "FUGR" && kind == "GROUPS":
 				return o, true
 			}
 		}
@@ -423,8 +432,47 @@ func (s *Server) objectOf(path string) (Object, bool) {
 	return Object{}, false
 }
 
+// partOf is the function-group part a path addresses, if it addresses one.
+func partOf(o Object, path string) (string, bool) {
+	_, rest, ok := strings.Cut(strings.ToUpper(path), "/INCLUDES/")
+	if !ok || o.Type != "FUGR" {
+		return "", false
+	}
+	name, _, _ := strings.Cut(rest, "/")
+	return name, true
+}
+
+func (s *Server) serveObjectStructure(w http.ResponseWriter, path string) {
+	o, ok := s.objectOf(path)
+	if !ok || o.Type != "FUGR" {
+		refuse(w, "Resource does not exist", http.StatusNotFound)
+		return
+	}
+	const rel = "http://www.sap.com/adt/relations/source/definitionIdentifier"
+	base := "/sap/bc/adt/functions/groups/" + strings.ToLower(o.Name)
+	var b strings.Builder
+	fmt.Fprintf(&b, `<?xml version="1.0" encoding="utf-8"?><abapsource:objectStructureElement xmlns:abapsource="x" xmlns:atom="http://www.w3.org/2005/Atom" name="%s" type="FUGR/F">`, o.Name)
+	fmt.Fprintf(&b, `<atom:link rel="%s" href="%s/source/main"/>`, rel, base)
+	for _, part := range sortedKeys(o.Parts) {
+		fmt.Fprintf(&b, `<abapsource:objectStructureElement name="%s" type="FUGR/I"><atom:link rel="%s" href="%s/includes/%s/source/main"/></abapsource:objectStructureElement>`,
+			part, rel, base, strings.ToLower(part))
+	}
+	b.WriteString(`</abapsource:objectStructureElement>`)
+	w.Header().Set("Content-Type", "application/xml")
+	_, _ = io.WriteString(w, b.String())
+}
+
 func (s *Server) serveSource(w http.ResponseWriter, path string) {
 	o, ok := s.objectOf(path)
+	if part, isPart := partOf(o, path); ok && isPart {
+		if src := o.Parts[part]; src != "" {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, src)
+			return
+		}
+		refuse(w, "Resource does not exist", http.StatusNotFound)
+		return
+	}
 	if !ok || o.Source == "" {
 		refuse(w, "Resource does not exist", http.StatusNotFound)
 		return

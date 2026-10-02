@@ -10,17 +10,27 @@ import (
 	"github.com/oisee/vibing-steampunk/pkg/graph"
 )
 
-func TestMainType(t *testing.T) {
+// The part after the slash says what the object is, so it is mapped, not cut
+// off: an include is not a program, a function module is not its group.
+func TestSourceKind(t *testing.T) {
 	for in, want := range map[string]string{
 		"CLAS/OC": "CLAS",
-		"prog/p":  "PROG",
-		"INTF/OI": "INTF",
+		"clas/oc": "CLAS",
 		"CLAS":    "CLAS",
+		"INTF/OI": "INTF",
+		"PROG/P":  "PROG",
+		"PROG/I":  "INCL",
 		" FUGR/F": "FUGR",
+		"FUGR/FF": "FUNC",
+		"FUGR/I":  "",
+		"CLAS/OL": "",
+		"TABL/DT": "",
+		"TABL/DS": "",
+		"DEVC/K":  "",
 		"":        "",
 	} {
-		if got := MainType(in); got != want {
-			t.Errorf("MainType(%q) = %q, want %q", in, got, want)
+		if got := SourceKind(in); got != want {
+			t.Errorf("SourceKind(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

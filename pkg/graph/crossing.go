@@ -295,10 +295,10 @@ func AnalyzeCrossings(g *Graph, scope *PackageScope, opts *CrossingOptions) *Cro
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	// Find all nodes in scope. They are walked in ID order, not map order: the
-	// first edge seen for a source→target pair is the one reported, and a
-	// target whose package is guessed keeps that guess for the edges after it,
-	// so the walk order decides what the report says and must not vary.
+	// Find all nodes in scope. The result does not depend on the order they are
+	// walked in (see analyzeCrossingsFrom); they are sorted anyway so that the
+	// walk itself, and the guessed packages it writes into the graph, happen
+	// the same way on every run.
 	var scopeNodes []string
 	for _, n := range g.nodes {
 		if scope.InScope(n.Package) {
@@ -308,15 +308,41 @@ func AnalyzeCrossings(g *Graph, scope *PackageScope, opts *CrossingOptions) *Cro
 	sort.Strings(scopeNodes)
 	report.ObjectsScanned = len(scopeNodes)
 
-	// Track sibling direction pairs for circular detection
-	siblingPairs := make(map[string]map[string]bool) // srcPkg → set of tgtPkgs
-	// Deduplicate: same source→target pair only counted once
-	seenPairs := make(map[string]bool)
+	g.analyzeCrossingsFrom(scopeNodes, scope, opts, report)
+	return report
+}
 
-	for _, nodeID := range scopeNodes {
-		edges := g.outEdges[nodeID]
-		for _, e := range edges {
-			fromNode := g.nodes[nodeID]
+// analyzeCrossingsFrom walks the out-edges of nodeIDs and fills in report's
+// entries, counts and circular pairs. The caller holds g.mu.
+//
+// Its answer is the same whatever order nodeIDs come in, and that is a
+// property the tests check by walking one graph both ways:
+//
+//   - A pair is one source node and one target node, by ID — type and name.
+//     It used to be by name alone, so CLAS:Z_DUP → CLAS:Z_TARGET and
+//     PROG:Z_DUP → PROG:Z_TARGET were one pair, and whichever was walked first
+//     hid the other, a downward violation included.
+//   - When several edges join the same pair, the worst direction is kept
+//     (CrossingDirectionOrder), not the first one seen.
+//   - A test package's sibling crossing is exempt whether the target's package
+//     was looked up or guessed from its name. The guessed path used to skip
+//     the exemption, so the verdict on a test package's call depended on
+//     whether an earlier edge had already written the guess into the graph.
+//   - The counts and the circular pairs are computed from the kept entries,
+//     so they cannot disagree with them.
+func (g *Graph) analyzeCrossingsFrom(nodeIDs []string, scope *PackageScope, opts *CrossingOptions, report *CrossingReport) {
+	best := make(map[[2]string]CrossingEntry)
+	keep := func(from, to string, e CrossingEntry) {
+		key := [2]string{from, to}
+		if old, ok := best[key]; ok && directionRank(old.Direction) <= directionRank(e.Direction) {
+			return
+		}
+		best[key] = e
+	}
+
+	for _, nodeID := range nodeIDs {
+		fromNode := g.nodes[nodeID]
+		for _, e := range g.outEdges[nodeID] {
 			toNode := g.nodes[e.To]
 
 			// Dynamic calls
@@ -341,64 +367,31 @@ func AnalyzeCrossings(g *Graph, scope *PackageScope, opts *CrossingOptions) *Cro
 				continue
 			}
 
-			// Unresolved package on a custom object → guess from name, classify
+			var direction CrossingDirection
 			if tgtPkg == "" {
-				pairKey := fromNode.Name + "→" + toNode.Name
-				if !IsStandardObject(toNode.Name) && !seenPairs[pairKey] {
-					seenPairs[pairKey] = true
-					guessed := GuessPackageFromName(toNode.Name)
-					direction := CrossExternal
-					if guessed != "" {
-						toNode.Package = guessed
-						tgtPkg = guessed
-						direction = ClassifyCrossing(srcPkg, tgtPkg, scope, opts)
-					}
-					if direction == CrossSame {
-						continue
-					}
-					report.Entries = append(report.Entries, CrossingEntry{
-						SourceObject:  fromNode.Name,
-						SourceType:    fromNode.Type,
-						SourcePackage: srcPkg,
-						TargetObject:  toNode.Name,
-						TargetType:    toNode.Type,
-						TargetPackage: guessed,
-						Direction:     direction,
-						EdgeKind:      string(e.Kind),
-						RefDetail:     e.RefDetail,
-					})
-					switch direction {
-					case CrossUpward:
-						report.Upward++
-					case CrossCommon:
-						report.Common++
-					case CrossSibling:
-						report.Sibling++
-					case CrossDownward:
-						report.Downward++
-					case CrossCommonDown:
-						report.CommonDown++
-					default:
-						report.External++
-					}
+				// Unresolved package on a custom object: guess it from the
+				// name. The guess is written into the graph, as it always was;
+				// a later edge to this node then finds the same package by
+				// lookup and is classified the same way.
+				direction = CrossExternal
+				if guessed := GuessPackageFromName(toNode.Name); guessed != "" {
+					toNode.Package = guessed
+					tgtPkg = guessed
+					direction = ClassifyCrossing(srcPkg, tgtPkg, scope, opts)
 				}
-				continue
+				if direction == CrossSame {
+					continue
+				}
+			} else {
+				direction = ClassifyCrossing(srcPkg, tgtPkg, scope, opts)
 			}
-
-			direction := ClassifyCrossing(srcPkg, tgtPkg, scope, opts)
 
 			// Skip test package sibling crossings — tests are expected to reach into siblings
 			if direction == CrossSibling && isTestPackage(srcPkg, opts.TestPatterns) {
 				continue
 			}
 
-			pairKey := fromNode.Name + "→" + toNode.Name
-			if seenPairs[pairKey] {
-				continue
-			}
-			seenPairs[pairKey] = true
-
-			entry := CrossingEntry{
+			keep(fromNode.ID, toNode.ID, CrossingEntry{
 				SourceObject:  fromNode.Name,
 				SourceType:    fromNode.Type,
 				SourcePackage: srcPkg,
@@ -408,30 +401,33 @@ func AnalyzeCrossings(g *Graph, scope *PackageScope, opts *CrossingOptions) *Cro
 				Direction:     direction,
 				EdgeKind:      string(e.Kind),
 				RefDetail:     e.RefDetail,
-			}
-			report.Entries = append(report.Entries, entry)
+			})
+		}
+	}
 
-			switch direction {
-			case CrossUpward:
-				report.Upward++
-			case CrossUpwardSkip:
-				report.UpwardSkip++
-			case CrossCommon:
-				report.Common++
-			case CrossSibling:
-				report.Sibling++
-				// Track for circular detection
-				if siblingPairs[srcPkg] == nil {
-					siblingPairs[srcPkg] = make(map[string]bool)
-				}
-				siblingPairs[srcPkg][tgtPkg] = true
-			case CrossDownward:
-				report.Downward++
-			case CrossCommonDown:
-				report.CommonDown++
-			case CrossExternal:
-				report.External++
+	// Track sibling direction pairs for circular detection
+	siblingPairs := make(map[string]map[string]bool) // srcPkg → set of tgtPkgs
+	for _, entry := range best {
+		report.Entries = append(report.Entries, entry)
+		switch entry.Direction {
+		case CrossUpward:
+			report.Upward++
+		case CrossUpwardSkip:
+			report.UpwardSkip++
+		case CrossCommon:
+			report.Common++
+		case CrossSibling:
+			report.Sibling++
+			if siblingPairs[entry.SourcePackage] == nil {
+				siblingPairs[entry.SourcePackage] = make(map[string]bool)
 			}
+			siblingPairs[entry.SourcePackage][entry.TargetPackage] = true
+		case CrossDownward:
+			report.Downward++
+		case CrossCommonDown:
+			report.CommonDown++
+		default:
+			report.External++
 		}
 	}
 
@@ -447,7 +443,6 @@ func AnalyzeCrossings(g *Graph, scope *PackageScope, opts *CrossingOptions) *Cro
 	sort.Strings(report.Circular)
 
 	sortCrossingEntries(report.Entries)
-	return report
 }
 
 // CrossingDirectionOrder ranks the directions from worst to most benign: the

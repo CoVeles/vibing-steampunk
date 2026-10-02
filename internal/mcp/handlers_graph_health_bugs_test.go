@@ -73,3 +73,31 @@ func TestWhereUsedConfigNamesAnUnreadableCandidate(t *testing.T) {
 		t.Fatalf("the note should count 1 of the 3 candidates: %q", got.Notes)
 	}
 }
+
+// funcGroupWorld is a package holding one function group whose include calls
+// into another package, and one of whose includes cannot be read.
+func funcGroupWorld() fakesap.World {
+	w := fakesap.Gold()
+	w.Packages = map[string]string{"$ZFG": "", "$ZOTHER": ""}
+	w.Objects = []fakesap.Object{
+		{Type: "FUGR", Name: "ZFG_MAIN", Package: "$ZFG", Source: "FUNCTION-POOL zfg_main.", Parts: map[string]string{
+			"LZFG_MAINU01": "FUNCTION z_fg_run.\n  DATA lo TYPE REF TO zcl_foreign.\nENDFUNCTION.",
+			"LZFG_MAINU02": "",
+		}},
+		{Type: "CLAS", Name: "ZCL_FOREIGN", Package: "$ZOTHER"},
+	}
+	return w
+}
+
+// GetSource answers for a function group with its metadata as JSON, which
+// parses to no dependencies. The group counted as read and its cross-package
+// reference vanished, so the package came out clean.
+func TestABoundaryCheckReadsAFunctionGroupsCode(t *testing.T) {
+	text := callFake(t, funcGroupWorld(), (*Server).checkBoundaries, map[string]any{"package": "$ZFG"})
+	if !strings.Contains(text, "ZFG_MAIN → ZCL_FOREIGN") || !strings.Contains(text, "--- VIOLATIONS (1) ---") {
+		t.Fatalf("the function group's call into $ZOTHER is not reported as a violation:\n%s", text)
+	}
+	if !strings.Contains(text, "FUGR ZFG_MAIN: /sap/bc/adt/functions/groups/zfg_main/includes/lzfg_mainu02/source/main") {
+		t.Fatalf("the include that could not be read is not named as a gap:\n%s", text)
+	}
+}

@@ -125,7 +125,7 @@ func (s *Server) collectPackageTests(ctx context.Context, pkg string) healthSign
 
 	var testClasses []adt.PackageObject
 	for _, obj := range content.Objects {
-		if adtsource.MainType(obj.Type) == "CLAS" && graph.IsTestCaller(obj.Name, "") {
+		if adtsource.SourceKind(obj.Type) == "CLAS" && graph.IsTestCaller(obj.Name, "") {
 			testClasses = append(testClasses, obj)
 		}
 	}
@@ -273,7 +273,7 @@ func (s *Server) collectPackageBoundaries(ctx context.Context, pkg string) healt
 	skipped := 0
 	var missed []adt.Unsearched
 	for _, obj := range content.Objects {
-		objType := adtsource.MainType(obj.Type)
+		objType := adtsource.SourceKind(obj.Type)
 		if objType != "CLAS" && objType != "PROG" && objType != "INTF" {
 			continue
 		}
@@ -355,7 +355,7 @@ func (s *Server) collectPackageStaleness(ctx context.Context, pkg string) health
 	attempted := 0
 	var missed []adt.Unsearched
 	for _, obj := range content.Objects {
-		objType := adtsource.MainType(obj.Type)
+		objType := adtsource.SourceKind(obj.Type)
 		if objType != "CLAS" && objType != "PROG" && objType != "INTF" {
 			continue
 		}

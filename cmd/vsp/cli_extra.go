@@ -2134,11 +2134,20 @@ func runGraphWhereUsedConfig(cmd *cobra.Command, args []string) error {
 	grepCount := 0
 	// Held until the count line is done, so each warning is a line of its own.
 	var grepFailures []string
+	// What could not be searched, for the JSON answer: the tables that could
+	// not be asked, and the candidates that could not be read. A JSON consumer
+	// sees no stderr, so the gaps ride in the same document as the readers.
+	gaps := adtsource.TVARVCTableGaps(wbErr, crossErr)
 	for _, c := range candidates {
 		confirmed := false
 		if doGrep {
 			objURL := cliADTObjectURL(c.Type, c.Name)
-			if objURL != "" {
+			if objURL == "" {
+				gaps = append(gaps, adt.Unsearched{
+					Object: c.Type + " " + c.Name,
+					Reason: "no ADT source URL for this object type, so it was listed unconfirmed rather than grepped",
+				})
+			} else {
 				grepResult, err := client.GrepObject(ctx, objURL, variable, true, 0)
 				// Unconfirmed already means "read it, the name is not there".
 				// A grep that failed must not be filed under it — and
@@ -2146,6 +2155,7 @@ func runGraphWhereUsedConfig(cmd *cobra.Command, args []string) error {
 				// result, not in err.
 				if reason, failed := adtsource.GrepFailure(grepResult, err); failed {
 					grepFailures = append(grepFailures, fmt.Sprintf("WARN: %s %s could not be grepped: %s", c.Type, c.Name, reason))
+					gaps = append(gaps, adt.Unsearched{Object: c.Type + " " + c.Name, Reason: reason})
 				} else if len(grepResult.Matches) > 0 {
 					confirmed = true
 					grepCount++
@@ -2182,7 +2192,16 @@ func runGraphWhereUsedConfig(cmd *cobra.Command, args []string) error {
 	// Output
 	switch format {
 	case "json":
-		data, err := json.MarshalIndent(result, "", "  ")
+		// The same envelope MCP's where_used_config answers with.
+		envelope := struct {
+			*graph.ConfigUsageResult
+			Unsearched []adt.Unsearched `json:"unsearched,omitempty"`
+			Notes      []string         `json:"notes,omitempty"`
+		}{ConfigUsageResult: result, Unsearched: gaps}
+		if note := adtsource.ConfigGapNote(refs, gaps); note != "" {
+			envelope.Notes = append(envelope.Notes, note)
+		}
+		data, err := json.MarshalIndent(envelope, "", "  ")
 		if err != nil {
 			return err
 		}

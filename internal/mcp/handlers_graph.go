@@ -225,8 +225,15 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 		// dependencies: 0, CLEAN" for a package the CLI finds three
 		// crossings in. Nothing reported a failure because nothing was
 		// attempted.
-		objType := adtsource.MainType(obj.Type)
-		if objType != "CLAS" && objType != "PROG" && objType != "FUGR" && objType != "INTF" {
+		//
+		// The code is mapped, not cut at the slash: PROG/I is an include and
+		// is read as one, and FUGR/FF is a function module, whose source is
+		// read with its group's. Reading it again on its own would count a
+		// part as another whole object.
+		objType := adtsource.SourceKind(obj.Type)
+		switch objType {
+		case "CLAS", "PROG", "INTF", "INCL", "FUGR":
+		default:
 			continue
 		}
 
@@ -244,13 +251,18 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 		// edges is indistinguishable from a clean one, which is how this
 		// answered "Total dependencies: 0, CLEAN" for a package the CLI
 		// finds three boundary crossings in.
-		source, err := s.adtClient.GetSource(ctx, objType, obj.Name, nil)
+		source, missedParts, err := s.readPackageObjectSource(ctx, objType, obj.Name)
 		if err != nil {
 			// An object we could not read contributes no edges, and no
 			// edges is what a clean object looks like. Record it or the
 			// verdict below is about code nobody opened.
 			unreadable = append(unreadable, adt.Unsearched{Object: objType + " " + obj.Name, Reason: err.Error()})
 			continue
+		}
+		// A function group is read part by part, and a part that failed is
+		// as absent from the edges as a whole object would be.
+		for _, m := range missedParts {
+			unreadable = append(unreadable, adt.Unsearched{Object: objType + " " + obj.Name + ": " + m.Object, Reason: m.Reason})
 		}
 
 		nodeID := graph.NodeID(objType, obj.Name)
@@ -265,6 +277,20 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 		count++
 	}
 	return &packageScan{Graph: g, Read: count, Unreadable: unreadable, Truncated: truncated, Cap: maxObjects}, nil
+}
+
+// readPackageObjectSource reads the source of one object from a package
+// listing. A function group has no single source: GetSource answers for FUGR
+// with the group's metadata as JSON, which parses to no dependencies at all,
+// so a group calling across packages read that way came out clean. Its
+// includes and modules are read instead, and the ones that could not be read
+// are returned.
+func (s *Server) readPackageObjectSource(ctx context.Context, objType, name string) (string, []adt.Unsearched, error) {
+	if objType == "FUGR" {
+		return s.adtClient.GetFunctionGroupAllSources(ctx, name)
+	}
+	source, err := s.adtClient.GetSource(ctx, objType, name, nil)
+	return source, nil, err
 }
 
 // resolvePackages queries TADIR to fill in missing package info and correct
@@ -1049,20 +1075,7 @@ func (s *Server) handleWhereUsedConfig(ctx context.Context, request mcp.CallTool
 		Unsearched []adt.Unsearched `json:"unsearched,omitempty"`
 		Notes      []string         `json:"notes,omitempty"`
 	}{ConfigUsageResult: result, Unsearched: gaps}
-	// The total is every candidate plus every table that could not be asked. A
-	// candidate whose source could not be read is a gap and also a reader row,
-	// so it is counted once.
-	total := len(refs)
-	candidate := make(map[string]bool, len(refs))
-	for _, r := range refs {
-		candidate[r.ObjectType+" "+r.ObjectName] = true
-	}
-	for _, g := range gaps {
-		if !candidate[g.Object] {
-			total++
-		}
-	}
-	if note := adt.UnsearchedNote(gaps, total, "object"); note != "" {
+	if note := adtsource.ConfigGapNote(refs, gaps); note != "" {
 		envelope.Notes = append(envelope.Notes, note)
 	}
 
@@ -1147,12 +1160,7 @@ func (s *Server) fetchConfigRefs(ctx context.Context, variable string, doGrep bo
 	if wbErr != nil && crossErr != nil {
 		return nil, nil, fmt.Errorf("neither cross-reference table could be read, so this is not an answer: %v; %v", wbErr, crossErr)
 	}
-	if wbErr != nil {
-		gaps = append(gaps, adt.Unsearched{Object: "WBCROSSGT (object-oriented code)", Reason: wbErr.Error()})
-	}
-	if crossErr != nil {
-		gaps = append(gaps, adt.Unsearched{Object: "CROSS (classic procedural code)", Reason: crossErr.Error()})
-	}
+	gaps = append(gaps, adtsource.TVARVCTableGaps(wbErr, crossErr)...)
 
 	// Step 2: Grep each candidate's source for the variable name
 	var refs []graph.TVARVCReference

@@ -92,3 +92,34 @@ func GrepFailure(res *adt.GrepObjectResult, err error) (reason string, failed bo
 	}
 	return "", false
 }
+
+// TVARVCTableGaps names the cross-reference tables TVARVCReaders could not
+// read, in the words both front ends report them in.
+func TVARVCTableGaps(wbErr, crossErr error) []adt.Unsearched {
+	var gaps []adt.Unsearched
+	if wbErr != nil {
+		gaps = append(gaps, adt.Unsearched{Object: "WBCROSSGT (object-oriented code)", Reason: wbErr.Error()})
+	}
+	if crossErr != nil {
+		gaps = append(gaps, adt.Unsearched{Object: "CROSS (classic procedural code)", Reason: crossErr.Error()})
+	}
+	return gaps
+}
+
+// ConfigGapNote renders the gaps of a TVARVC where-used answer as a note, or
+// "" when there are none. The total is every candidate plus every table that
+// could not be asked: a candidate whose source could not be read is both a
+// reader row and a gap, and is counted once.
+func ConfigGapNote(refs []graph.TVARVCReference, gaps []adt.Unsearched) string {
+	total := len(refs)
+	candidate := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		candidate[r.ObjectType+" "+r.ObjectName] = true
+	}
+	for _, g := range gaps {
+		if !candidate[g.Object] {
+			total++
+		}
+	}
+	return adt.UnsearchedNote(gaps, total, "object")
+}
