@@ -427,8 +427,12 @@ var readOnlyClasses = map[string]surfaceClass{
 	"SAP query TABL_CONTENTS":             clsRead, "SAP query SQL": clsRead, "SAP query SQL table": clsRead,
 	"SAP query (no params)":   clsRead,
 	"SAP query SQL in target": clsRead, "SAP query table in target": clsRead,
-	"SAP search":       clsRead,
-	"SAP grep package": clsRead, "SAP grep packages": clsRead, "SAP grep object": clsRead,
+	// A statement on a table read is free SQL: --block-free-sql governs it
+	// (GetTableContents), not --read-only.
+	"SAP query table in target with sql": clsRead, "SAP query TABL with sql": clsRead,
+	"SAP query TABL_CONTENTS with sql": clsRead,
+	"SAP search":                       clsRead,
+	"SAP grep package":                 clsRead, "SAP grep packages": clsRead, "SAP grep object": clsRead,
 	"SAP grep objects": clsRead, "SAP grep (no target)": clsRead,
 
 	// --- SAP(): edit ---
@@ -589,6 +593,10 @@ var readOnlyClasses = map[string]surfaceClass{
 	"SAP system type=system_info":             clsRead,
 	"SAP system type=installed_components":    clsRead,
 	"SAP system type=connection_info":         clsRead,
+	"SAP system type=info":                    clsRead,
+	"SAP system type=components":              clsRead,
+	"SAP system type=connection":              clsRead,
+	"SAP system type=features":                clsRead,
 	"SAP system type=git_types":               clsRead,
 	"SAP system type=git_export":              clsRead,
 	"SAP system type=git_import_zip":          clsMutate, // abapGit deserialize into a package, as a background job
@@ -1006,6 +1014,9 @@ func actionCases() []actionCase {
 		{Name: "SAP query (no params)", Action: "query", Exact: true},
 		{Name: "SAP query SQL in target", Action: "query", Target: "SELECT * FROM T000", Exact: true},
 		{Name: "SAP query table in target", Action: "query", Target: "T000", Exact: true},
+		{Name: "SAP query table in target with sql", Action: "query", Target: "T000", Exact: true, Params: kv("sql", "SELECT * FROM T000")},
+		{Name: "SAP query TABL with sql", Action: "query", Target: "TABL T000", Exact: true, Params: kv("sql", "SELECT * FROM T000")},
+		{Name: "SAP query TABL_CONTENTS with sql", Action: "query", Target: "TABL_CONTENTS T000", Exact: true, Params: kv("sql", "SELECT * FROM T000")},
 
 		// search and grep
 		{Name: "SAP search", Action: "search", Target: "ZDEMO*", Exact: true},
@@ -1119,6 +1130,10 @@ func actionCases() []actionCase {
 		{Name: "SAP system type=system_info", Action: "system", Exact: true, Params: kv("type", "system_info")},
 		{Name: "SAP system type=installed_components", Action: "system", Exact: true, Params: kv("type", "installed_components")},
 		{Name: "SAP system type=connection_info", Action: "system", Exact: true, Params: kv("type", "connection_info")},
+		{Name: "SAP system type=info", Action: "system", Exact: true, Params: kv("type", "info")},
+		{Name: "SAP system type=components", Action: "system", Exact: true, Params: kv("type", "components")},
+		{Name: "SAP system type=connection", Action: "system", Exact: true, Params: kv("type", "connection")},
+		{Name: "SAP system type=features", Action: "system", Exact: true, Params: kv("type", "features")},
 		sys("git_types", "GitTypes"), sys("git_export", "GitExport"),
 		{Name: "SAP system type=git_import_zip", Action: "system", Exact: true, Params: kv("type", "git_import_zip", "file_path", "demo.zip", "package", "$TMP")},
 		{Name: "SAP system type=git_import_zip base64", Action: "system", Exact: true, Params: kv("type", "git_import_zip",

@@ -218,6 +218,8 @@ Free SQL (ABAP SQL, read in the logon client):
   SAP(action="query", target="SELECT * FROM T000")
       the statement may be the target; one passed in params ("sql_query", "sql", "query"
       or "statement") wins over it
+  --block-free-sql refuses a statement in every form, a table read that carries one
+  included; a table read without one stays allowed.
 
 The data preview wraps the statement in its own SELECT ... INTO, so it takes
 ABAP SQL only. vsp rewrites the common ANSI spellings before sending -- t.col to

@@ -20,7 +20,7 @@ import (
 // handler now gates before it locks, as UpdateSource's deploy path does.
 
 type deleteCall struct {
-	method, path, action, sessionType string
+	method, path, action, sessionType, lockHandle string
 }
 
 func (c deleteCall) String() string {
@@ -28,6 +28,13 @@ func (c deleteCall) String() string {
 }
 
 func newDeleteTestServer(t *testing.T, pkg string) (*Server, func() []deleteCall) {
+	t.Helper()
+	return newDeleteTestServerWith(t, pkg, nil)
+}
+
+// newDeleteTestServerWith is newDeleteTestServer with an override: when
+// override answers true it has written the response itself.
+func newDeleteTestServerWith(t *testing.T, pkg string, override func(w http.ResponseWriter, r *http.Request) bool) (*Server, func() []deleteCall) {
 	t.Helper()
 	var mu sync.Mutex
 	var calls []deleteCall
@@ -39,10 +46,14 @@ func newDeleteTestServer(t *testing.T, pkg string) (*Server, func() []deleteCall
 			path:        r.URL.Path,
 			action:      r.URL.Query().Get("_action"),
 			sessionType: r.Header.Get("X-sap-adt-sessiontype"),
+			lockHandle:  r.URL.Query().Get("lockHandle"),
 		})
 		mu.Unlock()
 
 		w.Header().Set("X-CSRF-Token", "TOKEN")
+		if override != nil && override(w, r) {
+			return
+		}
 		switch {
 		case strings.Contains(r.URL.Path, "informationsystem/search"):
 			_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>
@@ -265,7 +276,6 @@ func TestDeleteURLByName(t *testing.T) {
 		{"INCL", "ZDEMO_TOP", "", "/sap/bc/adt/programs/includes/ZDEMO_TOP"},
 		{"FUNC", "Z_DEMO_FM", "ZDEMO_FG", "/sap/bc/adt/functions/groups/ZDEMO_FG/fmodules/Z_DEMO_FM"},
 		{"STRUCT", "ZDEMO_S", "", "/sap/bc/adt/ddic/structures/zdemo_s"},
-		{"DEVC", "$ZDEMO", "", "/sap/bc/adt/packages/$ZDEMO"},
 	} {
 		got, ok := deleteURLByName(tc.typ, tc.name, tc.parent)
 		if !ok || got != tc.want {
@@ -280,5 +290,109 @@ func TestDeleteURLByName(t *testing.T) {
 		if got, ok := deleteURLByName(typ, "ZDEMO", parent); !ok || !strings.HasPrefix(got, "/sap/bc/adt/") {
 			t.Errorf("%s is listed as deletable by name but has no URL: %q", typ, got)
 		}
+	}
+}
+
+// The expert DeleteObject tool with a lock_handle from an earlier call: the
+// caller holds that lock, so the handler sends the DELETE with it and takes
+// no lock of its own and releases none.
+func TestHandleDeleteObject_SuppliedHandleNoLockNoUnlock(t *testing.T) {
+	server, trace := newDeleteTestServer(t, "$TMP")
+	res, err := server.handleDeleteObject(context.Background(), newRequest(map[string]any{
+		"object_url":  "/sap/bc/adt/programs/programs/ZDEMO_DEL",
+		"lock_handle": "CALLER-HANDLE",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := trace()
+	if res.IsError {
+		dumpDeleteCalls(t, calls)
+		t.Fatalf("delete failed: %s", resultText(res))
+	}
+	deletes := 0
+	for i, c := range calls {
+		switch {
+		case c.action == "LOCK" || c.action == "UNLOCK":
+			t.Errorf("a supplied handle must not be locked or released by the handler: [%d] %s", i, c)
+		case c.method == http.MethodDelete:
+			deletes++
+			if c.lockHandle != "CALLER-HANDLE" {
+				t.Errorf("DELETE carried lockHandle %q, want the caller's", c.lockHandle)
+			}
+		}
+	}
+	if deletes != 1 {
+		dumpDeleteCalls(t, calls)
+		t.Errorf("%d DELETEs, want 1", deletes)
+	}
+}
+
+// When the UNLOCK after a successful DELETE fails, the answer says the object
+// is deleted and the lock may stay, once each.
+func TestHandleDeleteObject_FailedUnlockAfterDeleteSaidOnce(t *testing.T) {
+	server, _ := newDeleteTestServerWith(t, "$TMP", func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodPost && r.URL.Query().Get("_action") == "UNLOCK" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return true
+		}
+		return false
+	})
+	text, isErr := universalDelete(t, server, "PROG ZDEMO_DEL", nil)
+	if isErr {
+		t.Fatalf("the DELETE succeeded; a failed UNLOCK after it is a note, not an error: %s", text)
+	}
+	if !strings.Contains(text, "may stay in SM12") {
+		t.Errorf("want the stranded-lock note, got: %s", text)
+	}
+	if strings.Count(strings.ToLower(text), "deleted") != 1 {
+		t.Errorf("\"deleted\" said more than once: %s", text)
+	}
+}
+
+// delete FUNC <name> without a group looks the group up; when the search
+// finds no such module the answer says to pass parent, and nothing is
+// locked or deleted.
+func TestUniversalDeleteFUNCLookupFails(t *testing.T) {
+	server, trace := newDeleteTestServer(t, "$TMP") // the search answers a PROG, never a FUGR/FF
+	text, isErr := universalDelete(t, server, "FUNC Z_DEMO_FM", nil)
+	if !isErr || !strings.Contains(text, `"parent"`) {
+		t.Errorf("want a refusal that names params.parent, got: %s", text)
+	}
+	for i, c := range trace() {
+		if c.action == "LOCK" || c.method == http.MethodDelete {
+			t.Errorf("a module whose group was not found was touched: [%d] %s", i, c)
+		}
+	}
+}
+
+// Names that are not object names are refused before a URL is built from
+// them: a dot segment or a space would address something else.
+func TestUniversalDeleteRefusesBadNames(t *testing.T) {
+	server, trace := newDeleteTestServer(t, "$TMP")
+	for _, target := range []string{"PROG .", "PROG ..", "CLAS ZCL_A ZCL_B", "PROG Z?X", "PROG ZA%2FB", "PROG ../ZX", "PROG //"} {
+		text, isErr := universalDelete(t, server, target, nil)
+		if !isErr || !strings.Contains(text, "not an object name") {
+			t.Errorf("%s: want a refusal of the name, got: %s", target, text)
+		}
+	}
+	for i, c := range trace() {
+		if c.action == "LOCK" || c.method == http.MethodDelete || strings.Contains(c.path, "search") {
+			t.Errorf("a refused name reached SAP: [%d] %s", i, c)
+		}
+	}
+	for _, name := range []string{"ZDEMO", "/NS/CL_X", "$ZPKG_1", "Z_DEMO_FM"} {
+		if !validDeleteName(name) {
+			t.Errorf("validDeleteName(%q) = false; it is an object name", name)
+		}
+	}
+}
+
+// DEVC is not deleted by name: which package --allowed-packages checks for a
+// package (itself or its parent) is not pinned, so the by-name form is not
+// offered for it.
+func TestUniversalDeleteDEVCNotByName(t *testing.T) {
+	if deletableByName("DEVC") {
+		t.Fatal("DEVC is deletable by name")
 	}
 }

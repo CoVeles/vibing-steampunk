@@ -223,7 +223,7 @@ var helpUnadvertised = map[string]string{
 	"text_pool":             "alias of i18n op=texts_get",
 	"write_text_pool":       "alias of i18n op=texts_set",
 	"write_labels":          "refuses by design (help i18n says why); no call is shown for it",
-	"recover_failed_create": "operator recovery that deletes the named object, gated behind SAP_ENABLE_LOCK_ADMIN; not offered to a model",
+	"recover_failed_create": "operator recovery that deletes the named object if it exists; not offered to a model",
 	"coverage":              "takes an object URL as target, which parseTarget upper-cases; not shown until that form is verified",
 	"api_state":             "takes an object URL as target, which parseTarget upper-cases; not shown until that form is verified",
 	"ui5_list_apps":         "params.type spelling of read target=\"UI5_LIST\"",

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -656,8 +657,14 @@ func (s *Server) handleDeleteObject(ctx context.Context, request mcp.CallToolReq
 
 // deleteNameTypes are the target types delete <TYPE> <NAME> resolves to an
 // ADT URL without a lookup (FUNC looks up its group when none is given).
+//
+// DEVC is left out on purpose: whether --allowed-packages judges a package
+// by its own name or by its parent's has not been pinned, and a delete gate
+// that may be checking the wrong package is not one to hand a model. A
+// package is still deleted by URL (delete OBJECT), or by git_delete_objects
+// when empty.
 var deleteNameTypes = []string{
-	"PROG", "INCL", "CLAS", "INTF", "FUGR", "FUNC", "DEVC", "TABL", "STRUCT", "DTEL", "DOMA",
+	"PROG", "INCL", "CLAS", "INTF", "FUGR", "FUNC", "TABL", "STRUCT", "DTEL", "DOMA",
 	"TTYP", "DDLS", "DCLS", "BDEF", "SRVD", "SRVB", "MSAG", "XSLT",
 }
 
@@ -672,6 +679,17 @@ func deletableByName(objectType string) bool {
 		}
 	}
 	return false
+}
+
+// deleteNameRe is what an object name delete <TYPE> <NAME> accepts: letters,
+// digits, _, $ and the / of a namespace. Nothing else -- not a dot, a space or
+// a percent sign -- so the name can only ever be one path segment's worth of
+// object, never a way to address something else.
+var deleteNameRe = regexp.MustCompile(`^[A-Z0-9_/$]*[A-Z0-9][A-Z0-9_/$]*$`)
+
+// validDeleteName reports whether name may go into a delete URL.
+func validDeleteName(name string) bool {
+	return deleteNameRe.MatchString(strings.ToUpper(name))
 }
 
 // deleteURLByName is the ADT URL delete <TYPE> <NAME> deletes at. parent is
@@ -707,6 +725,11 @@ func (s *Server) handleDeleteByName(ctx context.Context, request mcp.CallToolReq
 		return newToolResultError(fmt.Sprintf("Failed to delete object: %v", err)), nil
 	}
 	parent := firstParam(args, "parent", "parent_name", "function_group")
+	for _, n := range []string{name, parent} {
+		if n != "" && !validDeleteName(n) {
+			return newToolResultError(fmt.Sprintf("delete: %q is not an object name (letters, digits, _, $ and a namespace's /)", n)), nil
+		}
+	}
 	if objectType == "FUNC" && parent == "" {
 		group, err := s.adtClient.ResolveFunctionGroup(ctx, name)
 		if err != nil {
