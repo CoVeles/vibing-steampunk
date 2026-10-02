@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"encoding/json"
@@ -346,6 +348,7 @@ func init() {
 	// Execute flags
 	executeCmd.Flags().String("file", "", "Read ABAP code from file")
 	executeCmd.Flags().Bool("stdin", false, "Read ABAP code from stdin")
+	executeCmd.Flags().Bool("json", false, "Print the result as JSON, the same object the execute_abap MCP tool answers (result_text, output, failure, ...)")
 	executeCmd.Flags().Bool("no-dump-check", false, "Do not look in ST22 for a runtime error this run may have caused")
 	executeCmd.Flags().Duration("dump-wait", 2*time.Second, "How long to keep looking for that runtime error after the code returns")
 
@@ -647,7 +650,10 @@ func runExecute(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	ctx := context.Background()
+	// Ctrl-C cancels the run rather than killing the process, so ExecuteABAP
+	// gets to run its deferred delete of the temporary program.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// What ST22 already held before any of this ran. It has to be read first —
 	// afterwards there is no way to tell an old dump from a new one — and it is
@@ -672,7 +678,17 @@ func runExecute(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("execute failed: %w\n\nNote: ExecuteABAP wraps code in a unit test class.\nFor advanced execution, use ZADT_VSP WebSocket (vsp install zadt-vsp)", err)
 	}
 
-	if len(result.Output) > 0 {
+	// Every value, whole and in order, one per line: a value is never cut, and
+	// a script reading stdout gets exactly what the code returned. --json gives
+	// the MCP tool's object instead, for a caller that needs to tell one value
+	// with a line break in it from two.
+	if asJSON, _ := cmd.Flags().GetBool("json"); asJSON {
+		out, jerr := adt.IndentJSON(result.Lean())
+		if jerr != nil {
+			return fmt.Errorf("could not encode the result: %w", jerr)
+		}
+		fmt.Println(string(out))
+	} else {
 		for _, line := range result.Output {
 			fmt.Println(line)
 		}
@@ -706,9 +722,13 @@ func runExecute(cmd *cobra.Command, args []string) error {
 		reportDumpsAfterRun(dumped, result.ProgramName, watch.User)
 	}
 
-	// The exit code is the part scripts read, so both kinds of failure have to
-	// reach it. The detail is on stderr already; this only has to be short and
-	// true.
+	return executeExitError(result, dumped)
+}
+
+// executeExitError is what `vsp execute` exits with. The exit code is the part
+// scripts read, so every kind of failure has to reach it. The detail is on
+// stderr already; this only has to be short and true.
+func executeExitError(result *adt.ExecuteABAPResult, dumped []adt.Dump) error {
 	switch {
 	case result.Failure != nil && result.Failure.Kind == adt.ExecuteFailureSyntax:
 		// Said apart from "did not finish", because it did not start. That
@@ -723,6 +743,15 @@ func runExecute(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("the code did not finish")
 	case len(dumped) > 0:
 		return fmt.Errorf("a runtime error appeared while this ran")
+	case result.Success && !result.CleanedUp:
+		// The code ran, but the temporary program is still in $TMP (the CLI
+		// never asks to keep it); the warning naming it is on stderr.
+		return fmt.Errorf("the code ran, but its temporary program %s was not deleted", result.ProgramName)
+	case !result.Success:
+		// No failure from the run, because there was no run: the temporary
+		// program could not be created, locked, written or activated. Its
+		// message is already on stderr; exiting 0 would call that a success.
+		return fmt.Errorf("the code did not run")
 	}
 	return nil
 }
@@ -883,12 +912,12 @@ func runGraph(cmd *cobra.Command, args []string) error {
 	// succeeded.
 	switch direction {
 	case "callers":
-		callers, err := whereUsedCallers(ctx, client, objURI)
+		callers, unresolved, err := whereUsedCallers(ctx, client, objURI)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "The where-used list could not be read (%v); falling back to the cross-reference tables.\n\n", err)
 			return graphFromCross(ctx, client, name, objType, "callers")
 		}
-		printWhereUsedCallers(callers)
+		printWhereUsedCallers(callers, unresolved)
 		return nil
 	case "both":
 		fmt.Println("=== CALLEES (what this uses) ===")
@@ -896,12 +925,12 @@ func runGraph(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		fmt.Println("\n=== CALLERS (what uses this) ===")
-		callers, err := whereUsedCallers(ctx, client, objURI)
+		callers, unresolved, err := whereUsedCallers(ctx, client, objURI)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "The where-used list could not be read (%v); falling back to the cross-reference tables.\n\n", err)
 			return graphFromCross(ctx, client, name, objType, "callers")
 		}
-		printWhereUsedCallers(callers)
+		printWhereUsedCallers(callers, unresolved)
 		return nil
 	default: // callees
 		return printCalleesOf(ctx, client, objURI, name, objType)
@@ -1127,11 +1156,16 @@ func crossToADTType(crossType string) string {
 }
 
 // whereUsedCallers asks the SE84 where-used list who calls an object.
-func whereUsedCallers(ctx context.Context, client *adt.Client, objURI string) ([]adt.ExposedCaller, error) {
+func whereUsedCallers(ctx context.Context, client *adt.Client, objURI string) ([]adt.ExposedCaller, []adt.Unsearched, error) {
 	return client.WhereUsed(ctx, objURI)
 }
 
-func printWhereUsedCallers(callers []adt.ExposedCaller) {
+func printWhereUsedCallers(callers []adt.ExposedCaller, unresolved []adt.Unsearched) {
+	// Printed ahead of the table, as the callee gap is: an include standing in
+	// for its program is still a caller, but the list is not the whole answer.
+	if note := adt.UnresolvedIncludesNote(unresolved); note != "" {
+		fmt.Printf("%s\n\n", note)
+	}
 	if len(callers) == 0 {
 		// Checked live: a name that does not exist gets the same 200 and the
 		// same empty list as a real object nobody calls. The list cannot tell

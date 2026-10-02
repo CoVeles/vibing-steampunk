@@ -529,6 +529,143 @@ under `--read-only`. If the buffer add fails while the request is certainly not 
 buffer, the two files this upload wrote are deleted again. Taking a request
 out of the queue again is done in STMS.
 
+**Import an abapGit zip** into a package in one call, with the abapGit
+installed on the system: an offline repository for the package, abapGit's
+deserialize checks, deserialize, activation -- and back come the outcome,
+abapGit's errors and warnings, the TADIR rows created or changed and the
+repository key. `git delete-objects` undoes it item by item.
+
+```bash
+vsp -s devsys git import-zip ./demo.zip --package '$ZDEMO'               # waits up to --wait (5m) for the job
+vsp -s devsys git import-zip ./demo.zip --package '$ZDEMO' --overwrite   # into its existing offline repository, overwriting
+vsp -s devsys git import-status 12345678                                 # a job still running, read-only
+vsp -s devsys git delete-objects --package '$ZDEMO' "PROG ZDEMO_REPORT" "CLAS ZCL_DEMO"
+vsp -s devsys git delete-objects --package '$ZDEMO' --delete-repo "PROG ZDEMO_REPORT"   # and unregister its offline repository
+vsp -s devsys git object-versions --package '$ZDEMO' "CLAS ZCL_DEMO" --sha256          # read-only: the versions to expect
+vsp -s devsys git delete-objects --package '$ZDEMO' "CLAS ZCL_DEMO" \
+    --expect "CLAS ZCL_DEMO sha256=<from object-versions --sha256>"                     # only while it is still that version
+```
+
+MCP: `system` with `git_import_zip` (`file_path` or `zip_base64`, `package`,
+`repo_name`, `overwrite`, `transport`, `wait_seconds`), the read-only
+`git_import_status` (`job`), `git_delete_objects` (`package`, `objects`,
+`delete_repo`, `expect_repo`), and the read-only `git_object_versions`
+(`package`, `objects`, `sha256`).
+
+Nothing that exists is overwritten without `overwrite`, and a package that
+already has a repository is refused without it. A package that exists
+without a repository is imported into without `overwrite`; its own package
+entry is left as it is. `overwrite` also needs deletes allowed
+(`--disallowed-ops` without `D`), since abapGit deletes and recreates an
+object whose type changed. Unmet requirements or APACK
+dependencies, an object of another package, a package move, potential data
+loss, an unsupported object type and table content refuse the import; a
+local object the zip does not have is never deleted. Before a byte is sent,
+vsp reads the zip's `.abapgit.xml` and folders and checks the target package
+and every package the zip maps to against `--allowed-packages`; ZADT_VSP
+checks again that every file maps to one of those packages. A transportable
+package needs `--allow-transportable-edits` and a transport (named, or chosen
+as for any write); a local one takes none, and only a local one is created by
+the import. Refused under `--read-only`.
+
+`git_delete_objects` deletes exactly the listed TADIR items -- each only when
+the package's TADIR has it, each through the same gated delete as any other
+-- then the package itself if nothing and no subpackage is left and no
+abapGit repository is registered for it. Nothing outside the package is
+deleted, a package is never an item, and when an object cannot be deleted
+the repository and the package stay. The repository registered for the
+package (its row: URL, branch, settings) is kept unless `delete_repo: true`
+(`--delete-repo`) is given, and then it is unregistered only if it is offline
+and the package is empty after the deletes; ZADT_VSP checks both again. An
+online repository is never unregistered: `delete_repo` with one is refused
+before anything is deleted. A repository abapGit cannot open counts as
+online, and the package is never deleted while any repository is registered
+for it. Objects are deleted at their own ADT address (an include, a
+structure), looked up by name.
+
+To delete only what is still the version you decided on, read the versions
+first (`git_object_versions`, `vsp git object-versions --sha256`) and pass
+them back: an object `{"type", "name", "expect": {"sha256": ...}}` (or
+`"stamp"`; with both, sha256 decides). vsp takes the object's ADT lock,
+reads its version again while it holds the lock, and deletes it only on a
+match; otherwise its status is `changed`, with what it is now (`observed`),
+and it is kept. A version that cannot be read never matches. Objects are
+checked and deleted one at a time: when one comes back `changed` (or
+`failed`), **the other objects listed are still deleted**; only the
+repository and the package are kept. There is no all-or-nothing mode yet.
+
+The ADT lock is the workbench enqueue: a second ADT session -- even the same
+user's -- is refused while it is held (checked live: `EU 510`), and abapGit's
+import refuses an object with that lock entry. That editors outside ADT (SE38,
+SE24, SE11, SE51 for dynpros, SE41 for GUI status, SE63/SE61 for texts and
+documentation) take the same enqueue for every part they write is expected
+but has not been verified for each of them; anything that writes the tables
+directly, without the enqueue, is not held off by it.
+`expect_repo: {"key", "name"}` (`--expect-repo-key`, `--expect-repo-name`)
+unregisters the repository only when it is exactly that row; otherwise
+`repoNote` is `kept: registered repository is <key> <name>`.
+
+**Use `sha256` when it matters.** It is the SHA-256 (lower-case hex) of the
+UTF-8 text of the lines `<file name>=<SHA-256 of the file>`, one per file
+of the object's abapGit serialisation in its original language only,
+sorted, joined by LF without a final LF -- so it covers everything abapGit
+serialises for the object. It sees only the active version: an object with
+an inactive version (a row of the inactive worklist DWINACTIV for it or a
+part of it, reported as `inactive`) is never a sha256 match, so
+unactivated work is not deleted unnoticed. Reading it serialises the object
+with abapGit, which only reads.
+
+The stamp is cheaper and coarser:
+`v2:<TABLES>:<YYYYMMDDHHMMSS>:<ROWS>:<DIGEST>`, the newest change date and
+time over the object's dated version rows (active and inactive), the number
+of those rows, and the first 16 hex digits of a SHA-256 over the rows of
+some tables that carry no date:
+
+| Type | Dated rows | Digest |
+|------|------------|--------|
+| CLAS, INTF | REPOSRC (every include of the pool but CS, which is regenerated without the source changing), REPOTEXT (text pool) | SEOCLASSDF, SEOCLASSTX, SEOCOMPOTX |
+| PROG | REPOSRC, REPOTEXT (text pool), D020S (dynpro generation) | |
+| TABL | DD02L, DD09L (technical settings), DD12L (indexes) | DD02T, DD35L (search help assignment), TDDAT |
+| DTEL | DD04L | DD04T |
+| DOMA | DD01L | DD01T, DD07L, DD07T |
+| TTYP | DD40L | DD40T |
+| DDLS | DDDDLSRC | DDDDLSRCT |
+
+**What the stamp does not see**, so that a change there alone leaves it as
+it was: documentation (DOKHL/DOKTL) of every type; a program's GUI status
+and titles (EUDB, RSMPTEXTS) and a dynpro changed without being generated;
+a class's or interface's SOTR texts, sub-component texts (SEOSUBCOTX:
+parameter and exception descriptions), relations and friends (SEOMETAREL,
+SEOFRIENDS) and component properties its source does not carry; a table's
+field texts (DD03T), foreign keys (DD05S, DD08L) and search help field
+mapping (DD36M), unless the change also updated a dated row; and two
+changes within the second the stamp was read in. Other types have no stamp.
+
+The stamp also moves where sha256 does not: on a translation in any
+language (it reads the text tables in every language; sha256 covers the
+original language only), and on a dynpro's regeneration (D020S's
+generation date moves without a change). Both give a `changed` where
+nothing sha256 covers changed -- the safe side. Inactive versions are
+looked up by name, whatever the object type, so an inactive DTEL ZFOO also
+marks DOMA ZFOO inactive -- the safe side too. A ZADT_VSP too old to report
+`inactive` makes a sha256 expectation `failed` ("ZADT_VSP too old"), never a
+match.
+
+A zip is refused above 20 MB, 50,000 entries or 200 MB unpacked (its
+declared sizes, checked by vsp and again by ZADT_VSP before abapGit unpacks
+it), and with more than one `.abapgit.xml` at its root. If the import's
+commit gets no answer, the job may be running: vsp says so, and
+`git_import_status` or SM37 (job `ZVSP_GIT_IMPORT`) tells.
+
+abapGit's deserialize commits with `WAIT`, which a ZADT_VSP (APC) session may
+not do (it dumps `APC_ILLEGAL_STATEMENT`), so the import runs as background
+job `ZVSP_GIT_IMPORT` under the caller's user; its outcome is pushed to the
+WebSocket that started it (AMC application `ZVSP_GIT`, channel `/import`) and
+kept a week for `git_import_status`. Needs ZADT_VSP with the git service,
+which `vsp install zadt-vsp` deploys where abapGit is installed (with the job
+program and the AMC application); without abapGit the rest of ZADT_VSP still
+runs.
+
 `vsp update` fetches the latest release for this platform, compares it with
 the running version, verifies the download against the release's
 `checksums.txt`, and puts it in place of the running binary — the old one is
@@ -885,7 +1022,77 @@ Earlier: **[Still Only 5%](articles/2026-08-25-still-five-percent.md)** · **[VS
 
 ## What's New
 
-The headline changes are in the **"New in the last three releases"** callout at the top of this README; the full version history is in [CHANGELOG.md](CHANGELOG.md). Latest release: **[v2.57.0 — the dump's own why](https://github.com/oisee/vibing-steampunk/releases/tag/v2.57.0)**.
+The headline changes are in the **"New in the last three releases"** callout at the top of this README; the full version history is in [CHANGELOG.md](CHANGELOG.md). Latest release: **[v2.58.0 — where the file actually ends](https://github.com/oisee/vibing-steampunk/releases/tag/v2.58.0)**.
+
+### Unreleased — new since v2.58.0
+
+**Transports and change control**
+
+- **Upload a released transport and add it to the import queue — never import.**
+  `vsp transport upload` / `system` `upload_transport` writes the cofile and
+  data file into DIR_TRANS and adds the request to the buffer; the import
+  itself stays a human step in STMS (#296). Also: `transport status`,
+  `transport buffer` and `transport download`.
+- **A transport of copies** of a request, as SE01 builds one (#247); entries
+  added to a request and taken out, as SE09 does (#262); requests filed under
+  a CTS project (#246); a refused release is reported, not swallowed (#248).
+
+**abapGit offline zip import** (#301). `vsp git import-zip` / `system`
+`git_import_zip` imports an abapGit zip with the abapGit already on the
+system, as a background job; `git import-status` reports on it and
+`git delete-objects` removes exactly what it brought. Needs ZADT_VSP and
+abapGit. Every package the zip maps to must pass `--allowed-packages`.
+`git delete-objects` deletes only what is still the version you saw:
+per-object `expect` (sha256, or a coarser stamp), checked under the ADT
+lock, `expect_repo` for the repository row, and the read-only
+`git_object_versions` (`vsp git object-versions`) to read them (#320).
+
+**Code, run and checked**
+
+- **[ExecuteABAP](#executeabap) answers JSON**: `result_text` is the value in
+  full, `RETURN_VALUE( x )` hands back any number of values (structures and
+  tables as JSON), and a run that did not finish says where in your code (#298).
+- **[ABAP Unit results](#abap-unit-results) as JSON** with counts; a class
+  ABAP Unit refused to run is not a pass; `only_failures` for a short answer (#298).
+- **Check a snippet without running it**: `vsp check-abap` / `analyze`
+  `check_abap`, SAP's own syntax check, findings in the snippet's lines (#300).
+- **Long calls take a `timeout`** (seconds), and `--call-timeout` /
+  `SAP_CALL_TIMEOUT` sets the server's default (#299).
+- **Run a report as a background job** from the SAP tool (#261).
+
+**Read and find**
+
+- **Exact-name search**: `params.exact` / `vsp search --exact` (#299).
+- **A package's inventory in one call**: `read` `DEVC $PKG` with
+  `params.inventory` — objects with author and date, subpackages, and its
+  abapGit repository (#299).
+- **An IDoc as WE02 shows it** (#268).
+- **`vsp query`** accepts the common ANSI spellings and explains what SAP
+  refuses (#267).
+
+**Create**
+
+- Domains and data elements (#273), structures and append structures from
+  DDL (#272), message classes with messages in the language asked (#270),
+  and enhancement implementations — source plug-ins and BAdI
+  implementations (#263).
+
+**Fixed**, among others: concurrent callers of one client no longer break
+each other's locks (#251); a cookie-jar race (#229); credentials and the CSRF
+token stay on the SAP host across redirects (#257); namespaced objects and
+function groups (#233, #274, #282); activation of a group with its inactive
+parts (#271); a failed transport download is an error (#302).
+
+**Behaviour changes you may notice:**
+
+- `execute_abap` (MCP) answers JSON instead of text.
+- `vsp execute` exits non-zero when the code did not finish, never ran, or
+  left its temporary program behind; `vsp test` exits non-zero when a test
+  class was not run.
+- `vsp update` follows the repository the binary was released from (#259).
+- `git_delete_objects` refuses an object given as a map with a key other
+  than `type`, `name` and `expect` (a typo such as `expected` used to be
+  ignored) (#320).
 
 ### Unreleased — behaviour changes since v2.58.0
 
@@ -1564,11 +1771,12 @@ SAP_PASSWORD=secret
 | `--sso` | `SAP_SSO` | Browser SSO; re-captures the session when it expires |
 | `--sso-system` | `SAP_SSO_SYSTEM` | Name for the cached session (default: URL host) |
 | `--sso-on-expiry` | `SAP_SSO_ON_EXPIRY` | `window` (default) or `error` when a sign-in is due |
-| `--insecure` | `SAP_INSECURE` | Skip TLS verification |
+| `--insecure` | `SAP_INSECURE` | Skip TLS verification. CLI subcommands on a `.vsp.json` system (`-s` or `default`) use that system's `insecure` setting instead, for ADT calls and the ZADT_VSP WebSocket alike |
 | `--terminal-id` | `SAP_TERMINAL_ID` | SAP GUI terminal ID for cross-tool debugging |
 | `--allow-transportable-edits` | `SAP_ALLOW_TRANSPORTABLE_EDITS` | Enable editing transportable objects |
 | `--allowed-transports` | `SAP_ALLOWED_TRANSPORTS` | Whitelist transports (wildcards: `A4HK*`) |
 | `--allowed-packages` | `SAP_ALLOWED_PACKAGES` | Whitelist packages (wildcards: `Z*,$TMP`) |
+| `--call-timeout` | `SAP_CALL_TIMEOUT` | Default budget in seconds of one long MCP call (ExecuteABAP, ABAP Unit, deploy) without its own `params.timeout`; 1–3600, 0 = none (each SAP request then limited to 60s). An invalid value stops startup |
 
 </details>
 
@@ -1912,9 +2120,64 @@ ExecuteABAP:
     lv_result = lv_msg.
 ```
 
+Several values: call `RETURN_VALUE( x )` once per value (in addition to, or
+instead of, `lv_result`). Each value is handed back the moment it is returned,
+so a later `RETURN`, `CHECK` or exception does not lose it. `x` can be any data
+object: an elementary value comes back as text, a structure or table as JSON,
+a data reference as what it points to, and an object reference as
+`<object CLASS_NAME>`.
+
+The MCP tool (`execute_abap`) answers JSON. `result_text` is the returned value
+in full, unwrapped from SAP's `Critical Assertion Error: '…'`: a string for one
+value, an array for several. The other fields are `success`, `programName`,
+`output` (every value, in order), `executionTime`, `message`, `cleanedUp`,
+`failure` (when the code did not finish) and `rawAlerts` (only when no value
+came back). SAP turns a line break inside a value into `#`.
+
+```json
+{ "success": true, "programName": "ZTEMP_EXEC_12345678",
+  "output": ["20261001", "TESTUSER"], "result_text": ["20261001", "TESTUSER"],
+  "executionTime": 0.41,
+  "message": "Executed successfully, 2 output(s) returned", "cleanedUp": true }
+```
+
+`vsp execute` prints every value whole, one per line; `vsp execute --json`
+prints the same object as the MCP tool.
+
 **Risk levels:** `harmless` (read-only), `dangerous` (write), `critical` (full access)
 
 See [ExecuteABAP Report](reports/2025-12-05-004-execute-abap-implementation.md) for details.
+
+## ABAP Unit results
+
+`RunUnitTests` / `SAP(action="test")` answers JSON:
+
+```json
+{
+  "ok": false,
+  "counts": { "classes": 2, "methods": 3, "passed": 2, "failed": 1, "classFailures": 1, "warnings": 1, "notRun": 0 },
+  "classes": [ { "name": "LTC_CALC", "parentName": "ZCL_DEMO_CALC", "testMethods": [ ... ], ... } ]
+}
+```
+
+- `ok` is true when at least one test method ran, nothing failed and every test
+  class ran; a run in which no test method ran is not ok, and `note` says why.
+- A method fails on a failed assertion or an exception (or any critical/fatal
+  alert). Warnings are counted but do not fail it.
+- A test class with no test method and no failure of its own was not run (most
+  often ABAP Unit refused it for its risk level or duration). It is counted in
+  `notRun`, named in `notRunClasses`, and makes the run not ok, even when
+  another class passed. `vsp test` exits non-zero whenever `ok` is false.
+- `classes` keeps the fields it always had (name, parentName, testMethods with
+  name and alerts: kind, severity, title, details, stack; alerts filed on the
+  class itself, as CLASS_SETUP/CLASS_TEARDOWN failures are).
+- `"only_failures": true` lists only failed methods and classes with alerts of
+  their own, without URIs or stacks (`at` is where the alert was raised); the
+  counts still cover the whole run, so a green run is just `ok` + `counts`.
+- `include_dangerous` runs RISK LEVEL DANGEROUS/CRITICAL tests and is refused
+  under `--read-only`.
+
+CLI: `vsp test CLAS ZCL_X --only-failures`, `vsp test CLAS ZCL_X --json`.
 
 ## AI-Powered Root Cause Analysis
 
@@ -2075,7 +2338,29 @@ make build-all      # All 9 platforms
 # Test (go.mod pins toolchain go1.26.8)
 go test ./...                              # Unit tests (1354)
 go test -tags=integration -v ./pkg/adt/    # Integration tests (34+)
+
+# Lint and metrics, as CI runs them
+make lint                                  # correctness linters, new code since origin/main
+make lint-full                             # every linter, whole tree (advisory debt count)
+make metrics                               # size and complexity, as in the PR report
 ```
+
+**What CI blocks on.** Build, vet, tests, and the `lint` gate are blocking. The
+gate runs correctness linters (errcheck, govet, staticcheck SA, unused,
+ineffassign) on new code only. Complexity, size and style are never red in CI:
+the PR report shows them as advisory drift.
+
+**Opt-in pre-push hook.** It runs the same gate before a push, using the pinned
+golangci-lint version from `.github/workflows/ci.yml`, and blocks on a finding.
+It also warns, in yellow, about new or changed functions over the complexity
+thresholds (cyclomatic 30, cognitive 40, 150 lines). Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2   # if not installed
+```
+
+Skip it for one push with `git push --no-verify`.
 
 <details>
 <summary><strong>Architecture</strong></summary>
