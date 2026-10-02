@@ -60,9 +60,12 @@ func (v *versionsWS) SendDomainRequest(ctx context.Context, domain, action strin
 		if !ok {
 			a = map[string]any{"devclass": "$ZOTHER", "in_package": false}
 		}
-		m := map[string]any{"type": typ, "name": name, "devclass": "$ZDEMO", "in_package": true}
+		m := map[string]any{"type": typ, "name": name, "devclass": "$ZDEMO", "in_package": true, "inactive": false}
 		for k, x := range a {
 			m[k] = x
+		}
+		if m["inactive"] == "absent" { // a ZADT_VSP that predates the field
+			delete(m, "inactive")
 		}
 		out = append(out, m)
 	}
@@ -207,6 +210,10 @@ func TestDeleteGitObjectsExpectNeverOnUncertainty(t *testing.T) {
 		{"stamp matches, sha differs", map[string]any{"stamp": stampOld, "sha256": shaNew}, nil, GitExpect{Stamp: stampOld, SHA256: shaOld}, "changed", true},
 		// sha256 sees the active version only: unactivated work is never a match.
 		{"sha matches, inactive version", map[string]any{"sha256": shaOld, "inactive": true}, nil, GitExpect{SHA256: shaOld}, "changed", true},
+		// A ZADT_VSP that does not say whether it is inactive: unknown, never a match.
+		{"sha matches, inactive not reported", map[string]any{"sha256": shaOld, "inactive": "absent"}, nil, GitExpect{SHA256: shaOld}, "failed", true},
+		{"stamp and sha match, inactive not reported", map[string]any{"stamp": stampOld, "sha256": shaOld, "inactive": "absent"}, nil, GitExpect{Stamp: stampOld, SHA256: shaOld}, "failed", true},
+		{"stamp only, inactive not reported", map[string]any{"stamp": stampOld, "inactive": "absent"}, nil, GitExpect{Stamp: stampOld}, "deleted", false},
 		{"stamp and sha match, inactive version", map[string]any{"stamp": stampOld, "sha256": shaOld, "inactive": true}, nil, GitExpect{Stamp: stampOld, SHA256: shaOld}, "changed", true},
 		{"sha only, matches", map[string]any{"sha256": strings.ToUpper(shaOld)}, nil, GitExpect{SHA256: shaOld}, "deleted", true},
 		{"sha only, differs", map[string]any{"sha256": shaNew}, nil, GitExpect{SHA256: shaOld}, "changed", true},
@@ -227,6 +234,9 @@ func TestDeleteGitObjectsExpectNeverOnUncertainty(t *testing.T) {
 		}
 		if got := res.Objects[0].Status; got != c.status {
 			t.Errorf("%s: %s (%s); want %s", c.name, got, res.Objects[0].Reason, c.status)
+		}
+		if strings.Contains(c.name, "inactive not reported") && c.status == "failed" && !strings.Contains(res.Objects[0].Reason, "too old") {
+			t.Errorf("%s: reason %q; want ZADT_VSP too old", c.name, res.Objects[0].Reason)
 		}
 		deleted := len(deletedPaths(rec.snapshot())) > 0
 		if deleted != (c.status == "deleted") {
@@ -403,7 +413,7 @@ func TestGitObjectVersions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err) // read-only does not refuse a read
 	}
-	if len(vs) != 2 || vs[0].Stamp != clasStamp || !vs[0].Inactive || vs[1].Inactive || vs[0].SHA256 != shaOld || !vs[0].InPackage || vs[1].InPackage || vs[1].Package != "$ZOTHER" {
+	if len(vs) != 2 || vs[0].Stamp != clasStamp || vs[0].Inactive == nil || !*vs[0].Inactive || vs[1].Inactive == nil || *vs[1].Inactive || vs[0].SHA256 != shaOld || !vs[0].InPackage || vs[1].InPackage || vs[1].Package != "$ZOTHER" {
 		t.Errorf("versions %+v", vs)
 	}
 	if c := ws.calls(); len(c) != 1 || c[0].objects != "CLAS ZCL_DEMO,PROG ZGONE" || !c[0].sha {

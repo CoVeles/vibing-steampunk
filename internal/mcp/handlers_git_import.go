@@ -293,8 +293,9 @@ func (s *Server) handleGitDeleteObjects(ctx context.Context, request mcp.CallToo
 //	SAP(action="system", params={"type": "git_object_versions", "package": "$ZDEMO",
 //	    "objects": ["CLAS ZCL_DEMO", "PROG ZDEMO_REPORT"], "sha256": true})
 //
-// stamp is v1:<TABLE>:<YYYYMMDDHHMMSS>:<ROWS> (see pkg/adt/git_versions.go);
-// sha256, only when asked, is over the object's abapGit serialisation.
+// stamp is v2:<TABLES>:<YYYYMMDDHHMMSS>:<ROWS>:<DIGEST> (see
+// pkg/adt/git_versions.go); sha256, only when asked, is over the object's
+// abapGit serialisation, and "inactive" says it has an inactive version.
 func (s *Server) handleGitObjectVersions(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := request.GetArguments()
 	pkg := getStringParam(args, "package")

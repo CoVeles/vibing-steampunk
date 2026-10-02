@@ -815,6 +815,11 @@ func checkGitPolicy(stmts []string) []string {
 	// version only for an object of this package; its stamp and hash as
 	// documented.
 	need("HANDLE_OBJECT_VERSIONS", gitObjectVersions, "object_versions must refuse a bad package, a package without S_DEVELOP display, too many or malformed objects, and read a version only for an object of this package")
+	// Every answer says whether the object is inactive: Go treats a missing
+	// "inactive" as unknown and refuses a sha256 match on it.
+	if ov := methodStatements(stmts, "HANDLE_OBJECT_VERSIONS"); !strings.Contains(normStmt(strings.Join(ov, " ")), "( ZCL_VSP_UTILS=>JSON_BOOL( IV_KEY = 'INACTIVE' IV_VALUE = LV_INACTIVE ) )") {
+		bad = append(bad, "object_versions must answer inactive for every object")
+	}
 	if !strings.Contains(up, "\nCONSTANTS C_MAX_VERSIONS TYPE I VALUE 500\n") {
 		bad = append(bad, "object_versions' limit must be CONSTANTS c_max_versions TYPE i VALUE 500")
 	}
@@ -1058,6 +1063,8 @@ func TestGitServiceGuardBites(t *testing.T) {
 		"object_inactive: parts ignored": {"      IF ls_inactive-obj_name = iv_name OR ls_inactive-obj_name(30) = iv_name OR",
 			"      IF ls_inactive-obj_name = iv_name OR"},
 		"object_inactive: never inactive":        {"        rv_inactive = abap_true.\n        RETURN.", "        RETURN."},
+		"object_versions: inactive key dropped":  {"        ( zcl_vsp_utils=>json_bool( iv_key = 'inactive' iv_value = lv_inactive ) )\n", ""},
+		"object_versions: inactive key renamed":  {"json_bool( iv_key = 'inactive' iv_value = lv_inactive )", "json_bool( iv_key = 'is_inactive' iv_value = lv_inactive )"},
 		"object_versions: inactive not reported": {"        lv_inactive = object_inactive( iv_type = lv_type iv_name = lv_name ).\n", ""},
 		"object_stamp: unsupported type stamped": {"        ev_error = |no stamp for type { iv_type }: only CLAS, INTF, PROG, TABL, DTEL, DOMA, TTYP and DDLS have one|.\n        RETURN.",
 			"        ev_stamp = `v1:NONE:00000000000000:0`.\n        RETURN."},

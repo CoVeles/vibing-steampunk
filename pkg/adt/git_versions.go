@@ -51,11 +51,19 @@ import (
 // other relations (SEOMETAREL, SEOFRIENDS), and component definitions
 // beyond what their source carries; a table's field texts (DD03T),
 // foreign keys (DD05S/DD08L) and enhancement category beyond DD02L's date;
-// a search help's field mapping (DD36M). A change only there leaves the
+// a search help's field mapping (DD36M); sub-component texts (SEOSUBCOTX,
+// e.g. parameter and exception descriptions). A change only there leaves the
 // stamp as it was: expect sha256 when such changes must not be deleted.
 // CS (the class's whole-source include) is left out on purpose: it is
 // regenerated and moves without the source changing. The resolution of the
-// date part is a second.
+// date part is a second. The stamp also moves on things sha256 does not
+// see -- a translation in any language (the text tables are read for every
+// language), and D020S's generation date, which a dynpro regeneration moves
+// without a change -- so it can say "changed" where nothing that sha256
+// covers changed. That errs on the safe side. Inactive versions are found
+// by name in DWINACTIV, whatever the object type: an inactive object of
+// another type with the same name (DTEL ZFOO for DOMA ZFOO) also counts,
+// which again only errs on the safe side.
 
 // GitExpect is the version of an object a caller saw. With sha256, sha256
 // decides (and the stamp is only reported); otherwise the stamp. A version
@@ -270,8 +278,10 @@ type GitObjectVersion struct {
 	SHA256Error string `json:"sha256Error,omitempty"`
 	// Files is the number of files the sha256 is over.
 	Files int `json:"files,omitempty"`
-	// Inactive: the object or a part of it has an inactive version.
-	Inactive bool `json:"inactive,omitempty"`
+	// Inactive: the object or a part of it has an inactive version. nil
+	// when ZADT_VSP did not say (one that predates the field): unknown,
+	// never "no".
+	Inactive *bool `json:"inactive,omitempty"`
 }
 
 type gitVersionsAnswer struct {
@@ -285,7 +295,7 @@ type gitVersionsAnswer struct {
 		SHA256      string `json:"sha256"`
 		SHA256Error string `json:"sha256_error"`
 		Files       int    `json:"files"`
-		Inactive    bool   `json:"inactive"`
+		Inactive    *bool  `json:"inactive"`
 	} `json:"objects"`
 }
 
@@ -381,7 +391,10 @@ func (c *Client) checkGitExpect(ctx context.Context, ws GitService, pkg string, 
 		switch {
 		case v.SHA256Error != "":
 			return obs, fmt.Errorf("its sha256 could not be read (%s), so it was not deleted", v.SHA256Error)
-		case v.Inactive:
+		case v.Inactive == nil:
+			// An older ZADT_VSP does not say; unknown is never "active only".
+			return obs, errors.New("ZADT_VSP too old to say whether it has an inactive version, which its sha256 does not cover: reinstall it (vsp install zadt-vsp); not deleted")
+		case *v.Inactive:
 			changed.Inactive = true
 			return obs, changed
 		case v.SHA256 == "" || v.SHA256 != exp.SHA256:

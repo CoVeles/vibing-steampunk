@@ -414,7 +414,7 @@ and other parts (the README lists them). Its resolution is a second.
 				fmt.Printf("%s %s\tin package %s, not %s\n", v.Type, v.Name, v.Package, strings.ToUpper(pkg))
 			default:
 				fmt.Printf("%s %s\tstamp=%s%s", v.Type, v.Name, orDash(v.Stamp), errNote(v.StampError))
-				if v.Inactive {
+				if v.Inactive != nil && *v.Inactive {
 					fmt.Print("\tinactive")
 				}
 				if withSHA {

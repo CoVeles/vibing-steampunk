@@ -634,11 +634,22 @@ some tables that carry no date:
 **What the stamp does not see**, so that a change there alone leaves it as
 it was: documentation (DOKHL/DOKTL) of every type; a program's GUI status
 and titles (EUDB, RSMPTEXTS) and a dynpro changed without being generated;
-a class's or interface's SOTR texts, relations and friends (SEOMETAREL,
+a class's or interface's SOTR texts, sub-component texts (SEOSUBCOTX:
+parameter and exception descriptions), relations and friends (SEOMETAREL,
 SEOFRIENDS) and component properties its source does not carry; a table's
 field texts (DD03T), foreign keys (DD05S, DD08L) and search help field
 mapping (DD36M), unless the change also updated a dated row; and two
 changes within the second the stamp was read in. Other types have no stamp.
+
+The stamp also moves where sha256 does not: on a translation in any
+language (it reads the text tables in every language; sha256 covers the
+original language only), and on a dynpro's regeneration (D020S's
+generation date moves without a change). Both give a `changed` where
+nothing sha256 covers changed -- the safe side. Inactive versions are
+looked up by name, whatever the object type, so an inactive DTEL ZFOO also
+marks DOMA ZFOO inactive -- the safe side too. A ZADT_VSP too old to report
+`inactive` makes a sha256 expectation `failed` ("ZADT_VSP too old"), never a
+match.
 
 A zip is refused above 20 MB, 50,000 entries or 200 MB unpacked (its
 declared sizes, checked by vsp and again by ZADT_VSP before abapGit unpacks
