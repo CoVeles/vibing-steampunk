@@ -14,7 +14,8 @@
 #   missing-object    "<TYPE> <NAME> does not exist": the test reads an SAP-standard
 #                     object (SAPMSSY0, I_ABAPPACKAGE, /DMO/...) the target does not ship
 #   timeout           the 30 s test client gave up (OSD activation rebuilds the runtime)
-#   environment       the runner lacks something (a browser, an RFC channel, a fixture variable)
+#   environment       the runner lacks something (a browser, an RFC channel, a fixture variable),
+#                     or the browser-auth tests cannot reach an SSO page (GitHub runners ship Chrome)
 #   different-answer  anything else: the target answered, and not the way the test expects
 #   skipped           the test skipped itself, with its own reason
 #
@@ -42,6 +43,7 @@ jq -s --argjson tests "$tests" '
     elif $action == "pass" then "pass"
     elif $action == "skip" then "skipped"
     elif ($text | test("is not served by OSD")) then "missing-endpoint"
+    elif ($text | test("browser_auth_integration_test\\.go:[0-9]+: navigation failed")) then "environment"
     elif ($text | test("context deadline exceeded|Client.Timeout")) then "timeout"
     elif ($text | test("executable file not found|no RFC channel|only one transport ran|required for")) then "environment"
     elif ($text | test("<message[^>]*>[A-Z/]+ [A-Z0-9_/$]+ does not exist")) then "missing-object"

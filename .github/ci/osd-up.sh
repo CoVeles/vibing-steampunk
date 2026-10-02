@@ -64,6 +64,7 @@ if [ "$binary" = osd ]; then
   # header says which path an activation took and why. OSD_WARM=0 STG_DEV=0
   # in the caller's environment restores the all-cold behaviour.
   export OSD_WARM="${OSD_WARM:-1}" STG_DEV="${STG_DEV:-1}"
+  warm="; OSD_WARM=$OSD_WARM STG_DEV=$STG_DEV"
   (cd "$work/cwd" && "$bin" doctor) > "$work/doctor.log" 2>&1 || true
 fi
 # osd starts with `up`; osgo with its home and port as flags.
@@ -108,7 +109,7 @@ done
 echo "$body" > "$work/build.json"
 # Does it speak ADT? This is the switch between the full suite and a smoke run.
 adt=$(curl -s -o /dev/null -I -m 10 -w '%{http_code}' "$url/sap/bc/adt/core/discovery" || true)
-echo "osd-up: $binary $tag ready on $url after ${SECONDS}s; HEAD core/discovery: $adt${OSD_WARM:+; OSD_WARM=$OSD_WARM STG_DEV=$STG_DEV}" >&2
+echo "osd-up: $binary $tag ready on $url after ${SECONDS}s; HEAD core/discovery: $adt${warm:-}" >&2
 
 out=$(printf 'SAP_URL=%s\nOSD_PID=%s\nOSD_TAG=%s\nOSD_WORKDIR=%s\nOSD_ADT=%s\n' "$url" "$pid" "$binary-$tag" "$work" "$adt")
 echo "$out"

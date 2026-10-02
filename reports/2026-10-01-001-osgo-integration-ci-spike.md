@@ -166,6 +166,35 @@ over all `osd` processes (builds included) peaked at 6.5 GB. The data dir
 grew to about 1 GB (the 0.4 home was 147 MB) and the database to 11 MB. Both
 fit a standard `ubuntu-latest` runner (16 GB RAM, 14 GB free disk).
 
+## Update 2026-10-02 (3): first run on a GitHub runner (PR #321)
+
+`ubuntu-latest`, `pull_request` event, run 36967594544. All three rows
+finished green.
+
+| Row | Download + sha256 | Ready | Suite | Job total |
+|---|---|---|---|---|
+| osd pinned (`vscode-v0.5.1486`, warm) | `osd-linux-x64: OK` 4 s after the step started | 49 s after the step started; HEAD discovery 200 | 8 m 42 s step (compile included; the top-level tests sum to 508 s) | 10 m 10 s |
+| osgo pinned | `osgo-linux-x64: OK` after 1 s | 4 s after the step started; HEAD discovery 404, so smoke only | none | 34 s |
+| osd latest | not run (nightly only); the plan step skipped it | | | 4 s |
+
+**Matrix on the runner:** 22 pass, the same 22 as locally. The only difference
+is the two `BrowserAuth` tests. The runner ships Chrome, so they run, and they
+fail on navigation to an SSO page ("context deadline exceeded" and "websocket
+url timeout reached"). They were therefore classed `timeout` and
+`different-answer` instead of `environment`. `osd-summary.sh` now classes a
+browser-auth navigation failure as `environment`, before the timeout rule.
+The runner is about 1.5x slower than the local host (EditSource 123 s,
+WriteProgram 48 s; the warm primes took 12-15 s instead of 10 s). No
+activation took the warm path, as locally.
+
+Two harmless warnings: `setup-go`'s cache restore hit a tar "File exists"
+(exit 2), and GitHub notes that the v4/v5 actions are being forced onto
+Node 24.
+
+**Artifacts checked:** `summary.*`, `osd.log` and `build.json`. Their only
+paths are OSD's own `/home/runner/work/_temp/osd/...`, and their only URLs
+are `localhost`. There is no user, host or A4H identifier.
+
 Sections 1-8 below are the original 2026-10-01 write-up against
 `vscode-v0.4.1444`, kept as the baseline. Section 8's answers marked
 "0.4.x" shipped in `vscode-v0.5.1486`.
