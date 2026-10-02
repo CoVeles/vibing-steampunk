@@ -2132,20 +2132,21 @@ func runGraphWhereUsedConfig(cmd *cobra.Command, args []string) error {
 	// Step 3: Grep each candidate for the variable name
 	var refs []graph.TVARVCReference
 	grepCount := 0
-	grepFailed := 0
+	// Held until the count line is done, so each warning is a line of its own.
+	var grepFailures []string
 	for _, c := range candidates {
 		confirmed := false
 		if doGrep {
 			objURL := cliADTObjectURL(c.Type, c.Name)
 			if objURL != "" {
 				grepResult, err := client.GrepObject(ctx, objURL, variable, true, 0)
-				switch {
-				case err != nil:
-					// Unconfirmed already means "read it, the name is not
-					// there". A grep that failed must not be filed under it.
-					grepFailed++
-					fmt.Fprintf(os.Stderr, "WARN: %s %s could not be grepped: %v\n", c.Type, c.Name, err)
-				case grepResult != nil && len(grepResult.Matches) > 0:
+				// Unconfirmed already means "read it, the name is not there".
+				// A grep that failed must not be filed under it — and
+				// GrepObject reports a source it could not read in its
+				// result, not in err.
+				if reason, failed := adtsource.GrepFailure(grepResult, err); failed {
+					grepFailures = append(grepFailures, fmt.Sprintf("WARN: %s %s could not be grepped: %s", c.Type, c.Name, reason))
+				} else if len(grepResult.Matches) > 0 {
 					confirmed = true
 					grepCount++
 				}
@@ -2160,9 +2161,12 @@ func runGraphWhereUsedConfig(cmd *cobra.Command, args []string) error {
 	}
 	if doGrep {
 		fmt.Fprintf(os.Stderr, "Grep confirmed %d.\n", grepCount)
-		if grepFailed > 0 {
+		for _, w := range grepFailures {
+			fmt.Fprintln(os.Stderr, w)
+		}
+		if len(grepFailures) > 0 {
 			fmt.Fprintf(os.Stderr, "WARN: %d of %d candidates could not be grepped, so an unconfirmed row below may only mean unread.\n",
-				grepFailed, len(candidates))
+				len(grepFailures), len(candidates))
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "Grep skipped.\n")

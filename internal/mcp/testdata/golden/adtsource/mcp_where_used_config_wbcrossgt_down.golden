@@ -26,10 +26,14 @@ false
     {
       "object": "WBCROSSGT (object-oriented code)",
       "reason": "WBCROSSGT: running query: ADT API error: status 500 at /sap/bc/adt/datapreview/freestyle: Data preview refused this query"
+    },
+    {
+      "object": "PROG ZGOLD_MISSING",
+      "reason": "Failed to read source: ADT API error: status 404 at /sap/bc/adt/programs/programs/zgold_missing/source/main: Resource does not exist"
     }
   ],
   "notes": [
-    "1 of 3 objects could not be searched, so this is not a complete answer:\n  WBCROSSGT (object-oriented code): WBCROSSGT: running query: ADT API error: status 500 at /sap/bc/adt/datapreview/freestyle: Data preview refused this query"
+    "2 of 3 objects could not be searched, so this is not a complete answer:\n  WBCROSSGT (object-oriented code): WBCROSSGT: running query: ADT API error: status 500 at /sap/bc/adt/datapreview/freestyle: Data preview refused this query\n  PROG ZGOLD_MISSING: Failed to read source: ADT API error: status 404 at /sap/bc/adt/programs/programs/zgold_missing/source/main: Resource does not exist"
   ]
 }
 === requests

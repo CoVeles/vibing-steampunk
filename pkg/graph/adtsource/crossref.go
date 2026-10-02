@@ -70,3 +70,25 @@ func D010INCRows(rows []adt.LoadRow) []graph.D010INCRow {
 	}
 	return out
 }
+
+// GrepFailure says whether a grep of one object's source failed, and why.
+//
+// adt.Client.GrepObject reports a source it could not read in the result, not
+// in the error: Success stays false and Message carries the reason. A caller
+// that looks only at the error and at the matches files that object as read
+// and not matching, which is the opposite fact, and the one someone deletes a
+// variable on.
+func GrepFailure(res *adt.GrepObjectResult, err error) (reason string, failed bool) {
+	switch {
+	case err != nil:
+		return err.Error(), true
+	case res == nil:
+		return "the grep returned no result", true
+	case !res.Success:
+		if res.Message == "" {
+			return "the source could not be read", true
+		}
+		return res.Message, true
+	}
+	return "", false
+}

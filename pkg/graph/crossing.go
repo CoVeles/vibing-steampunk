@@ -1,6 +1,9 @@
 package graph
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // Complete reports whether every object in scope was read. A verdict from an
 // incomplete scan is still useful and must not be presented as a whole one.
@@ -292,13 +295,17 @@ func AnalyzeCrossings(g *Graph, scope *PackageScope, opts *CrossingOptions) *Cro
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	// Find all nodes in scope
-	scopeNodes := make(map[string]bool)
+	// Find all nodes in scope. They are walked in ID order, not map order: the
+	// first edge seen for a source→target pair is the one reported, and a
+	// target whose package is guessed keeps that guess for the edges after it,
+	// so the walk order decides what the report says and must not vary.
+	var scopeNodes []string
 	for _, n := range g.nodes {
 		if scope.InScope(n.Package) {
-			scopeNodes[n.ID] = true
+			scopeNodes = append(scopeNodes, n.ID)
 		}
 	}
+	sort.Strings(scopeNodes)
 	report.ObjectsScanned = len(scopeNodes)
 
 	// Track sibling direction pairs for circular detection
@@ -306,7 +313,7 @@ func AnalyzeCrossings(g *Graph, scope *PackageScope, opts *CrossingOptions) *Cro
 	// Deduplicate: same source→target pair only counted once
 	seenPairs := make(map[string]bool)
 
-	for nodeID := range scopeNodes {
+	for _, nodeID := range scopeNodes {
 		edges := g.outEdges[nodeID]
 		for _, e := range edges {
 			fromNode := g.nodes[nodeID]
@@ -428,22 +435,67 @@ func AnalyzeCrossings(g *Graph, scope *PackageScope, opts *CrossingOptions) *Cro
 		}
 	}
 
-	// Detect circular sibling dependencies
-	seen := make(map[string]bool)
+	// Detect circular sibling dependencies. Each pair is named once, with the
+	// alphabetically first package on the left, and the list is sorted.
 	for srcPkg, targets := range siblingPairs {
 		for tgtPkg := range targets {
-			if siblingPairs[tgtPkg] != nil && siblingPairs[tgtPkg][srcPkg] {
-				pair := srcPkg + " <-> " + tgtPkg
-				pairRev := tgtPkg + " <-> " + srcPkg
-				if !seen[pair] && !seen[pairRev] {
-					report.Circular = append(report.Circular, pair)
-					seen[pair] = true
-				}
+			if srcPkg < tgtPkg && siblingPairs[tgtPkg][srcPkg] {
+				report.Circular = append(report.Circular, srcPkg+" <-> "+tgtPkg)
 			}
 		}
 	}
+	sort.Strings(report.Circular)
 
+	sortCrossingEntries(report.Entries)
 	return report
+}
+
+// CrossingDirectionOrder ranks the directions from worst to most benign: the
+// three that break the hierarchy (sibling, downward, common-to-specific), then
+// a crossing out of the hierarchy altogether, then the ones that follow it.
+// Reports list their entries in this order.
+var CrossingDirectionOrder = []CrossingDirection{
+	CrossSibling, CrossDownward, CrossCommonDown,
+	CrossExternal, CrossUpward, CrossUpwardSkip, CrossCommon,
+}
+
+func directionRank(d CrossingDirection) int {
+	for i, o := range CrossingDirectionOrder {
+		if o == d {
+			return i
+		}
+	}
+	return len(CrossingDirectionOrder)
+}
+
+// sortCrossingEntries puts the entries in the order a reader triages them:
+// worst direction first (CrossingDirectionOrder), then by source package and
+// object, then by target package and object, then by edge kind and detail. The
+// order used to be whatever the graph's maps handed out, so the same package
+// printed its crossings differently on every run, and a diff of two runs
+// showed changes where there were none.
+func sortCrossingEntries(entries []CrossingEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		a, b := entries[i], entries[j]
+		if ra, rb := directionRank(a.Direction), directionRank(b.Direction); ra != rb {
+			return ra < rb
+		}
+		for _, k := range [][2]string{
+			{a.SourcePackage, b.SourcePackage},
+			{a.SourceObject, b.SourceObject},
+			{a.SourceType, b.SourceType},
+			{a.TargetPackage, b.TargetPackage},
+			{a.TargetObject, b.TargetObject},
+			{a.TargetType, b.TargetType},
+			{a.EdgeKind, b.EdgeKind},
+			{a.RefDetail, b.RefDetail},
+		} {
+			if k[0] != k[1] {
+				return k[0] < k[1]
+			}
+		}
+		return false
+	})
 }
 
 // GuessPackageFromName infers a likely package name from an object name.

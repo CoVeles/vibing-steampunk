@@ -225,10 +225,7 @@ func (s *Server) packageGraph(ctx context.Context, pkg string, depth int) (*pack
 		// dependencies: 0, CLEAN" for a package the CLI finds three
 		// crossings in. Nothing reported a failure because nothing was
 		// attempted.
-		objType := strings.ToUpper(obj.Type)
-		if i := strings.Index(objType, "/"); i > 0 {
-			objType = objType[:i]
-		}
+		objType := adtsource.MainType(obj.Type)
 		if objType != "CLAS" && objType != "PROG" && objType != "FUGR" && objType != "INTF" {
 			continue
 		}
@@ -1052,7 +1049,20 @@ func (s *Server) handleWhereUsedConfig(ctx context.Context, request mcp.CallTool
 		Unsearched []adt.Unsearched `json:"unsearched,omitempty"`
 		Notes      []string         `json:"notes,omitempty"`
 	}{ConfigUsageResult: result, Unsearched: gaps}
-	if note := adt.UnsearchedNote(gaps, len(refs)+len(gaps), "object"); note != "" {
+	// The total is every candidate plus every table that could not be asked. A
+	// candidate whose source could not be read is a gap and also a reader row,
+	// so it is counted once.
+	total := len(refs)
+	candidate := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		candidate[r.ObjectType+" "+r.ObjectName] = true
+	}
+	for _, g := range gaps {
+		if !candidate[g.Object] {
+			total++
+		}
+	}
+	if note := adt.UnsearchedNote(gaps, total, "object"); note != "" {
 		envelope.Notes = append(envelope.Notes, note)
 	}
 
@@ -1159,13 +1169,13 @@ func (s *Server) fetchConfigRefs(ctx context.Context, variable string, doGrep bo
 				})
 			} else {
 				grepResult, err := s.adtClient.GrepObject(ctx, objURL, variable, true, 0)
-				switch {
-				case err != nil:
-					// Confirmed=false is the same value we would record for an
-					// object we read and did not find the name in. A failed
-					// grep must not borrow that meaning.
-					gaps = append(gaps, adt.Unsearched{Object: c.Type + " " + c.Name, Reason: err.Error()})
-				case grepResult != nil && len(grepResult.Matches) > 0:
+				// Confirmed=false is the same value we would record for an
+				// object we read and did not find the name in. A failed grep
+				// must not borrow that meaning — and GrepObject reports a
+				// source it could not read in its result, not in err.
+				if reason, failed := adtsource.GrepFailure(grepResult, err); failed {
+					gaps = append(gaps, adt.Unsearched{Object: c.Type + " " + c.Name, Reason: reason})
+				} else if len(grepResult.Matches) > 0 {
 					confirmed = true
 				}
 			}
