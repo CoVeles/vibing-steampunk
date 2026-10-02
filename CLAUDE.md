@@ -140,7 +140,8 @@ func (s *Server) handleX(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 2. Register in the matching `tools_<domain>.go` with `shouldRegister("X")` (a new domain also needs a call in `tools_register.go`)
 3. Route in `handlers_analysis.go` (or appropriate router)
 4. Add to `tools_focused.go` if needed in focused mode
-5. `go test ./internal/mcp -run TestToolRegistryGolden -update-tools-golden` and commit the golden diff
+5. Classify it in `internal/mcp/readonly_classes_test.go` (READ, MUTATE or EXECUTE); the read-only invariant test fails with "classify me" otherwise. The harness in `readonly_invariant_test.go` rarely needs reading.
+6. `go test ./internal/mcp -run TestToolRegistryGolden -update-tools-golden` and commit the golden diff
 
 ---
 
