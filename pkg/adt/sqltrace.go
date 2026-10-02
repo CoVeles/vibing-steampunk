@@ -264,8 +264,8 @@ func parseSQLTraceDirectory(data []byte) (*SQLTraceDirectory, error) {
 		for _, entry := range feed.Entries {
 			var recordCount int
 			var size int64
-			fmt.Sscanf(entry.Content.Trace.RecordCount, "%d", &recordCount)
-			fmt.Sscanf(entry.Content.Trace.Size, "%d", &size)
+			_, _ = fmt.Sscanf(entry.Content.Trace.RecordCount, "%d", &recordCount)
+			_, _ = fmt.Sscanf(entry.Content.Trace.Size, "%d", &size)
 			out.Entries = append(out.Entries, SQLTraceEntry{
 				ID:          entry.ID,
 				User:        entry.Author.Name,

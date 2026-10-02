@@ -171,7 +171,7 @@ func parseTracesFeed(data []byte) ([]ABAPTrace, error) {
 	for _, entry := range feed.Entries {
 		var duration int64
 		if entry.Content.Trace.Duration != "" {
-			fmt.Sscanf(entry.Content.Trace.Duration, "%d", &duration)
+			_, _ = fmt.Sscanf(entry.Content.Trace.Duration, "%d", &duration)
 		}
 
 		trace := ABAPTrace{
@@ -220,7 +220,7 @@ func parseTraceAnalysis(data []byte, traceID, toolType string) (*TraceAnalysis, 
 	var hitlist hitlistXML
 	if err := xml.Unmarshal(data, &hitlist); err == nil && hitlist.XMLName.Local == "hitlist" {
 		if hitlist.TotalTime != "" {
-			fmt.Sscanf(hitlist.TotalTime, "%d", &analysis.TotalTime)
+			_, _ = fmt.Sscanf(hitlist.TotalTime, "%d", &analysis.TotalTime)
 		}
 
 		for _, e := range hitlist.Entries {
@@ -228,11 +228,11 @@ func parseTraceAnalysis(data []byte, traceID, toolType string) (*TraceAnalysis, 
 			var grossTime, netTime int64
 			var percentage float64
 
-			fmt.Sscanf(e.Line, "%d", &line)
-			fmt.Sscanf(e.Calls, "%d", &calls)
-			fmt.Sscanf(e.GrossTime, "%d", &grossTime)
-			fmt.Sscanf(e.NetTime, "%d", &netTime)
-			fmt.Sscanf(e.Percentage, "%f", &percentage)
+			_, _ = fmt.Sscanf(e.Line, "%d", &line)
+			_, _ = fmt.Sscanf(e.Calls, "%d", &calls)
+			_, _ = fmt.Sscanf(e.GrossTime, "%d", &grossTime)
+			_, _ = fmt.Sscanf(e.NetTime, "%d", &netTime)
+			_, _ = fmt.Sscanf(e.Percentage, "%f", &percentage)
 
 			analysis.Entries = append(analysis.Entries, TraceEntry{
 				Program:    e.Program,

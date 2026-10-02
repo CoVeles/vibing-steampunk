@@ -2,8 +2,6 @@ package adt
 
 import (
 	"context"
-	"encoding/xml"
-	"fmt"
 	"strings"
 )
 
@@ -59,50 +57,4 @@ func (c *Client) GetObjectStructureCAI(ctx context.Context, objectName string, m
 		})
 	}
 	return root, nil
-}
-
-// objectExplorerNodeXML is used for parsing object explorer XML responses.
-type objectExplorerNodeXML struct {
-	URI         string                  `xml:"uri,attr"`
-	Name        string                  `xml:"name,attr"`
-	Type        string                  `xml:"type,attr"`
-	Description string                  `xml:"description,attr"`
-	Children    []objectExplorerNodeXML `xml:"object"`
-}
-
-// parseObjectExplorerResponse parses the object explorer XML response.
-func parseObjectExplorerResponse(data []byte) (*ObjectExplorerNode, error) {
-	type explorerXML struct {
-		XMLName xml.Name                `xml:"objects"`
-		Objects []objectExplorerNodeXML `xml:"object"`
-	}
-
-	var exp explorerXML
-	if err := xml.Unmarshal(data, &exp); err != nil {
-		return nil, fmt.Errorf("parsing object explorer: %w", err)
-	}
-
-	if len(exp.Objects) == 0 {
-		return nil, nil
-	}
-
-	// Return the first object with its children
-	return convertObjectExplorerNode(&exp.Objects[0]), nil
-}
-
-func convertObjectExplorerNode(n *objectExplorerNodeXML) *ObjectExplorerNode {
-	if n == nil {
-		return nil
-	}
-	node := &ObjectExplorerNode{
-		URI:         n.URI,
-		Name:        n.Name,
-		Type:        n.Type,
-		Description: n.Description,
-	}
-	for _, child := range n.Children {
-		childCopy := child
-		node.Children = append(node.Children, *convertObjectExplorerNode(&childCopy))
-	}
-	return node
 }
