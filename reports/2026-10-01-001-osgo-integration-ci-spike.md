@@ -195,6 +195,63 @@ Node 24.
 paths are OSD's own `/home/runner/work/_temp/osd/...`, and their only URLs
 are `localhost`. There is no user, host or A4H identifier.
 
+## Update 2026-10-02 (4): the checksum pins the binary; published output is redacted
+
+Review found two problems (codex critic on PR #321). This update fixes both.
+
+**The checksum did not pin the binary.** `osd-up.sh` used to check the
+download only against the `.sha256` from the same release. An asset swapped
+together with its checksum would have run.
+
+- `.github/ci/osd.sha256` now commits the expected sha256 of all 8 pinned
+  assets: `osd-*` and `osgo-*` for linux-x64, linux-arm64, darwin-arm64 and
+  windows-x64. Each line reads `<sha256>  <tag>/<asset>`.
+- The values are the release's `.sha256` files. They agree with binaries
+  downloaded independently a day earlier.
+- `osd-up.sh` requires the download to match the committed value **and** the
+  release `.sha256`. It checks both before the binary is copied, chmod-ed or
+  run. A mismatch exits 4.
+- A tag with no committed line is refused, unless the caller sets
+  `OSD_ALLOW_UNPINNED=1`. The workflow sets it only for the nightly "latest"
+  row and for a dispatch with an explicit tag.
+- An unpinned run is reported `OSD_PINNED=false`, and its summary says
+  "(unpinned)". The latest row never runs on push or PR, and it holds no
+  secret.
+- `GH_TOKEN` and `GITHUB_TOKEN` are unset before the binary starts. This was
+  checked locally: the started `osgo` process's environment had neither.
+
+`.github/ci/osd-up-test.sh` is offline and runs in the workflow before every
+start. If it fails, the start is skipped. It checks six cases:
+
+| Case | Expected |
+|---|---|
+| control: a temp copy of the pin file whose line matches a fake asset | 0, `OSD_PINNED=true` |
+| that copy with one hex digit of the committed hash edited | 4, binary not installed |
+| the real committed pin against the fake asset | 4 |
+| asset and release `.sha256` disagree | 4 |
+| no committed line | 4 |
+| no committed line, with `OSD_ALLOW_UNPINNED=1` | 0, `OSD_PINNED=false` |
+
+A mutation check confirmed the test catches a removed pin: with the
+committed-hash comparison disabled, both pin cases fail.
+
+**Local paths and SAP details could leak.** `.github/ci/osd-redact.sh`
+makes three replacements:
+
+- the work dir becomes `<work>`;
+- `$HOME` becomes `<home>`;
+- the host of `$SAP_URL` becomes `<sap-host>`, unless it is a loopback host.
+
+`osd-summary.sh` passes `summary.json` (and `summary.md`, which is built
+from it) through the filter. The workflow does the same for the artifact
+copies of `osd.log` and `build.json`, and for the log tail it prints when a
+start fails.
+
+**The summary is meant for OSD runs only.** Its reasons quote the target's
+own messages. The redaction removes paths and the host, not object names or
+message text. A summary of a run against A4H or another real system must not
+be published.
+
 Sections 1-8 below are the original 2026-10-01 write-up against
 `vscode-v0.4.1444`, kept as the baseline. Section 8's answers marked
 "0.4.x" shipped in `vscode-v0.5.1486`.

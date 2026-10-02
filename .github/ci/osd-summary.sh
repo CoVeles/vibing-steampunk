@@ -20,8 +20,17 @@
 #   skipped           the test skipped itself, with its own reason
 #
 # Nothing is hidden: the counts are of what ran, and the reason is the test's.
+#
+# Meant for OSD runs only. Pointed at a run against a real SAP system it would
+# still work, but the reasons quote that system's messages; osd-redact.sh
+# strips $HOME, the work dir and a non-loopback $SAP_URL host, not object
+# names or message text. Do not publish a summary of a run against A4H.
+#
+# OSD_PINNED=false (osd-up.sh, the nightly "latest" row) marks the summary
+# "unpinned".
 set -euo pipefail
 in=${1:?test.json}; json=${2:?summary.json}; md=${3:?summary.md}
+here=$(cd "$(dirname "$0")" && pwd)
 root=$(git rev-parse --show-toplevel)
 module=$(cd "$root" && go list -m)
 
@@ -60,12 +69,12 @@ jq -s --argjson tests "$tests" '
           class: class($d.Action; $all), seconds: $d.Elapsed,
           reason: (if class($d.Action; $all) == "pass" then "" else ($lines | reason) end) } ]
   | sort_by(.package, .test)
-  | { schema: "vsp-osd-matrix/1", target: env.OSD_TAG,
+  | { schema: "vsp-osd-matrix/1", target: env.OSD_TAG, pinned: (env.OSD_PINNED != "false"),
       counts: (group_by(.class) | map({key: .[0].class, value: length}) | from_entries),
-      total: length, tests: . }' "$in" > "$json"
+      total: length, tests: . }' "$in" | "$here/osd-redact.sh" > "$json"
 
 {
-  echo "## vsp integration tests against OSD ${OSD_TAG:-}"
+  echo "## vsp integration tests against OSD ${OSD_TAG:-}$([ "${OSD_PINNED:-}" = false ] && echo ' (unpinned)')"
   echo
   jq -r '"\(.total) tests: " + (.counts | to_entries | map("\(.value) \(.key)") | join(", "))' "$json"
   echo
@@ -73,4 +82,4 @@ jq -s --argjson tests "$tests" '
   echo "|---|---|---|---|---|"
   jq -r '.tests[] | "| \(.package) | \(.test) | \(.result) | \(.class) | \(.reason | gsub("\\|"; "\\\\|")) |"' "$json"
 } > "$md"
-jq -r '"osd-integration: \(.total) tests: " + (.counts | to_entries | map("\(.value) \(.key)") | join(", "))' "$json"
+jq -r '"osd-integration\(if .pinned then "" else " (unpinned)" end): \(.total) tests: " + (.counts | to_entries | map("\(.value) \(.key)") | join(", "))' "$json"

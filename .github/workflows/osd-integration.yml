@@ -93,6 +93,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Offline: a binary that does not match the committed sha256
+      # (.github/ci/osd.sha256) is refused and never made executable.
+      - name: Checksum pin refuses a mismatch
+        if: steps.plan.outputs.run == 'true'
+        id: pintest
+        continue-on-error: true
+        run: .github/ci/osd-up-test.sh
+
       - name: Resolve the latest tag
         if: steps.plan.outputs.run == 'true' && steps.plan.outputs.tag == 'latest'
         id: latest
@@ -104,11 +112,15 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "latest ${{ matrix.target }} tag: ${tag:-none}"
 
-      # Download, verify the sha256, start on throwaway state, wait for ready.
-      # No node, no npm: the binary embeds its runtime and dependencies.
-      # A failed start (not an unavailable asset) is a warning, not a red job.
+      # Download, verify the sha256 against the committed pin and the release,
+      # start on throwaway state, wait for ready. No node, no npm: the binary
+      # embeds its runtime and dependencies. GH_TOKEN is unset before the binary
+      # starts. A failed start (not an unavailable asset) is a warning, not a
+      # red job. Only the nightly "latest" row and a dispatch with an explicit
+      # tag may run a tag with no committed hash, and their summary says
+      # "unpinned".
       - name: Start ${{ matrix.target }}
-        if: steps.plan.outputs.run == 'true'
+        if: steps.plan.outputs.run == 'true' && steps.pintest.outcome == 'success'
         id: up
         continue-on-error: true
         env:
@@ -120,6 +132,7 @@ jobs:
           OSD_WARM: '1'
           STG_DEV: '1'
           TAG: ${{ steps.latest.outputs.tag || steps.plan.outputs.tag }}
+          OSD_ALLOW_UNPINNED: ${{ (matrix.tag == 'latest' || inputs.tag != '') && '1' || '0' }}
         run: |
           status=0
           .github/ci/osd-up.sh "$RUNNER_TEMP/osd" ${TAG:+"$TAG"} || status=$?
@@ -152,18 +165,22 @@ jobs:
           if [ -s test.json ]; then
             .github/ci/osd-summary.sh test.json out/summary.json out/summary.md | tee out/line.txt
           else
-            echo "## $OSD_TAG: smoke only (HEAD /sap/bc/adt/core/discovery answered ${OSD_ADT:-nothing})" | tee out/summary.md
+            unpinned=""
+            if [ "${OSD_PINNED:-}" = false ]; then unpinned=" (unpinned)"; fi
+            echo "## $OSD_TAG$unpinned: smoke only (HEAD /sap/bc/adt/core/discovery answered ${OSD_ADT:-nothing})" | tee out/summary.md
           fi
           cat out/summary.md >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=osd-integration::$(head -1 out/line.txt 2>/dev/null || head -1 out/summary.md)"
-          cp "$OSD_WORKDIR"/osd.log "$OSD_WORKDIR"/build.json out/ 2>/dev/null || true
+          for f in osd.log build.json; do
+            if [ -f "$OSD_WORKDIR/$f" ]; then .github/ci/osd-redact.sh < "$OSD_WORKDIR/$f" > "out/$f"; fi
+          done
           kill "$OSD_PID" 2>/dev/null || true
 
       - name: Say why the start failed
         if: always() && steps.up.outcome == 'failure'
         run: |
           echo "::warning title=osd-integration::${{ matrix.target }} did not start; see the step log (advisory, not a failure)"
-          tail -40 "$RUNNER_TEMP/osd/osd.log" 2>/dev/null || true
+          tail -40 "$RUNNER_TEMP/osd/osd.log" 2>/dev/null | OSD_WORKDIR="$RUNNER_TEMP/osd" .github/ci/osd-redact.sh || true
 
       - name: Upload the matrix
         if: always() && steps.up.outputs.available == 'true'
