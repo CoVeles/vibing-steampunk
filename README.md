@@ -541,12 +541,16 @@ vsp -s devsys git import-zip ./demo.zip --package '$ZDEMO' --overwrite   # into 
 vsp -s devsys git import-status 12345678                                 # a job still running, read-only
 vsp -s devsys git delete-objects --package '$ZDEMO' "PROG ZDEMO_REPORT" "CLAS ZCL_DEMO"
 vsp -s devsys git delete-objects --package '$ZDEMO' --delete-repo "PROG ZDEMO_REPORT"   # and unregister its offline repository
+vsp -s devsys git object-versions --package '$ZDEMO' "CLAS ZCL_DEMO" --sha256          # read-only: the versions to expect
+vsp -s devsys git delete-objects --package '$ZDEMO' "CLAS ZCL_DEMO" \
+    --expect "CLAS ZCL_DEMO stamp=v1:REPOSRC:20261002101500:7"                         # only while it is still that version
 ```
 
 MCP: `system` with `git_import_zip` (`file_path` or `zip_base64`, `package`,
 `repo_name`, `overwrite`, `transport`, `wait_seconds`), the read-only
-`git_import_status` (`job`), and `git_delete_objects` (`package`, `objects`,
-`delete_repo`).
+`git_import_status` (`job`), `git_delete_objects` (`package`, `objects`,
+`delete_repo`, `expect_repo`), and the read-only `git_object_versions`
+(`package`, `objects`, `sha256`).
 
 Nothing that exists is overwritten without `overwrite`, and a package that
 already has a repository is refused without it. A package that exists
@@ -578,6 +582,30 @@ before anything is deleted. A repository abapGit cannot open counts as
 online, and the package is never deleted while any repository is registered
 for it. Objects are deleted at their own ADT address (an include, a
 structure), looked up by name.
+
+To delete only what is still the version you decided on, read the versions
+first (`git_object_versions`, `vsp git object-versions`) and pass them back:
+an object `{"type", "name", "expect": {"stamp": ...}}` (or `"sha256"`, or
+both, either matching is enough). vsp takes the object's ADT lock, reads its
+version again while it holds the lock, and deletes it only on a match;
+otherwise its status is `changed`, with what it is now (`observed`), it is
+kept, and the repository and the package stay. A version that cannot be
+read never matches. The lock is the enqueue every editor (ADT, SE80, SE24,
+SE11, abapGit) takes before it writes, so no such writer can change the
+object between the check and the DELETE. `expect_repo: {"key", "name"}`
+(`--expect-repo-key`, `--expect-repo-name`) unregisters the repository only
+when it is exactly that row; otherwise `repoNote` is `kept: registered
+repository is <key> <name>`.
+
+The stamp is `v1:<TABLE>:<YYYYMMDDHHMMSS>:<ROWS>`: the newest change date
+and time over every version row of the object, active and inactive, and the
+number of those rows -- REPOSRC (`UDAT`, `UTIME`) over every include of a
+class or interface pool and of a program; DD02L, DD04L, DD01L, DD40L,
+DDDDLSRC (`AS4DATE`, `AS4TIME`) for TABL, DTEL, DOMA, TTYP, DDLS. Other types
+have none. Its resolution is a second. `sha256` is the SHA-256 (lower-case
+hex) of the UTF-8 text of the lines `<file name>=<SHA-256 of the file>`, one
+per file of the object's abapGit serialisation in its original language
+only, sorted, joined by LF without a final LF.
 
 A zip is refused above 20 MB, 50,000 entries or 200 MB unpacked (its
 declared sizes, checked by vsp and again by ZADT_VSP before abapGit unpacks
