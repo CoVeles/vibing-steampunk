@@ -27,7 +27,7 @@ itself, about 5 MB. It also needs, at runtime, the persistence table `ZABAPGIT`,
 abapGit creates on first start through DDIF. So the system needs DDIC write at runtime
 too, not only at install.
 
-### Developer edition (`abapGit/abapGit@511cdbe`, 2026-10-01; the local `/home/alice/dev/abapGit` is a fork at 1.132.0 from Aug 2025, so a fresh clone was used)
+### Developer edition (`abapGit/abapGit@511cdbe`, 2026-10-01; the maintainer's local abapGit checkout is a fork at 1.132.0 from Aug 2025, so a fresh clone was used)
 
 | Type | Objects | ABAP bytes | Notes |
 |---|---|---|---|
